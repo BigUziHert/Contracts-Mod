@@ -23,6 +23,9 @@ tmp/
 *.aps
 *.cache
 
+# Claude Code local settings (personal)
+.claude/settings.local.json
+
 # User-specific files
 *.vcxproj.user
 *.suo
