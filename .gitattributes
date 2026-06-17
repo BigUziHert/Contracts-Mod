@@ -1,0 +1,5 @@
+# Normalize line endings: store as LF in the repo, check out native (CRLF on Windows)
+* text=auto
+
+# Binary files Git must never touch
+*.lib binary
