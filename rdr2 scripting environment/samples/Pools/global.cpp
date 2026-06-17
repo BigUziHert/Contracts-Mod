@@ -437,39 +437,30 @@ Ped getClosestEnemy(float distance)
 {
 	Ped worldPeds[1024];
 	int worldPedCount = worldGetAllPeds(worldPeds, 1024);
-	std::vector<std::pair<int, float>> pv{};
-	pv.clear();
-	int p{};
-	float f{};
+
+	Ped playerPed = PLAYER::PLAYER_PED_ID();
+	Vector3 playerCoords = ENTITY::GET_ENTITY_COORDS(playerPed, true, true);
+
+	Ped closest = 0;
+	float closestDist = distance;
 	for (int i = 0; i < worldPedCount; i++)
 	{
-		if (!ENTITY::IS_ENTITY_DEAD(worldPeds[i]))
+		if (ENTITY::IS_ENTITY_DEAD(worldPeds[i]))
+			continue;
+		if (PED::GET_CURRENT_TARGET_FOR_PED(worldPeds[i]) != playerPed)
+			continue;
+
+		Vector3 pedCoords = ENTITY::GET_ENTITY_COORDS(worldPeds[i], true, true);
+		float f = MISC::GET_DISTANCE_BETWEEN_COORDS(
+			playerCoords.x, playerCoords.y, playerCoords.z,
+			pedCoords.x, pedCoords.y, pedCoords.z, true);
+		if (f <= closestDist)
 		{
-			if (PED::GET_CURRENT_TARGET_FOR_PED(worldPeds[i]) == PLAYER::PLAYER_PED_ID())
-			{
-				f = MISC::GET_DISTANCE_BETWEEN_COORDS(ENTITY::GET_ENTITY_COORDS(PLAYER::PLAYER_PED_ID(), true, true).x, ENTITY::GET_ENTITY_COORDS(PLAYER::PLAYER_PED_ID(), true, true).y, ENTITY::GET_ENTITY_COORDS(PLAYER::PLAYER_PED_ID(), true, true).z, ENTITY::GET_ENTITY_COORDS(worldPeds[i], true, true).x, ENTITY::GET_ENTITY_COORDS(worldPeds[i], true, true).y, ENTITY::GET_ENTITY_COORDS(worldPeds[i], true, true).z, true);
-				if (f <= distance)
-				{
-					pv.push_back({ worldPeds[i], f });
-				}
-			}
+			closestDist = f;
+			closest = worldPeds[i];
 		}
 	}
-	if (!pv.empty())
-	{
-		auto min_distance = std::min_element(pv.begin(), pv.end(),
-			[](const std::pair<int, float>& a, const std::pair<int, float>& b)
-			{
-				return a.second < b.second;
-			});
-		p = min_distance->first;
-	}
-	pv.erase(std::remove_if(pv.begin(), pv.end(),
-		[](const std::pair<int, float>& v) {
-			return ENTITY::IS_ENTITY_DEAD(v.first) ||
-				PED::GET_CURRENT_TARGET_FOR_PED(v.first) != PLAYER::PLAYER_PED_ID();
-		}), pv.end());
-	return p;
+	return closest;
 }
 
 void addPedToPlayerGroup(Ped ped)

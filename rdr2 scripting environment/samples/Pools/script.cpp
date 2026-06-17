@@ -33,6 +33,7 @@ static Hash camGroup = 0;
 static Blip searchBlip = 0;
 static Blip bountyBlip = 0;
 static bool blipAdd = false;
+static bool trailsActive = false;
 static float searchRadius = 0.0f;
 
 static bool RetrySpawn = false;
@@ -317,10 +318,8 @@ static const int gNumClerkSpots = sizeof(gClerkSpots) / sizeof(gClerkSpots[0]);
 
 static void DisplaySubtitle(const char* message)
 {
-	UILOG::_UILOG_SET_CACHED_OBJECTIVE(message);
-	UILOG::_UILOG_PRINT_CACHED_OBJECTIVE();
-	UILOG::_UILOG_CLEAR_HAS_DISPLAYED_CACHED_OBJECTIVE();
-	UILOG::_UILOG_CLEAR_CACHED_OBJECTIVE();
+	// Thin wrapper over the shared DisplayObjective() in global.cpp
+	DisplayObjective(message);
 }
 
 // ===== [ RESET CONTRACT ] =====
@@ -338,6 +337,7 @@ static void ResetContract() {
 	}
 	PLAYER::_CLEAR_PED_EAGLE_EYE_TRAILS_FOR_PLAYER(me);
 	PLAYER::_UNREGISTER_EAGLE_EYE_FOR_ENTITY(me, contractTarget);
+	trailsActive = false;
 
 	ENTITY::SET_ENTITY_AS_NO_LONGER_NEEDED(&contractTarget);
 	contractTarget = 0;
@@ -393,32 +393,6 @@ static void CreateCameraPrompt()
 	HUD::_UI_PROMPT_SET_ENABLED(camPrompt, false);
 	HUD::_UI_PROMPT_SET_VISIBLE(camPrompt, false);
 	HUD::_UI_PROMPT_REGISTER_END(camPrompt);
-}
-
-static void getPedHash()
-{
-	Entity target = 0;
-	if (!PLAYER::GET_PLAYER_TARGET_ENTITY(me, &target))
-		return;
-
-	Ped targetPed = ENTITY::GET_PED_INDEX_FROM_ENTITY_INDEX(target);
-	if (!ENTITY::DOES_ENTITY_EXIST(targetPed))
-		return;
-
-	Hash model = ENTITY::GET_ENTITY_MODEL(targetPed);
-	Vector3 pos = ENTITY::GET_ENTITY_COORDS(targetPed, false, false);
-
-	char buf[128];
-	sprintf(
-		buf,
-		"Ped hash: 0x%08X | Coords: X %.2f Y %.2f Z %.2f",
-		model,
-		pos.x,
-		pos.y,
-		pos.z
-	);
-
-	DisplaySubtitle(buf);
 }
 
 // ===== [ CLERK PROMPT ] =====
@@ -511,21 +485,7 @@ static void UpdateClerkPrompt()
 			HUD::_UI_PROMPT_SET_VISIBLE(clerkPrompt, false);
 		}
 	}
-	else if (g_state == CONTRACT_UNKNOWN) {
-		HUD::_UI_PROMPT_SET_TEXT(clerkPrompt, MISC::VAR_STRING(10, "LITERAL_STRING", "End Contract"));
-		HUD::_UI_PROMPT_SET_ENABLED(clerkPrompt, true);
-		HUD::_UI_PROMPT_SET_VISIBLE(clerkPrompt, true);
-		if (HUD::_UI_PROMPT_HAS_HOLD_MODE_COMPLETED(clerkPrompt)) {
-			DisplaySubtitle("CONTRACT ENDED");
-			if (ENTITY::DOES_ENTITY_EXIST(contractTarget)) {
-				PED::DELETE_PED(&contractTarget);
-			}
-			ResetContract();
-			HUD::_UI_PROMPT_SET_ENABLED(clerkPrompt, false);
-			HUD::_UI_PROMPT_SET_VISIBLE(clerkPrompt, false);
-		}
-	}
-	else if (g_state == CONTRACT_FOUND) {
+	else if (g_state == CONTRACT_UNKNOWN || g_state == CONTRACT_FOUND) {
 		HUD::_UI_PROMPT_SET_TEXT(clerkPrompt, MISC::VAR_STRING(10, "LITERAL_STRING", "End Contract"));
 		HUD::_UI_PROMPT_SET_ENABLED(clerkPrompt, true);
 		HUD::_UI_PROMPT_SET_VISIBLE(clerkPrompt, true);
@@ -752,7 +712,6 @@ static void foundBlip() {
 
 // ===== [ TRACKING TRAILS ] =====
 static void enableTrail() {
-	static bool trailsActive = false;
 	if (g_state != CONTRACT_DEAD && g_state != CONTRACT_NONE) {
 		float dx = playerPos.x - targetPos.x;
 		float dy = playerPos.y - targetPos.y;
@@ -834,6 +793,8 @@ static bool IsInHandheldCamera()
 static void targetDeathCheck()
 {
 	if (!camPrompt) CreateCameraPrompt();
+	if (!ENTITY::DOES_ENTITY_EXIST(contractTarget))
+		return;
 	if (PED::IS_PED_DEAD_OR_DYING(contractTarget, true)) {
 		if (!blipAdd) {
 			if (MAP::DOES_BLIP_EXIST(bountyBlip)) {
@@ -887,7 +848,7 @@ void main() {
 		if (contractTarget && ENTITY::DOES_ENTITY_EXIST(contractTarget)) {
 			targetPos = ENTITY::GET_ENTITY_COORDS(contractTarget, true, false);
 		}
-		//getPedHash();
+		// Press U to skip the clerk and immediately roll a new contract (debug/testing)
 		if (IsKeyJustUp(0x55)) {
 			if (ENTITY::DOES_ENTITY_EXIST(contractTarget)) {
 				PED::DELETE_PED(&contractTarget);
