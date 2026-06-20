@@ -16,6 +16,9 @@ static void PlayAnimOnPed(Ped, const char*, const char*, float, float, int, int)
 static Ped spawnPed(Hash, float, float, float);
 static void pickContract();
 static void startPedCombat(Ped);
+static void EnterCombat(Ped);
+static bool TargetCanSeePlayer();
+static float TargetPlayerDistSq();
 static void StartPedWander(Ped);
 static void AIHandler();
 static void unknownBlip();
@@ -68,6 +71,22 @@ enum ContractTasks {
 	CONTRACT_AGGRO,
 };
 static ContractTasks g_task = CONTRACT_WANDER;
+
+// ===== [ AGGRO / PERCEPTION TUNABLES ] =====
+// Of every aggro, how often the target draws a weapon vs. throwing fists.
+static const int   kArmedChancePct   = 90;     // 90% armed, 10% fists
+static const int   kGunVsKnifePct    = 75;     // of the armed rolls: 75% gun, 25% knife
+// How far he can still "see"/notice the player (also his perception range + re-aggro range).
+// Must be LARGER than kDeAggroDist for line of sight to matter while chasing.
+static const float kReAggroSightDist = 45.0f;
+// Within this distance he stays engaged no matter what (no LOS needed); beyond it, staying
+// engaged requires line of sight, up to kReAggroSightDist.
+static const float kDeAggroDist      = 20.0f;
+// ...continuously for this long (ms), so a brief LOS break doesn't reset him.
+static const DWORD kDeAggroGraceMs   = 8000;
+
+static bool  targetRemembersPlayer = false; // once aggroed, re-aggros on sight alone
+static ULONGLONG lastContactMs     = 0;     // last time target saw / was near the player
 
 // ===== [ STRUCT CONTRACT SPAWNS + MODELS ] =====
 struct SpawnDef
@@ -349,6 +368,8 @@ static void ResetContract() {
 
 	targetInTask = false;
 	gAmbientPedActive = false;
+	targetRemembersPlayer = false;
+	lastContactMs = 0;
 
 
 	// reset / hide prompts but KEEP their handles valid
@@ -382,7 +403,7 @@ static void createClerkPrompt()
 static void CreateCameraPrompt()
 {
 	if (camPrompt) return;
-	camGroup = joaat("CAMERA_ITEM_GROUP");
+	camGroup = joaat("CAMERA_ITEM_GROUP"); // the native camera group — required for the prompt to render inside the camera UI
 
 	camPrompt = HUD::_UI_PROMPT_REGISTER_BEGIN();
 	HUD::_UI_PROMPT_SET_CONTROL_ACTION(camPrompt, INPUT_CAMERA_TAKE_PHOTO);
@@ -399,13 +420,20 @@ static void CreateCameraPrompt()
 static void UpdateClerkPrompt()
 {
 	Entity target = 0;
-	if (!PLAYER::GET_PLAYER_TARGET_ENTITY(me, &target))
+	if (!PLAYER::GET_PLAYER_TARGET_ENTITY(me, &target) || !ENTITY::IS_ENTITY_A_PED(target))
+	{
+		// Not aiming at a ped — don't leave the clerk prompt lingering on screen.
+		HUD::_UI_PROMPT_SET_ENABLED(clerkPrompt, false);
+		HUD::_UI_PROMPT_SET_VISIBLE(clerkPrompt, false);
 		return;
-	if (!ENTITY::IS_ENTITY_A_PED(target))
-		return;
+	}
 	clerkPed = ENTITY::GET_PED_INDEX_FROM_ENTITY_INDEX(target);
 	if (!ENTITY::DOES_ENTITY_EXIST(clerkPed))
+	{
+		HUD::_UI_PROMPT_SET_ENABLED(clerkPrompt, false);
+		HUD::_UI_PROMPT_SET_VISIBLE(clerkPrompt, false);
 		return;
+	}
 	Hash model = ENTITY::GET_ENTITY_MODEL(clerkPed);
 	Vector3 clerkPos = ENTITY::GET_ENTITY_COORDS(clerkPed, true, false);
 	bool  found = false;
@@ -565,6 +593,7 @@ static void pickContract() {
 		ENTITY::SET_ENTITY_AS_MISSION_ENTITY(contractTarget, true, true);
 
 		PED::SET_PED_COMBAT_ABILITY(contractTarget, CAL_PROFESSIONAL);
+		PED::SET_PED_CAN_BE_INCAPACITATED(contractTarget, false); // never surrender / give up — fight to the death
 
 		PED::SET_PED_CONFIG_FLAG(contractTarget, 130, false); //DisableTalkTo
 		PED::SET_PED_CONFIG_FLAG(contractTarget, 211, true); //GiveAmbientDefaultTaskIfMissionPed
@@ -578,7 +607,7 @@ static void pickContract() {
 		PED::SET_PED_CONFIG_FLAG(contractTarget, 225, false); //??
 		PED::SET_PED_CONFIG_FLAG(contractTarget, 437, false); //PCF_DisableWeatherConditionPerceptionChecks
 		PED::SET_PED_CONFIG_FLAG(contractTarget, 442, true);
-		PED::SET_PED_CONFIG_FLAG(contractTarget, 233, true); //PCF_PedIsEnemyToPlayer
+		PED::SET_PED_CONFIG_FLAG(contractTarget, 233, true); //PCF_PedIsEnemyToPlayer — true ON PURPOSE: false makes him a robbable civilian that cowers when aimed at. De-aggro turns it off; the bridge/re-aggro turns it back on.
 		PED::SET_PED_CONFIG_FLAG(contractTarget, 351, true); //	PCF_DisableIntimidationBackingAway
 		PED::SET_PED_CONFIG_FLAG(contractTarget, 356, true); //	PCF_BlockRobberyInteractionEscape
 
@@ -593,16 +622,18 @@ static void pickContract() {
 		PED::SET_PED_COMBAT_ATTRIBUTES(contractTarget, 93, false); //CA_PREFER_MELEE
 		PED::SET_PED_COMBAT_ATTRIBUTES(contractTarget, 54, true); //CA_ALWAYS_EQUIP_BEST_WEAPON
 		PED::SET_PED_COMBAT_ATTRIBUTES(contractTarget, 12, true); //BLIND_FIRE_IN_COVER
-		PED::SET_PED_COMBAT_ATTRIBUTES(contractTarget, 5, true); //ALWAYS_FIGHT
+		PED::SET_PED_COMBAT_ATTRIBUTES(contractTarget, 5, true); //ALWAYS_FIGHT — enabled in EnterCombat
 		PED::SET_PED_COMBAT_ATTRIBUTES(contractTarget, 17, false); //ALWAYS_FLEE
 		PED::SET_PED_COMBAT_ATTRIBUTES(contractTarget, 14, false); //CAN_INVESTIGATE
 		PED::SET_PED_COMBAT_ATTRIBUTES(contractTarget, 58, true); //DISABLE_FLEE_FROM_COMBAT
 		PED::SET_PED_COMBAT_ATTRIBUTES(contractTarget, 46, true); //CAN_FIGHT_ARMED_PEDS_WHEN_NOT_ARMED
+		PED::SET_PED_COMBAT_ATTRIBUTES(contractTarget, 28, true); //CA_CAN_USE_FRUSTRATED_ADVANCE — push in instead of giving up
+		PED::SET_PED_COMBAT_ATTRIBUTES(contractTarget, 50, true); //CA_CAN_CHARGE — charge instead of fleeing
 
 		PED::SET_PED_FLEE_ATTRIBUTES(contractTarget, 1024, true);
 		PED::SET_PED_FLEE_ATTRIBUTES(contractTarget, 512, true);
 		PED::SET_PED_FLEE_ATTRIBUTES(contractTarget, 16384, true);
-		PED::SET_PED_FLEE_ATTRIBUTES(contractTarget, 32768, true);
+		PED::SET_PED_FLEE_ATTRIBUTES(contractTarget, 32768, false); // enabled = lets him cower/flee; off so he fights (rdr2mods forum)
 
 		WEAPON::GIVE_WEAPON_TO_PED(contractTarget, WEAPON_REVOLVER_CATTLEMAN, 60, false, true, 0, true, 0.0f, 0.0f, ADD_REASON_DEFAULT, false, 0.0f, false);
 		WEAPON::GIVE_WEAPON_TO_PED(contractTarget, WEAPON_MELEE_KNIFE, 0, false, true, 0, true, 0.0f, 0.0f, ADD_REASON_DEFAULT, false, 0.0f, false);
@@ -627,24 +658,79 @@ static void RetryContractSpawn() {
 }
 
 // ===== [ AI HELPERS ] =====
+// Picks a weapon (or fists) per the tunables and starts combat with the player.
+static void EnterCombat(Ped ped) {
+	if (!ENTITY::DOES_ENTITY_EXIST(ped))
+		return;
+
+	TASK::CLEAR_PED_SECONDARY_TASK(ped);
+
+	// Become hostile for the fight (so his own AI presses the attack, not just our task).
+	PED::SET_PED_CONFIG_FLAG(ped, 233, true);     // PCF_PedIsEnemyToPlayer
+	PED::SET_PED_COMBAT_ATTRIBUTES(ped, 5, true); // CA_ALWAYS_FIGHT
+
+	if ((rand() % 100) < kArmedChancePct) {
+		bool useGun = (rand() % 100) < kGunVsKnifePct;
+		if (useGun) {
+			PED::SET_PED_COMBAT_ATTRIBUTES(ped, 93, false); // CA_PREFER_MELEE off
+			PED::SET_PED_COMBAT_ATTRIBUTES(ped, 54, true);  // CA_ALWAYS_EQUIP_BEST_WEAPON
+			WEAPON::SET_CURRENT_PED_WEAPON(ped, WEAPON_REVOLVER_CATTLEMAN, true, WEAPON_ATTACH_POINT_HAND_PRIMARY, false, false);
+		}
+		else {
+			PED::SET_PED_COMBAT_ATTRIBUTES(ped, 93, true);  // prefer melee so he keeps the knife
+			PED::SET_PED_COMBAT_ATTRIBUTES(ped, 54, false); // don't auto-swap to the revolver
+			WEAPON::SET_CURRENT_PED_WEAPON(ped, WEAPON_MELEE_KNIFE, true, WEAPON_ATTACH_POINT_HAND_PRIMARY, false, false);
+		}
+	}
+	else {
+		PED::SET_PED_COMBAT_ATTRIBUTES(ped, 93, true);   // fists
+		PED::SET_PED_COMBAT_ATTRIBUTES(ped, 54, false);  // don't draw a weapon
+		WEAPON::SET_CURRENT_PED_WEAPON(ped, joaat("WEAPON_UNARMED"), true, WEAPON_ATTACH_POINT_HAND_PRIMARY, false, false);
+	}
+
+	PED::SET_COMBAT_FLOAT(ped, 20, 0.0f); // far
+	PED::SET_COMBAT_FLOAT(ped, 21, 0.0f); // near
+	TASK::TASK_COMBAT_PED(ped, pedMe, 0, 0);
+	PED::SET_PED_KEEP_TASK(ped, true); // make the combat task stick so he can't drop into flee/cower
+
+	g_task = CONTRACT_AGGRO;
+	targetRemembersPlayer = true;
+	lastContactMs = GetTickCount64();
+}
+
+// True if the target has a clear line of sight to the player.
+// NOTE: CAN_PED_SEE_ENTITY returned non-zero even with NO line of sight, which kept the
+// target permanently "in contact" and stopped it from ever de-aggroing. A raw LOS trace
+// (blocked by world geometry) is the reliable check.
+static bool TargetCanSeePlayer() {
+	if (!ENTITY::DOES_ENTITY_EXIST(contractTarget))
+		return false;
+	// HAS_ENTITY_CLEAR_LOS_TO_ENTITY reports a clear line even at huge distances (it was
+	// returning true at ~190 m). Cap it to his sight range so "he sees me" is realistic.
+	if (TargetPlayerDistSq() > (kReAggroSightDist * kReAggroSightDist))
+		return false;
+	return ENTITY::HAS_ENTITY_CLEAR_LOS_TO_ENTITY(contractTarget, pedMe, 17) != 0;
+}
+
+static float TargetPlayerDistSq() {
+	float dx = playerPos.x - targetPos.x;
+	float dy = playerPos.y - targetPos.y;
+	float dz = playerPos.z - targetPos.z;
+	return dx * dx + dy * dy + dz * dz;
+}
+
+// First-contact trigger: he turns hostile when the player aims at or intimidates
+// him while he is looking at the player.
 static void startPedCombat(Ped ped) {
 	if (!ENTITY::DOES_ENTITY_EXIST(ped))
 		return;
 
-	if (PLAYER::IS_PLAYER_FREE_AIMING_AT_ENTITY(me, ped) && PED::IS_PED_HEADTRACKING_PED(ped, pedMe)) {
-		TASK::CLEAR_PED_SECONDARY_TASK(ped);
-		PED::SET_COMBAT_FLOAT(contractTarget, 20, 0.0f); // far
-		PED::SET_COMBAT_FLOAT(contractTarget, 21, 0.0f); // near
-		TASK::TASK_COMBAT_PED(ped, pedMe, 0, 0);
-		g_task = CONTRACT_AGGRO;
-	}
-	if (PED::_IS_PED_INTIMIDATED(ped) && PED::IS_PED_HEADTRACKING_PED(ped, pedMe)) {
-		TASK::CLEAR_PED_SECONDARY_TASK(ped);
-		PED::SET_COMBAT_FLOAT(contractTarget, 20, 0.0f); // far
-		PED::SET_COMBAT_FLOAT(contractTarget, 21, 0.0f); // near
-		TASK::TASK_COMBAT_PED(ped, pedMe, 0, 0);
-		g_task = CONTRACT_AGGRO;
-	}
+	bool aimingAt    = PLAYER::IS_PLAYER_FREE_AIMING_AT_ENTITY(me, ped) && PED::IS_PED_HEADTRACKING_PED(ped, pedMe);
+	bool intimidated = PED::_IS_PED_INTIMIDATED(ped) && PED::IS_PED_HEADTRACKING_PED(ped, pedMe);
+	bool damaged     = ENTITY::HAS_ENTITY_BEEN_DAMAGED_BY_ENTITY(ped, pedMe, true, true);
+
+	if (aimingAt || intimidated || damaged)
+		EnterCombat(ped);
 }
 static void StartPedWander(Ped ped)
 {
@@ -683,13 +769,59 @@ static void AIHandler()
 		if (!targetInTask)
 		{
 			StartPedWander(contractTarget);
-
 		}
-		startPedCombat(contractTarget);
+
+		// If his own AI is already fighting the player (e.g. he was antagonized into it),
+		// commit him to the fight and hand control to our AGGRO state so de-aggro governs it.
+		// No weapon re-roll here — he's already armed and shooting.
+		if (PED::IS_PED_IN_COMBAT(contractTarget, pedMe))
+		{
+			PED::SET_PED_CONFIG_FLAG(contractTarget, 233, true);     // enemy
+			PED::SET_PED_COMBAT_ATTRIBUTES(contractTarget, 5, true); // CA_ALWAYS_FIGHT
+			PED::SET_PED_KEEP_TASK(contractTarget, true);
+			targetRemembersPlayer = true;
+			lastContactMs = GetTickCount64();
+			g_task = CONTRACT_AGGRO;
+			break;
+		}
+
+		if (targetRemembersPlayer)
+		{
+			// Already met the player: attack again the moment he is back in sight.
+			if (TargetCanSeePlayer() &&
+				TargetPlayerDistSq() <= (kReAggroSightDist * kReAggroSightDist))
+			{
+				EnterCombat(contractTarget);
+			}
+		}
+		else
+		{
+			// First contact: aim / intimidation trigger.
+			startPedCombat(contractTarget);
+		}
 		break;
 
 	case CONTRACT_AGGRO:
+	{
+		bool inContact = TargetCanSeePlayer() ||
+			TargetPlayerDistSq() <= (kDeAggroDist * kDeAggroDist);
+
+		if (inContact)
+		{
+			lastContactMs = GetTickCount64();
+		}
+		else if (GetTickCount64() - lastContactMs > kDeAggroGraceMs)
+		{
+			// Lost the player long enough: drop hostility so his own combat AI stops
+			// hunting the player, then holster and wander. Keep remembering him so coming
+			// back into sight re-triggers combat.
+			PED::SET_PED_CONFIG_FLAG(contractTarget, 233, false);     // no longer enemy
+			PED::SET_PED_COMBAT_ATTRIBUTES(contractTarget, 5, false); // stop auto-fighting
+			TASK::CLEAR_PED_TASKS(contractTarget, true, true);
+			StartPedWander(contractTarget);
+		}
 		break;
+	}
 	}
 }
 
@@ -763,6 +895,16 @@ static void targetFindCheck() {
 	bool deadCheck = ENTITY::IS_ENTITY_DEAD(contractTarget);
 	bool combatCheck = PED::IS_PED_IN_COMBAT(contractTarget, pedMe);
 
+	// IS_PLAYER_FREE_AIMING_AT_ENTITY / IS_PLAYER_TARGETTING_ENTITY register by camera
+	// direction at ANY distance — you can "aim at" the target from across the map. Only
+	// treat that as finding the target when the player is genuinely near it AND has LOS.
+	float fdx = playerPos.x - targetPos.x;
+	float fdy = playerPos.y - targetPos.y;
+	float fdz = playerPos.z - targetPos.z;
+	bool nearTarget = (fdx * fdx + fdy * fdy + fdz * fdz) <= (searchRadius * searchRadius);
+	bool playerHasLOS = ENTITY::HAS_ENTITY_CLEAR_LOS_TO_ENTITY(pedMe, contractTarget, 17) != 0;
+	bool aimedAtTarget = (freeAimingAt || targetting) && nearTarget && playerHasLOS;
+
 	if (deadCheck) {
 		if (MAP::DOES_BLIP_EXIST(bountyBlip) || MAP::DOES_BLIP_EXIST(searchBlip)) {
 			MAP::REMOVE_BLIP(&bountyBlip);
@@ -773,7 +915,7 @@ static void targetFindCheck() {
 			return;
 		}
 	}
-	if (interactingWithTarget || freeAimingAt || targetting || damageCheck || combatCheck) {
+	if (interactingWithTarget || aimedAtTarget || damageCheck || combatCheck) {
 		DisplaySubtitle("TARGET FOUND");
 		if (MAP::DOES_BLIP_EXIST(searchBlip)) {
 			MAP::REMOVE_BLIP(&searchBlip);
@@ -814,6 +956,11 @@ static void targetDeathCheck()
 			MAP::SET_BLIP_COORDS(bountyBlip, targetPos);
 		}
 
+		// Making our prompt the ACTIVE prompt in the native CAMERA_ITEM_GROUP this frame
+		// renders it inside the handheld camera AND makes it intercept the take-photo input:
+		// the corpse shot triggers our prompt (IS_PRESSED) instead of the native capture, so
+		// the game never saves it. Once we reach CONTRACT_DEAD this stops running and the
+		// native shutter works (and saves) normally again.
 		if (IsInHandheldCamera())
 		{
 			if (ENTITY::IS_ENTITY_ON_SCREEN(contractTarget)) {
@@ -848,6 +995,24 @@ void main() {
 		if (contractTarget && ENTITY::DOES_ENTITY_EXIST(contractTarget)) {
 			targetPos = ENTITY::GET_ENTITY_COORDS(contractTarget, true, false);
 		}
+
+		// --- TEMP DEBUG: aggro/LOS readout. state 0=NONE 1=UNK 2=FOUND 3=DEAD  task 0=WANDER 1=AGGRO
+		{
+			bool haveTarget = contractTarget && ENTITY::DOES_ENTITY_EXIST(contractTarget);
+			int losRaw = haveTarget ? (ENTITY::HAS_ENTITY_CLEAR_LOS_TO_ENTITY(contractTarget, pedMe, 17) ? 1 : 0) : -1;
+			int sees = haveTarget ? (TargetCanSeePlayer() ? 1 : 0) : -1; // raw LOS capped to sight range — what the logic actually uses
+			float dist = -1.0f;
+			if (haveTarget) {
+				float dx = playerPos.x - targetPos.x, dy = playerPos.y - targetPos.y, dz = playerPos.z - targetPos.z;
+				dist = sqrtf(dx * dx + dy * dy + dz * dz);
+			}
+			char dbg[180];
+			sprintf(dbg, "state=%d task=%d remember=%d losRaw=%d sees=%d dist=%.1f", (int)g_state, (int)g_task,
+				targetRemembersPlayer ? 1 : 0, losRaw, sees, dist);
+			DrawTextToScreen(dbg, 0.05f, 0.08f, 0.4f, 255, 255, 0, 255);
+		}
+		// --- END TEMP DEBUG ---
+
 		// Press U to skip the clerk and immediately roll a new contract (debug/testing)
 		if (IsKeyJustUp(0x55)) {
 			if (ENTITY::DOES_ENTITY_EXIST(contractTarget)) {
@@ -883,6 +1048,6 @@ void main() {
 }
 
 void ScriptMain() {
-	srand(GetTickCount());
+	srand((unsigned)GetTickCount64());
 	main();
 }
