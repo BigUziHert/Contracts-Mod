@@ -48,7 +48,7 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <LinkIncremental>false</LinkIncremental>
     <TargetExt>.asi</TargetExt>
-    <OutDir>C:\Program Files (x86)\Steam\steamapps\common\Red Dead Redemption 2</OutDir>
+    <OutDir>G:\Games\Red Dead Redemption 2</OutDir>
     <IntDir>tmp\$(Configuration)\</IntDir>
     <TargetName>TestScript</TargetName>
   </PropertyGroup>
