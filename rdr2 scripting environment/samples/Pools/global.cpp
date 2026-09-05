@@ -283,28 +283,28 @@ void DrawTextToScreen(const char* text, float x, float y, float scale, int r, in
 {
 	UIDEBUG::_BG_SET_TEXT_SCALE(scale, scale);
 	UIDEBUG::_BG_SET_TEXT_COLOR(r, g, b, a);
-	UIDEBUG::_BG_DISPLAY_TEXT(MISC::VAR_STRING(10, "LITERAL_STRING", static_cast<char*>(_strdup(text))), x, y);
+	UIDEBUG::_BG_DISPLAY_TEXT(MISC::VAR_STRING(10, "LITERAL_STRING", text), x, y);
 }
 
 void DrawTextToScreen(int value, float x, float y, float scale, int r, int g, int b, int a)
 {
 	UIDEBUG::_BG_SET_TEXT_SCALE(scale, scale);
 	UIDEBUG::_BG_SET_TEXT_COLOR(r, g, b, a);
-	UIDEBUG::_BG_DISPLAY_TEXT(MISC::VAR_STRING(10, "LITERAL_STRING", static_cast<char*>(_strdup(std::to_string(value).c_str()))), x, y);
+	UIDEBUG::_BG_DISPLAY_TEXT(MISC::VAR_STRING(10, "LITERAL_STRING", std::to_string(value).c_str()), x, y);
 }
 
 void DrawTextToScreen(std::string text, float x, float y, float scale, int r, int g, int b, int a)
 {
 	UIDEBUG::_BG_SET_TEXT_SCALE(scale, scale);
 	UIDEBUG::_BG_SET_TEXT_COLOR(r, g, b, a);
-	UIDEBUG::_BG_DISPLAY_TEXT(MISC::VAR_STRING(10, "LITERAL_STRING", static_cast<char*>(_strdup(text.c_str()))), x, y);
+	UIDEBUG::_BG_DISPLAY_TEXT(MISC::VAR_STRING(10, "LITERAL_STRING", text.c_str()), x, y);
 }
 
 void DrawTextToScreen(Vector3 value, float x, float y, float scale, int r, int g, int b, int a)
 {
 	UIDEBUG::_BG_SET_TEXT_SCALE(scale, scale);
 	UIDEBUG::_BG_SET_TEXT_COLOR(r, g, b, a);
-	UIDEBUG::_BG_DISPLAY_TEXT(MISC::VAR_STRING(10, "LITERAL_STRING", static_cast<char*>(_strdup(Vector3ToString(value).c_str()))), x, y);
+	UIDEBUG::_BG_DISPLAY_TEXT(MISC::VAR_STRING(10, "LITERAL_STRING", Vector3ToString(value).c_str()), x, y);
 }
 
 void PlayFrontendAudio(const char* audioName, const char* audioRef)
@@ -695,7 +695,7 @@ Hash GetWeaponFromGroups(std::vector<Hash> groups)
 	{
 		weapons.push_back(WEAPON::_0xF8204EF17410BF43(groups[i], 0.5f, 1.f, 0));
 	}
-	return weapons[RINT(0, weapons.size())];
+	return weapons[RINT(0, (int)weapons.size())];
 }
 
 int GetIntStatValue(Hash BaseId, Hash PermutationId)
