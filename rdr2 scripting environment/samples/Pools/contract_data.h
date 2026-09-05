@@ -282,30 +282,37 @@ static const GiverSpot kGivers[] = {
 
 // ===== [ CONTRACT CARD ] =====
 // The physical card the clerk hands over: a 4x6 photo card examined through the game's own item-inspect
-// task (Zoom / Flip / Put Away). Interaction states from femga rdr3_discoveries/tasks/TASK_ITEM_INTERACTION.
+// task (Zoom / Flip / Put Away). Item, prop, slot and states are the ones Contracts Remastered uses
+// (read from its binary); state hashes cross-checked against femga rdr3_discoveries/tasks/TASK_ITEM_INTERACTION.
 namespace Card
 {
-	constexpr Hash kPropModel  = Joaat("p_cs_photonudie01x_4x6");            // CARD@W6-5_H10-7 portrait photo card
-	constexpr Hash kPrimaryItem = Joaat("PrimaryItem");                      // the held-prop slot every card/book/document state uses (femga table; R* scripts fetch it as "PRIMARYITEM")
-	constexpr Hash kItem       = Joaat("document_cig_card_grl");             // vanilla cigarette-card inventory item that owns the card animations
-	constexpr DWORD kTaskStartWaitMs = 700;                                  // how long to wait for the inspect task to report running before trying the fallback path
-	constexpr Hash kStateIntro       = Joaat("CIGARETTE_CARD_W6-5_H10-7_SINGLE_INTRO");
-	constexpr Hash kStateBase        = Joaat("CIGARETTE_CARD_W6-5_H10-7_SINGLE_BASE");
-	constexpr Hash kStateFlipToBack  = Joaat("CIGARETTE_CARD_W6-5_H10-7_SINGLE_FLIP_TO_BACK");
-	constexpr Hash kStateFlippedBase = Joaat("CIGARETTE_CARD_W6-5_H10-7_SINGLE_FLIPPED_BASE");
-	constexpr Hash kStateFlipToFront = Joaat("CIGARETTE_CARD_W6-5_H10-7_SINGLE_FLIP_TO_FRONT");
-	constexpr Hash kStateHolster     = Joaat("CIGARETTE_CARD_W6-5_H10-7_SINGLE_HOLSTER");
+	constexpr Hash kItem        = Joaat("generic_photograph");                // the inventory item whose inspect animations we borrow
+	constexpr Hash kPropModel   = Joaat("p_cs_photonudie05x_4x6");            // the photo card prop (its picture is replaced through a render target)
+	constexpr Hash kPrimaryItem = Joaat("primaryItem");                       // the held-prop slot every card/book/document state uses
+	constexpr Hash kStateIntro       = Joaat("DOCUMENT_INSPECT@Paper_w10-16_H15-24_INTRO");
+	constexpr Hash kStateBase        = Joaat("DOCUMENT_INSPECT@Paper_w10-16_H15-24_BASE");
+	constexpr Hash kStateFlipToBack  = Joaat("DOCUMENT_INSPECT@Paper_w10-16_H15-24_FLIP_TO_BACK");
+	constexpr Hash kStateFlippedBase = Joaat("DOCUMENT_INSPECT@Paper_w10-16_H15-24_FLIPPED_BASE");
+	constexpr Hash kStateFlipToFront = Joaat("DOCUMENT_INSPECT@Paper_w10-16_H15-24_FLIP_TO_FRONT");
+	constexpr Hash kStateOutro       = Joaat("DOCUMENT_INSPECT@Paper_w10-16_H15-24_OUTRO");
 	constexpr Hash kStartState       = kStateIntro;
+	constexpr const char* kFlipBlackboard = "GENERIC_DOCUMENT_FLIP_AVAILABLE";  // player-ped blackboard bool that enables the Flip prompt (R* generic_document_inspection)
+	constexpr DWORD kTaskStartWaitMs = 700;                                   // wait for the inspect task to report running before trying the fallback path
 	constexpr const char* kTitle        = "Contract Information";
-	constexpr const char* kPedshotName  = "CONTRACT_TARGET";   // texture the game writes the target's photo into
 	constexpr const char* kRenderTarget = "contract_card";
 	constexpr const char* kHandBone     = "PH_R_Hand";
 	constexpr Hash kCashPickup = Joaat("PICKUP_MONEY_VARIABLE");
+
+	// --- target portrait (the game's persona-photo / pedshot pipeline, as the MP persona_photos script drives it) ---
+	constexpr const char* kPhotoName  = "MINIGAME_PROFILE_PHOTO";   // one of the three names the pedshot system accepts (MP_PROFILE_PHOTO, MP_MISSION_PHOTO, MINIGAME_PROFILE_PHOTO)
+	constexpr int   kPhotoType        = 1;                          // _PEDSHOT_SET_PERSONA_PHOTO_TYPE
+	constexpr int   kPhotoCacheType   = 2;                          // persona-photo local cache type used for the write
+	constexpr DWORD kPhotoStepMs      = 4000;                       // per-step timeout: previous upload, write, upload, texture name
 }
 // Hashes verified against femga's documented values.
-static_assert(Card::kStateIntro       == 0xAB6FE483, "card state hash");
-static_assert(Card::kStateBase        == 0xA266F046, "card state hash");
-static_assert(Card::kStateFlipToBack  == 0x4C0134F2, "card state hash");
-static_assert(Card::kStateFlippedBase == 0xF53D8689, "card state hash");
-static_assert(Card::kStateFlipToFront == 0x19946CB0, "card state hash");
-static_assert(Card::kStateHolster     == 0x1CFAA394, "card state hash");
+static_assert(Card::kStateIntro       == 0x19FF3C2A, "card state hash");
+static_assert(Card::kStateBase        == 0x7593F5A7, "card state hash");
+static_assert(Card::kStateFlipToBack  == 0x0543087B, "card state hash");
+static_assert(Card::kStateFlippedBase == 0xB7286003, "card state hash");
+static_assert(Card::kStateFlipToFront == 0x0D9687E0, "card state hash");
+static_assert(Card::kStateOutro       == 0x13AA268C, "card state hash");

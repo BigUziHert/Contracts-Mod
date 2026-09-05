@@ -17,6 +17,8 @@
 #include "keyboard.h"
 #include "contract_data.h"
 
+static const char* kBuildTag = "dev-3";   // shown on the HUD and in a banner at startup so an installed build is verifiable
+
 // ===== [ DEBUG TOGGLES ] ===== (overridable from the build: set CL=/DCONTRACTS_DEBUG_HUD=0)
 #ifndef CONTRACTS_DEBUG_KEYS
 #define CONTRACTS_DEBUG_KEYS 1   // U: skip the clerk and roll a new contract
@@ -49,10 +51,12 @@ struct ActiveContract
 	int        bountyAtCrime = 0;
 	bool       gotWanted = false;
 
-	// target photo
-	bool       photoTaken = false;
-	bool       photoPedWasReady = false;
-	ULONGLONG  cardOpenAtMs = 0;        // deferred card examine (after the handoff anim)
+	// target portrait
+	bool        photoTaken = false;
+	bool        photoPedWasReady = false;
+	char        photoTexture[64] = "";  // texture name returned by the persona-photo cache ("" = none)
+	const char* photoStatus = "-";      // last step reached / failed (debug HUD)
+	ULONGLONG   cardOpenAtMs = 0;       // deferred card examine (after the handoff anim)
 
 	// hand-in
 	int        payoutCents = 0;
@@ -132,7 +136,6 @@ template<typename Pred> static bool WaitUntil(DWORD timeoutMs, Pred pred)
 	while (!pred() && GetTickCount64() < deadline) WAIT(0);
 	return pred();
 }
-static void ScriptSleep(DWORD ms) { WaitUntil(ms, [] { return false; }); }
 
 static void PlayAnimOnPed(Ped ped, const char* dict, const char* name, float blendIn, float blendOut, int duration, int flags)
 {
@@ -189,32 +192,61 @@ static void AddCorpseBlip()
 	StyleTargetBlip(C.targetBlip, "BLIP_MODIFIER_MP_COLOR_6", false, true);
 }
 
-// ===== [ TARGET PHOTO ] =====
-// The game's own ped-portrait renderer (the Online persona photo / companion-app mugshot), driven the way
-// Rockstar's spd_agnesdowd1 script drives it. It writes the portrait into a texture named Card::kPedshotName.
-static void TakeTargetPhoto(Ped ped)
+// ===== [ TARGET PORTRAIT ] =====
+// The game's own ped-portrait pipeline (the Online persona photo), driven the way Rockstar's persona_photos
+// script and Contracts Remastered drive it: generate -> write to the local persona-photo cache -> wait for
+// the upload -> ask the cache for the texture name. `ped` must be built (ready to render); it may be hidden.
+static bool TakeTargetPhoto(Ped ped)
 {
-	GRAPHICS::_PEDSHOT_SET_PERSONA_PHOTO_TYPE(0);
-	GRAPHICS::_0xFD05B1DDE83749FA(Card::kPedshotName);
+	C.photoStatus = "prev upload pending";
+	WaitUntil(Card::kPhotoStepMs, [] { return !NETWORK::_NETWORK_IS_PREVIOUS_UPLOAD_PENDING(); });
+
+	C.photoStatus = "ped not ready";
+	C.photoPedWasReady = WaitUntil(Tune::kPedshotReadyMs, [&] { return PED::IS_PED_READY_TO_RENDER(ped) != 0; });
+
 	GRAPHICS::_PEDSHOT_PREVIOUS_PERSONA_PHOTO_DATA_CLEANUP();
-	GRAPHICS::_PEDSHOT_GENERATE_PERSONA_PHOTO(Card::kPedshotName, ped, 0);
-	GRAPHICS::_0x402E1A61D2587FCD(0, ENTITY::GET_ENTITY_COORDS(ped, true, false), 0.0f, 0.0f, ENTITY::GET_ENTITY_HEADING(ped));
+	GRAPHICS::_PEDSHOT_SET_PERSONA_PHOTO_TYPE(Card::kPhotoType);
+	GRAPHICS::_PEDSHOT_GENERATE_PERSONA_PHOTO(Card::kPhotoName, ped, 0);
+	PED::FORCE_PED_MOTION_STATE(ped, joaat("MotionState_DoNothing"), false, 0, false);
 	C.photoTaken = true;
+
+	C.photoStatus = "write failed";
+	if (!WaitUntil(Card::kPhotoStepMs, [] { return NETWORK::_NETWORK_PERSONA_PHOTO_WRITE_LOCAL(Card::kPhotoName, 0, 1, Card::kPhotoCacheType) != 0; }))
+		return false;
+
+	C.photoStatus = "upload pending";
+	WaitUntil(Card::kPhotoStepMs, [] { return !NETWORK::_NETWORK_IS_PREVIOUS_UPLOAD_PENDING(); });
+
+	C.photoStatus = "no texture name";
+	const char* name = nullptr;
+	WaitUntil(Card::kPhotoStepMs, [&]
+	{
+		static const int kCacheTypes[] = { Card::kPhotoCacheType, 0, 1, 2 };
+		for (int ct : kCacheTypes)
+		{
+			const char* n = NETWORK::_REQUEST_PEDSHOT_TEXTURE_LOCAL_BACKUP_DOWNLOAD(0, ct);
+			if (n && *n) { name = n; return true; }
+		}
+		return false;
+	});
+	if (!name) return false;
+
+	strcpy_s(C.photoTexture, name);
+	C.photoStatus = "ok";
+	return true;
 }
 static void ReleaseTargetPhoto()
 {
 	if (!C.photoTaken) return;
+	if (C.photoTexture[0]) NETWORK::_TEXTURE_DOWNLOAD_RELEASE_BY_NAME(C.photoTexture);
 	GRAPHICS::_PEDSHOT_INIT_CLEANUP_DATA();
 	GRAPHICS::_PEDSHOT_FINISH_CLEANUP_DATA();
-	GRAPHICS::_0x5C9C3A466B3296A8(0);
 }
-static bool TargetPhotoReady()
-{
-	return C.photoTaken && TXD::DOES_STREAMED_TEXTURE_DICT_EXIST(Card::kPedshotName) != 0;
-}
+static bool TargetPhotoReady() { return C.photoTexture[0] != 0; }
 
-// Spawns the target next to the player first — hidden, frozen, no collision — so his clothes and textures
-// stream in and the portrait renderer has a fully built ped to shoot. Then moves him to his town.
+// Spawns the target next to the player first — hidden, frozen, no collision, exactly how the persona-photo
+// script parks its clone — so his clothes and textures stream in and the portrait can be taken. Then moves
+// him to his town.
 static Ped SpawnTargetWithPhoto(Hash model, const ContractDef& def)
 {
 	Ped ped = SpawnPed(model, ENTITY::GET_OFFSET_FROM_ENTITY_IN_WORLD_COORDS(pedMe, 0.0f, -1.5f, 0.0f));
@@ -223,11 +255,11 @@ static Ped SpawnTargetWithPhoto(Hash model, const ContractDef& def)
 	ENTITY::FREEZE_ENTITY_POSITION(ped, true);
 	ENTITY::SET_ENTITY_COLLISION(ped, false, false);
 	ENTITY::SET_ENTITY_HEADING(ped, ENTITY::GET_ENTITY_HEADING(pedMe));
+	PED::SET_BLOCKING_OF_NON_TEMPORARY_EVENTS(ped, false);
 	if (Tune::kPedshotHidden) ENTITY::SET_ENTITY_VISIBLE(ped, false);
+	TASK::CLEAR_PED_TASKS_IMMEDIATELY(ped, false, true);
 
-	C.photoPedWasReady = WaitUntil(Tune::kPedshotReadyMs, [&] { return PED::IS_PED_READY_TO_RENDER(ped) != 0; });
 	TakeTargetPhoto(ped);
-	ScriptSleep(Tune::kPedshotSettleMs);
 
 	if (Tune::kPedshotHidden) ENTITY::SET_ENTITY_VISIBLE(ped, true);
 	ENTITY::SET_ENTITY_COLLISION(ped, true, false);
@@ -276,14 +308,15 @@ static void DestroyCardObject()
 static bool CardTaskRunning() { return TASK::IS_PED_RUNNING_TASK_ITEM_INTERACTION(pedMe) != 0; }
 
 // Player takes the card out and examines it (Zoom / Flip / Put Away are the game's own prompts).
-//  Path 1: our photo card held through the item-interaction task with the "PrimaryItem" prop slot
-//          (the slot every card/book/document state uses) — this is the Remastered look.
+//  Path 1: our photo card held through the item-interaction task with the "primaryItem" prop slot —
+//          the Remastered look (item generic_photograph, prop p_cs_photonudie05x_4x6, paper-inspect states).
 //  Path 2: if that task refuses to start, do it the way Rockstar's document scripts do: let the game
-//          spawn the item's own card, then take over that prop (title + render target).
+//          spawn the item's own prop, then take over that prop (title + render target).
 static bool OpenCard()
 {
 	if (Cd.obj || Cd.examining) return false;
 	Cd.lastError = "";
+	PED::_SET_PED_BLACKBOARD_BOOL(pedMe, Card::kFlipBlackboard, true, -1); // enables the Flip prompt on the document
 
 	if (CreateCardObject())
 	{
@@ -320,7 +353,7 @@ static bool OpenCard()
 	}
 	else
 	{
-		Cd.lastError = "p2: running, no PrimaryItem prop";
+		Cd.lastError = "p2: running, no primaryItem prop";
 	}
 	Cd.examining = true;
 	Cd.openedMs = GetTickCount64();
@@ -344,8 +377,8 @@ static void DrawCardFace(bool corpse)
 {
 	if (!Cd.renderId || !TargetPhotoReady()) return;
 	HUD::SET_TEXT_RENDER_ID(Cd.renderId);
-	if (corpse) GRAPHICS::DRAW_SPRITE(Card::kPedshotName, Card::kPedshotName, 0.5f, 0.5f, 1.0f, 1.0f, 0.0f, 150, 105, 95, 255, false);
-	else        GRAPHICS::DRAW_SPRITE(Card::kPedshotName, Card::kPedshotName, 0.5f, 0.5f, 1.0f, 1.0f, 0.0f, 255, 255, 255, 255, false);
+	if (corpse) GRAPHICS::DRAW_SPRITE(C.photoTexture, C.photoTexture, 0.5f, 0.5f, 1.0f, 1.0f, 0.0f, 150, 105, 95, 255, false);
+	else        GRAPHICS::DRAW_SPRITE(C.photoTexture, C.photoTexture, 0.5f, 0.5f, 1.0f, 1.0f, 0.0f, 255, 255, 255, 255, false);
 	HUD::SET_TEXT_RENDER_ID(kDefaultRenderId);
 }
 
@@ -355,7 +388,7 @@ static void DrawCardBackPanel()
 	if (!C.def) return;
 	GRAPHICS::DRAW_RECT(0.50f, 0.50f, 0.40f, 0.34f, 18, 14, 11, 225, false, false);
 	if (TargetPhotoReady())
-		GRAPHICS::DRAW_SPRITE(Card::kPedshotName, Card::kPedshotName, 0.395f, 0.50f, 0.15f, 0.27f, 0.0f, 255, 255, 255, 255, false);
+		GRAPHICS::DRAW_SPRITE(C.photoTexture, C.photoTexture, 0.395f, 0.50f, 0.15f, 0.27f, 0.0f, 255, 255, 255, 255, false);
 
 	char lo[16], hi[16], reward[48];
 	FormatMoney(lo, sizeof lo, Tune::kPayoutMinCents);
@@ -376,8 +409,7 @@ static void UpdateCard()
 	}
 	if (Cd.examining)
 	{
-		bool running = TASK::IS_PED_RUNNING_TASK_ITEM_INTERACTION(pedMe) != 0;
-		if (!running && now > Cd.openedMs + 1500) { DestroyCardObject(); return; } // put away (or the task never started)
+		if (!CardTaskRunning() && now > Cd.openedMs + 1500) { DestroyCardObject(); return; } // put away (or the task ended)
 		DrawCardFace(false);
 		Hash state = TASK::GET_ITEM_INTERACTION_STATE(pedMe);
 		if (state == Card::kStateFlipToBack || state == Card::kStateFlippedBase) DrawCardBackPanel();
@@ -904,7 +936,7 @@ static const char* CardStateName(Hash h)
 	if (h == Card::kStateFlipToBack)  return "FLIP_TO_BACK";
 	if (h == Card::kStateFlippedBase) return "FLIPPED";
 	if (h == Card::kStateFlipToFront) return "FLIP_TO_FRONT";
-	if (h == Card::kStateHolster)     return "HOLSTER";
+	if (h == Card::kStateOutro)       return "OUTRO";
 	return h ? "other" : "-";
 }
 #endif
@@ -924,16 +956,16 @@ static void DebugUpdate()
 	int   losRaw = have ? (ENTITY::HAS_ENTITY_CLEAR_LOS_TO_ENTITY(C.target, pedMe, 17) ? 1 : 0) : -1;
 	int   sees   = have ? (TargetCanSeePlayer() ? 1 : 0) : -1;
 	float dist   = have ? sqrtf(DistSq(playerPos, C.targetPos)) : -1.0f;
-	char line[200], money[16];
-	sprintf_s(line, "state=%d task=%d remember=%d losRaw=%d sees=%d dist=%.1f",
-		(int)g_state, (int)C.task, C.remembersPlayer ? 1 : 0, losRaw, sees, dist);
+	char line[240], money[16];
+	sprintf_s(line, "build=%s state=%d task=%d remember=%d losRaw=%d sees=%d dist=%.1f",
+		kBuildTag, (int)g_state, (int)C.task, C.remembersPlayer ? 1 : 0, losRaw, sees, dist);
 	DrawTextToScreen(line, 0.05f, 0.08f, 0.4f, 255, 255, 0, 255);
 
 	Hash cardState = TASK::GET_ITEM_INTERACTION_STATE(pedMe);
-	sprintf_s(line, "photo: taken=%d pedReady=%d txd=%d | card: obj=%d exam=%d hand=%d task=%d st=%s rt=%d path=%d/%d item=%d err=%s",
-		C.photoTaken ? 1 : 0, C.photoPedWasReady ? 1 : 0, TargetPhotoReady() ? 1 : 0,
+	sprintf_s(line, "photo: taken=%d pedReady=%d status=%s tex=%s | card: obj=%d exam=%d hand=%d task=%d st=%s rt=%d path=%d/%d item=%d err=%s",
+		C.photoTaken ? 1 : 0, C.photoPedWasReady ? 1 : 0, C.photoStatus, C.photoTexture[0] ? C.photoTexture : "-",
 		Cd.obj ? 1 : 0, Cd.examining ? 1 : 0, Cd.inHand ? 1 : 0,
-		TASK::IS_PED_RUNNING_TASK_ITEM_INTERACTION(pedMe) ? 1 : 0, CardStateName(cardState), Cd.renderId,
+		CardTaskRunning() ? 1 : 0, CardStateName(cardState), Cd.renderId,
 		Cd.path, g_cardLastPath, ITEMDATABASE::_ITEMDATABASE_IS_KEY_VALID(Card::kItem, 0) ? 1 : 0, Cd.lastError);
 	DrawTextToScreen(line, 0.05f, 0.11f, 0.4f, 255, 255, 0, 255);
 
@@ -959,10 +991,19 @@ void ScriptMain()
 {
 	srand((unsigned)GetTickCount64());
 	CreateGiverPrompt();
+	ULONGLONG bannerAtMs = GetTickCount64() + 4000;   // one-time "this build is loaded" banner once the HUD is up
 	while (true)
 	{
 		UpdatePlayer();
 		DebugUpdate();
+
+		if (bannerAtMs && GetTickCount64() >= bannerAtMs)
+		{
+			bannerAtMs = 0;
+			char banner[64];
+			sprintf_s(banner, "CONTRACTS BUILD %s LOADED", kBuildTag);
+			DisplaySubtitle(banner);
+		}
 
 		// A contract whose target vanished (deleted by another script, fell out of the world) can never
 		// be completed — end it instead of leaving stale blips on the map.
