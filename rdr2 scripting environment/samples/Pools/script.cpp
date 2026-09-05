@@ -997,6 +997,8 @@ void main() {
 		}
 
 		// --- TEMP DEBUG: aggro/LOS readout. state 0=NONE 1=UNK 2=FOUND 3=DEAD  task 0=WANDER 1=AGGRO
+		// DISABLED for recording — flip `#if 0` to `#if 1` to bring the readout back.
+#if 0
 		{
 			bool haveTarget = contractTarget && ENTITY::DOES_ENTITY_EXIST(contractTarget);
 			int losRaw = haveTarget ? (ENTITY::HAS_ENTITY_CLEAR_LOS_TO_ENTITY(contractTarget, pedMe, 17) ? 1 : 0) : -1;
@@ -1011,6 +1013,7 @@ void main() {
 				targetRemembersPlayer ? 1 : 0, losRaw, sees, dist);
 			DrawTextToScreen(dbg, 0.05f, 0.08f, 0.4f, 255, 255, 0, 255);
 		}
+#endif
 		// --- END TEMP DEBUG ---
 
 		// Press U to skip the clerk and immediately roll a new contract (debug/testing)
