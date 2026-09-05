@@ -2,27 +2,31 @@
 	Contracts mod — bounty-style contracts handed out by station clerks.
 	Built on Alexander Blade's RDR2 ScriptHook SDK (http://dev-c.com).
 
-	Flow:  NONE --[Get Contract]--> UNKNOWN --[spot / hurt / fight the target]--> FOUND
-	       FOUND --[target dies, photograph the corpse]--> DEAD --[Collect Payment]--> NONE
+	Flow:  NONE --[Get Contract: clerk hands over a photo card]--> UNKNOWN
+	       UNKNOWN --[spot / hurt / fight the target]--> FOUND
+	       FOUND --[target dies, photograph the corpse]--> DEAD
+	       DEAD --[Collect Payment: hand the clerk the photo, cash lands on the counter]--> PAID
+	       PAID --[player takes the cash]--> NONE
 	       UNKNOWN / FOUND --[End Contract at a giver]--> NONE
 
-	Data (spawns, models, givers, tunables) lives in contract_data.h.
+	Payout scales with how long the contract ran and drops if the player got wanted after the crime;
+	see Tune::kPayout* in contract_data.h. Data (spawns, models, givers, card, tunables) lives there too.
 */
 
 #include "global.h"
 #include "keyboard.h"
 #include "contract_data.h"
 
-// ===== [ DEBUG TOGGLES ] ===== (overridable from the build: set CL=/DCONTRACTS_DEBUG_HUD=1)
+// ===== [ DEBUG TOGGLES ] ===== (overridable from the build: set CL=/DCONTRACTS_DEBUG_HUD=0)
 #ifndef CONTRACTS_DEBUG_KEYS
 #define CONTRACTS_DEBUG_KEYS 1   // U: skip the clerk and roll a new contract
 #endif
 #ifndef CONTRACTS_DEBUG_HUD
-#define CONTRACTS_DEBUG_HUD  0   // on-screen state / aggro / LOS readout
+#define CONTRACTS_DEBUG_HUD  1   // on-screen readout: state / aggro / photo / card / payout
 #endif
 
 // ===== [ STATE ] =====
-enum ContractState { CONTRACT_NONE, CONTRACT_UNKNOWN, CONTRACT_FOUND, CONTRACT_DEAD };
+enum ContractState { CONTRACT_NONE, CONTRACT_UNKNOWN, CONTRACT_FOUND, CONTRACT_DEAD, CONTRACT_PAID };
 enum TargetTask    { TARGET_WANDER, TARGET_AGGRO };
 
 struct ActiveContract
@@ -37,10 +41,40 @@ struct ActiveContract
 	TargetTask task = TARGET_WANDER;
 	bool       remembersPlayer = false; // once aggroed, re-aggros on sight alone
 	ULONGLONG  lastContactMs = 0;       // last time the target saw / was near the player
+
+	// timeline + law, for the payout
+	ULONGLONG  startMs = 0;             // Get Contract
+	ULONGLONG  crimeMs = 0;             // first hostile contact between player and target (0 = none yet)
+	ULONGLONG  photoMs = 0;             // corpse photographed
+	int        bountyAtCrime = 0;
+	bool       gotWanted = false;
+
+	// target photo
+	bool       photoTaken = false;
+	bool       photoPedWasReady = false;
+	ULONGLONG  cardOpenAtMs = 0;        // deferred card examine (after the handoff anim)
+
+	// hand-in
+	int        payoutCents = 0;
+	Ped        payingGiver = 0;
+	ULONGLONG  handInStartMs = 0;
+	bool       cashSpawned = false;
+	Object     cashObj = 0;
 };
 
-static ActiveContract C;
-static ContractState  g_state = CONTRACT_NONE;
+// The card prop while it is out (being examined, or in hand during the hand-in).
+struct CardRuntime
+{
+	Object    obj = 0;
+	bool      examining = false;
+	bool      inHand = false;
+	ULONGLONG openedMs = 0;
+	int       renderId = 0;
+};
+
+static ActiveContract  C;
+static CardRuntime     Cd;
+static ContractState   g_state = CONTRACT_NONE;
 
 static Player  me = 0;
 static Ped     pedMe = 0;
@@ -49,6 +83,8 @@ static Vector3 playerPos;
 static Prompt giverPrompt = 0;
 static Prompt camPrompt = 0;
 static Hash   camGroup = 0;
+
+static const int kDefaultRenderId = 1;   // the script's normal (screen) render target
 
 // ===== [ SMALL HELPERS ] =====
 static float DistSq(const Vector3& a, const Vector3& b)
@@ -59,10 +95,13 @@ static float DistSq(const Vector3& a, const Vector3& b)
 static bool Within(const Vector3& a, const Vector3& b, float dist) { return DistSq(a, b) <= dist * dist; }
 
 static bool TargetExists() { return C.target && ENTITY::DOES_ENTITY_EXIST(C.target); }
+static bool ContractActive() { return g_state == CONTRACT_UNKNOWN || g_state == CONTRACT_FOUND || g_state == CONTRACT_DEAD; }
 
 static const char* Literal(const char* text) { return MISC::VAR_STRING(10, "LITERAL_STRING", text); }
 
 static void DisplaySubtitle(const char* message) { DisplayObjective(message); }
+
+static void FormatMoney(char* out, size_t size, int cents) { sprintf_s(out, size, "$%d.%02d", cents / 100, cents % 100); }
 
 static void RemoveBlip(Blip& blip)
 {
@@ -83,32 +122,36 @@ static void ResetPrompt(Prompt prompt)
 	HUD::_UI_PROMPT_RESTART_MODES(prompt);
 }
 
-// Waits for a streaming request, bounded so a bad name can't hang the script forever.
-template<typename IsLoaded> static bool WaitLoaded(IsLoaded isLoaded)
+// Yields frames until pred() holds or timeoutMs passes; bounded so a bad name can't hang the script.
+template<typename Pred> static bool WaitUntil(DWORD timeoutMs, Pred pred)
 {
-	ULONGLONG deadline = GetTickCount64() + Tune::kStreamTimeoutMs;
-	while (!isLoaded() && GetTickCount64() < deadline) WAIT(0);
-	return isLoaded();
+	ULONGLONG deadline = GetTickCount64() + timeoutMs;
+	while (!pred() && GetTickCount64() < deadline) WAIT(0);
+	return pred();
 }
+static void ScriptSleep(DWORD ms) { WaitUntil(ms, [] { return false; }); }
 
 static void PlayAnimOnPed(Ped ped, const char* dict, const char* name, float blendIn, float blendOut, int duration, int flags)
 {
 	STREAMING::REQUEST_ANIM_DICT(dict);
-	if (!WaitLoaded([&] { return STREAMING::HAS_ANIM_DICT_LOADED(dict) != 0; })) return;
+	if (!WaitUntil(Tune::kStreamTimeoutMs, [&] { return STREAMING::HAS_ANIM_DICT_LOADED(dict) != 0; })) return;
 	TASK::CLEAR_PED_SECONDARY_TASK(ped);
 	TASK::TASK_PLAY_ANIM(ped, dict, name, blendIn, blendOut, duration, flags, 0.0f, 0,
 		AIK_DISABLE_ARM_IK | AIK_DISABLE_TORSO_REACT_IK | AIK_DISABLE_TORSO_IK | AIK_DISABLE_HEAD_IK | AIK_DISABLE_LEG_IK, 0, 0, 0);
 	STREAMING::REMOVE_ANIM_DICT(dict);
 }
 
-static Ped SpawnPed(Hash model, const Vector3& pos)
+static bool LoadModel(Hash model)
 {
 	STREAMING::REQUEST_MODEL(model, true);
-	if (!WaitLoaded([&] { return STREAMING::HAS_MODEL_LOADED(model) != 0; }))
-	{
-		STREAMING::SET_MODEL_AS_NO_LONGER_NEEDED(model);
-		return 0;
-	}
+	if (WaitUntil(Tune::kStreamTimeoutMs, [&] { return STREAMING::HAS_MODEL_LOADED(model) != 0; })) return true;
+	STREAMING::SET_MODEL_AS_NO_LONGER_NEEDED(model);
+	return false;
+}
+
+static Ped SpawnPed(Hash model, const Vector3& pos)
+{
+	if (!LoadModel(model)) return 0;
 	Ped ped = PED::CREATE_PED(model, pos, 0.0f, 0, 1, 1, 1);
 	PED::_SET_RANDOM_OUTFIT_VARIATION(ped, true);
 	ENTITY::PLACE_ENTITY_ON_GROUND_PROPERLY(ped, 1);
@@ -141,6 +184,155 @@ static void AddCorpseBlip()
 {
 	C.targetBlip = MAP::BLIP_ADD_FOR_COORDS(joaat("BLIP_STYLE_CREATOR_DEFAULT"), C.targetPos);
 	StyleTargetBlip(C.targetBlip, "BLIP_MODIFIER_MP_COLOR_6", false, true);
+}
+
+// ===== [ TARGET PHOTO ] =====
+// The game's own ped-portrait renderer (the Online persona photo / companion-app mugshot), driven the way
+// Rockstar's spd_agnesdowd1 script drives it. It writes the portrait into a texture named Card::kPedshotName.
+static void TakeTargetPhoto(Ped ped)
+{
+	GRAPHICS::_PEDSHOT_SET_PERSONA_PHOTO_TYPE(0);
+	GRAPHICS::_0xFD05B1DDE83749FA(Card::kPedshotName);
+	GRAPHICS::_PEDSHOT_PREVIOUS_PERSONA_PHOTO_DATA_CLEANUP();
+	GRAPHICS::_PEDSHOT_GENERATE_PERSONA_PHOTO(Card::kPedshotName, ped, 0);
+	GRAPHICS::_0x402E1A61D2587FCD(0, ENTITY::GET_ENTITY_COORDS(ped, true, false), 0.0f, 0.0f, ENTITY::GET_ENTITY_HEADING(ped));
+	C.photoTaken = true;
+}
+static void ReleaseTargetPhoto()
+{
+	if (!C.photoTaken) return;
+	GRAPHICS::_PEDSHOT_INIT_CLEANUP_DATA();
+	GRAPHICS::_PEDSHOT_FINISH_CLEANUP_DATA();
+	GRAPHICS::_0x5C9C3A466B3296A8(0);
+}
+static bool TargetPhotoReady()
+{
+	return C.photoTaken && TXD::DOES_STREAMED_TEXTURE_DICT_EXIST(Card::kPedshotName) != 0;
+}
+
+// Spawns the target next to the player first — hidden, frozen, no collision — so his clothes and textures
+// stream in and the portrait renderer has a fully built ped to shoot. Then moves him to his town.
+static Ped SpawnTargetWithPhoto(Hash model, const ContractDef& def)
+{
+	Ped ped = SpawnPed(model, ENTITY::GET_OFFSET_FROM_ENTITY_IN_WORLD_COORDS(pedMe, 0.0f, -1.5f, 0.0f));
+	if (!ped) return 0;
+	ENTITY::SET_ENTITY_AS_MISSION_ENTITY(ped, true, true);
+	ENTITY::FREEZE_ENTITY_POSITION(ped, true);
+	ENTITY::SET_ENTITY_COLLISION(ped, false, false);
+	ENTITY::SET_ENTITY_HEADING(ped, ENTITY::GET_ENTITY_HEADING(pedMe));
+	if (Tune::kPedshotHidden) ENTITY::SET_ENTITY_VISIBLE(ped, false);
+
+	C.photoPedWasReady = WaitUntil(Tune::kPedshotReadyMs, [&] { return PED::IS_PED_READY_TO_RENDER(ped) != 0; });
+	TakeTargetPhoto(ped);
+	ScriptSleep(Tune::kPedshotSettleMs);
+
+	if (Tune::kPedshotHidden) ENTITY::SET_ENTITY_VISIBLE(ped, true);
+	ENTITY::SET_ENTITY_COLLISION(ped, true, false);
+	ENTITY::FREEZE_ENTITY_POSITION(ped, false);
+	ENTITY::SET_ENTITY_COORDS(ped, def.spawn.x, def.spawn.y, def.spawn.z, false, false, false, true);
+	ENTITY::PLACE_ENTITY_ON_GROUND_PROPERLY(ped, 1);
+	return ped;
+}
+
+// ===== [ CONTRACT CARD ] =====
+static void LinkCardRenderTarget()
+{
+	if (!Tune::kCardFaceRenderTarget) return;
+	if (!HUD::IS_NAMED_RENDERTARGET_REGISTERED(Card::kRenderTarget)) HUD::REGISTER_NAMED_RENDERTARGET(Card::kRenderTarget, false);
+	if (!HUD::IS_NAMED_RENDERTARGET_LINKED(Card::kPropModel)) HUD::LINK_NAMED_RENDERTARGET(Card::kPropModel);
+	Cd.renderId = HUD::GET_NAMED_RENDERTARGET_RENDER_ID(Card::kRenderTarget);
+}
+
+static bool CreateCardObject()
+{
+	if (Cd.obj) return true;
+	if (!LoadModel(Card::kPropModel)) return false;
+	Cd.obj = OBJECT::CREATE_OBJECT(Card::kPropModel, ENTITY::GET_OFFSET_FROM_ENTITY_IN_WORLD_COORDS(pedMe, 0.0f, 0.5f, 0.0f), true, true, true, false, false);
+	STREAMING::SET_MODEL_AS_NO_LONGER_NEEDED(Card::kPropModel);
+	if (!ENTITY::DOES_ENTITY_EXIST(Cd.obj)) { Cd.obj = 0; return false; }
+	OBJECT::_SET_OBJECT_PROMPT_NAME(Cd.obj, Card::kTitle);
+	LinkCardRenderTarget();
+	return true;
+}
+
+static void DestroyCardObject()
+{
+	if (Cd.obj && ENTITY::DOES_ENTITY_EXIST(Cd.obj))
+	{
+		if (ENTITY::IS_ENTITY_ATTACHED(Cd.obj)) ENTITY::DETACH_ENTITY(Cd.obj, true, false);
+		OBJECT::DELETE_OBJECT(&Cd.obj);
+	}
+	Cd = CardRuntime();
+}
+
+// Player takes the card out and examines it (Zoom / Flip / Put Away are the game's own prompts).
+static bool OpenCard()
+{
+	if (Cd.obj || !CreateCardObject()) return false;
+	TASK::_TASK_ITEM_INTERACTION_2(pedMe, Card::kItem, Cd.obj, Card::kPropId, Card::kStartState, 1, 0, -1.0f);
+	Cd.examining = true;
+	Cd.openedMs = GetTickCount64();
+	return true;
+}
+
+// Card in the player's hand for the hand-in animation (no examine UI).
+static void AttachCardToHand()
+{
+	if (!CreateCardObject()) return;
+	int bone = ENTITY::GET_ENTITY_BONE_INDEX_BY_NAME(pedMe, Card::kHandBone);
+	if (bone < 0) { DestroyCardObject(); return; }
+	ENTITY::ATTACH_ENTITY_TO_ENTITY(Cd.obj, pedMe, bone, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, false, false, false, true, 0, true, false, false);
+	Cd.inHand = true;
+}
+
+// The target's portrait, drawn onto the card prop through its render target. Corpse photo = the same
+// portrait in a dead, faded tint (there is no native that turns an in-game camera photo into a texture).
+static void DrawCardFace(bool corpse)
+{
+	if (!Cd.renderId || !TargetPhotoReady()) return;
+	HUD::SET_TEXT_RENDER_ID(Cd.renderId);
+	if (corpse) GRAPHICS::DRAW_SPRITE(Card::kPedshotName, Card::kPedshotName, 0.5f, 0.5f, 1.0f, 1.0f, 0.0f, 150, 105, 95, 255, false);
+	else        GRAPHICS::DRAW_SPRITE(Card::kPedshotName, Card::kPedshotName, 0.5f, 0.5f, 1.0f, 1.0f, 0.0f, 255, 255, 255, 255, false);
+	HUD::SET_TEXT_RENDER_ID(kDefaultRenderId);
+}
+
+// The "back" of the card: a screen-space panel with the portrait, who the target is, where he is, and the pay.
+static void DrawCardBackPanel()
+{
+	if (!C.def) return;
+	GRAPHICS::DRAW_RECT(0.50f, 0.50f, 0.40f, 0.34f, 18, 14, 11, 225, false, false);
+	if (TargetPhotoReady())
+		GRAPHICS::DRAW_SPRITE(Card::kPedshotName, Card::kPedshotName, 0.395f, 0.50f, 0.15f, 0.27f, 0.0f, 255, 255, 255, 255, false);
+
+	char lo[16], hi[16], reward[48];
+	FormatMoney(lo, sizeof lo, Tune::kPayoutMinCents);
+	FormatMoney(hi, sizeof hi, Tune::kPayoutMaxCents);
+	sprintf_s(reward, "%s - %s", lo, hi);
+	DrawTextToScreen(C.def->targetDesc, 0.49f, 0.37f, 0.36f, 255, 255, 255, 255);
+	DrawTextToScreen(C.def->hint,       0.49f, 0.43f, 0.36f, 255, 255, 255, 255);
+	DrawTextToScreen(reward,            0.52f, 0.57f, 0.72f, 255, 255, 255, 255);
+}
+
+static void UpdateCard()
+{
+	ULONGLONG now = GetTickCount64();
+	if (C.cardOpenAtMs && now >= C.cardOpenAtMs)
+	{
+		C.cardOpenAtMs = 0;
+		OpenCard();
+	}
+	if (Cd.examining)
+	{
+		bool running = TASK::IS_PED_RUNNING_TASK_ITEM_INTERACTION(pedMe) != 0;
+		if (!running && now > Cd.openedMs + 1500) { DestroyCardObject(); return; } // put away (or the task never started)
+		DrawCardFace(false);
+		Hash state = TASK::GET_ITEM_INTERACTION_STATE(pedMe);
+		if (state == Card::kStateFlipToBack || state == Card::kStateFlippedBase) DrawCardBackPanel();
+	}
+	else if (Cd.inHand)
+	{
+		DrawCardFace(true);
+	}
 }
 
 // ===== [ HUMAN TARGET: SETUP ] =====
@@ -299,6 +491,44 @@ static void UpdateHumanTarget(Ped ped, const ContractDef& def)
 
 const TargetBehavior kHumanTarget = { SetupHumanTarget, UpdateHumanTarget };
 
+// ===== [ PAYOUT ] =====
+// Longer contracts pay more (linear up to kFullPayMinutes); getting wanted after the crime cuts the pay.
+static int ComputePayoutCents()
+{
+	ULONGLONG end = C.photoMs ? C.photoMs : GetTickCount64();
+	float minutes = (float)(end - C.startMs) / 60000.0f;
+	float t = minutes / Tune::kFullPayMinutes;
+	if (t < 0.0f) t = 0.0f;
+	if (t > 1.0f) t = 1.0f;
+	float pay = Tune::kPayoutMinCents + (Tune::kPayoutMaxCents - Tune::kPayoutMinCents) * t;
+	if (C.gotWanted) pay *= Tune::kWantedPayoutMult;
+	int cents = ((int)pay / Tune::kPayoutStepCents) * Tune::kPayoutStepCents;
+	if (cents < Tune::kPayoutMinCents) cents = Tune::kPayoutMinCents;
+	if (cents > Tune::kPayoutMaxCents) cents = Tune::kPayoutMaxCents;
+	return cents;
+}
+
+// "The crime" starts at the first hostile contact between the player and the target; from then on any
+// law incident, wanted score or bounty increase counts as getting wanted.
+static void UpdateCrimeTracking()
+{
+	if (!TargetExists()) return;
+	if (!C.crimeMs)
+	{
+		if (PED::IS_PED_IN_COMBAT(C.target, pedMe) || ENTITY::HAS_ENTITY_BEEN_DAMAGED_BY_ENTITY(C.target, pedMe, true, true))
+		{
+			C.crimeMs = GetTickCount64();
+			C.bountyAtCrime = LAW::GET_BOUNTY(me);
+		}
+		return;
+	}
+	if (!C.gotWanted &&
+		(LAW::IS_LAW_INCIDENT_ACTIVE(me) || LAW::GET_WANTED_SCORE(me) > 0 || LAW::GET_BOUNTY(me) > C.bountyAtCrime))
+	{
+		C.gotWanted = true;
+	}
+}
+
 // ===== [ CONTRACT LIFECYCLE ] =====
 static void ClearContract(bool deleteTarget)
 {
@@ -306,6 +536,9 @@ static void ClearContract(bool deleteTarget)
 	RemoveBlip(C.targetBlip);
 	PLAYER::_CLEAR_PED_EAGLE_EYE_TRAILS_FOR_PLAYER(me);
 	PLAYER::_UNREGISTER_EAGLE_EYE_FOR_ENTITY(me, C.target);
+	DestroyCardObject();
+	ReleaseTargetPhoto();
+	if (C.cashObj && ENTITY::DOES_ENTITY_EXIST(C.cashObj)) OBJECT::DELETE_OBJECT(&C.cashObj);
 	if (C.def && C.def->onCleanup) C.def->onCleanup();
 	if (deleteTarget && TargetExists()) PED::DELETE_PED(&C.target);
 	ENTITY::SET_ENTITY_AS_NO_LONGER_NEEDED(&C.target);
@@ -315,7 +548,7 @@ static void ClearContract(bool deleteTarget)
 	g_state = CONTRACT_NONE;
 }
 
-// Rolls a random contract and spawns its target. False if nothing could be spawned.
+// Rolls a random contract, photographs and spawns its target. False if nothing could be spawned.
 static bool StartContract()
 {
 	ClearContract(true);
@@ -323,13 +556,13 @@ static bool StartContract()
 	{
 		const ContractDef& def = kContracts[rand() % kContractCount];
 		Hash model = def.models.list[rand() % def.models.count];
-		Ped ped = SpawnPed(model, def.spawn);
+		Ped ped = SpawnTargetWithPhoto(model, def);
 		if (!ped) continue;
 
 		C.def = &def;
 		C.target = ped;
 		C.targetPos = def.spawn;
-		ENTITY::SET_ENTITY_AS_MISSION_ENTITY(ped, true, true);
+		C.startMs = GetTickCount64();
 		def.behavior->setup(ped, def);
 		if (def.onSpawned) def.onSpawned(def);
 		AddSearchBlip();
@@ -445,7 +678,54 @@ static void CheckTargetDeath()
 		AUDIO::PLAY_SOUND_FRONTEND("take_photo", "Photo_Mode_Sounds", true, 0);
 		ShowPrompt(camPrompt, false);
 		RemoveBlip(C.targetBlip);
+		C.photoMs = GetTickCount64();
 		g_state = CONTRACT_DEAD;
+	}
+}
+
+// ===== [ HAND-IN: PHOTO FOR CASH ] =====
+static void UpdatePayment()
+{
+	ULONGLONG now = GetTickCount64();
+
+	if (Cd.inHand && now >= C.handInStartMs + Tune::kHandInCardMs) DestroyCardObject();
+
+	if (!C.cashSpawned && now >= C.handInStartMs + Tune::kCashSpawnDelayMs)
+	{
+		C.cashSpawned = true;
+		Vector3 giver = ENTITY::DOES_ENTITY_EXIST(C.payingGiver) ? ENTITY::GET_ENTITY_COORDS(C.payingGiver, true, false) : playerPos;
+		Vector3 counter((giver.x + playerPos.x) * 0.5f, (giver.y + playerPos.y) * 0.5f, giver.z + Tune::kCounterHeight);
+		C.cashObj = OBJECT::CREATE_AMBIENT_PICKUP(Card::kCashPickup, counter, 0, C.payoutCents, 0, true, true, 0, 0.0f);
+
+		char money[16], msg[64];
+		FormatMoney(money, sizeof money, C.payoutCents);
+		if (!C.cashObj || !ENTITY::DOES_ENTITY_EXIST(C.cashObj))
+		{
+			// No pickup could be placed — pay directly rather than short the player.
+			MONEY::_MONEY_INCREMENT_CASH_BALANCE(C.payoutCents, 0);
+			sprintf_s(msg, "REWARD RECEIVED: %s", money);
+			DisplaySubtitle(msg);
+			ClearContract(false);
+			return;
+		}
+		sprintf_s(msg, "TAKE YOUR PAYMENT: %s", money);
+		DisplaySubtitle(msg);
+		return;
+	}
+
+	if (!C.cashSpawned) return;
+	bool taken    = !ENTITY::DOES_ENTITY_EXIST(C.cashObj);
+	bool timedOut = now > C.handInStartMs + Tune::kCashSpawnDelayMs + Tune::kCashTimeoutMs;
+	if (taken)
+	{
+		C.cashObj = 0;
+		DisplaySubtitle("REWARD RECEIVED");
+		ClearContract(false);
+	}
+	else if (timedOut)
+	{
+		MONEY::_MONEY_INCREMENT_CASH_BALANCE(C.payoutCents, 0); // left on the counter too long: pay it out anyway
+		ClearContract(false);
 	}
 }
 
@@ -522,9 +802,23 @@ static void UpdateGiverPrompt()
 	switch (g_state)
 	{
 	case CONTRACT_NONE:
+	{
+		ULONGLONG handoffMs = GetTickCount64();
 		PlayGiverHandoff(giver, false);
-		DisplaySubtitle(StartContract() ? "FIND THE TARGET" : "NO CONTRACTS AVAILABLE");
+		if (StartContract())
+		{
+			// The clerk is handing the card over; the player examines it once the handoff anim has played.
+			ULONGLONG now = GetTickCount64();
+			ULONGLONG at  = handoffMs + Tune::kCardOpenDelayMs;
+			C.cardOpenAtMs = at > now ? at : now;
+			DisplaySubtitle("FIND THE TARGET");
+		}
+		else
+		{
+			DisplaySubtitle("NO CONTRACTS AVAILABLE");
+		}
 		break;
+	}
 
 	case CONTRACT_UNKNOWN:
 	case CONTRACT_FOUND:
@@ -533,31 +827,69 @@ static void UpdateGiverPrompt()
 		break;
 
 	case CONTRACT_DEAD:
-		DisplaySubtitle("REWARD RECEIVED");
+		// Hand the clerk the corpse photo; he puts the money on the counter (UpdatePayment).
+		C.payoutCents   = ComputePayoutCents();
+		C.payingGiver   = giver;
+		C.handInStartMs = GetTickCount64();
 		PlayGiverHandoff(giver, true);
-		MONEY::_MONEY_INCREMENT_CASH_BALANCE(C.def ? C.def->reward : Tune::kDefaultReward, 0);
-		ClearContract(false);
+		AttachCardToHand();
+		ShowPrompt(giverPrompt, false);
+		g_state = CONTRACT_PAID;
+		break;
+
+	case CONTRACT_PAID:
 		break;
 	}
 }
 
 // ===== [ DEBUG ] =====
+#if CONTRACTS_DEBUG_HUD
+static const char* CardStateName(Hash h)
+{
+	if (h == Card::kStateIntro)       return "INTRO";
+	if (h == Card::kStateBase)        return "BASE";
+	if (h == Card::kStateFlipToBack)  return "FLIP_TO_BACK";
+	if (h == Card::kStateFlippedBase) return "FLIPPED";
+	if (h == Card::kStateFlipToFront) return "FLIP_TO_FRONT";
+	if (h == Card::kStateHolster)     return "HOLSTER";
+	return h ? "other" : "-";
+}
+#endif
+
 static void DebugUpdate()
 {
 #if CONTRACTS_DEBUG_KEYS
-	if (IsKeyJustUp(0x55)) // U: skip the clerk and roll a fresh contract
-		DisplaySubtitle(StartContract() ? "FIND THE TARGET" : "NO CONTRACTS AVAILABLE");
+	if (IsKeyJustUp(0x55)) // U: skip the clerk and roll a fresh contract, card in hand right away
+	{
+		if (StartContract()) { C.cardOpenAtMs = GetTickCount64(); DisplaySubtitle("FIND THE TARGET"); }
+		else                 DisplaySubtitle("NO CONTRACTS AVAILABLE");
+	}
 #endif
 #if CONTRACTS_DEBUG_HUD
-	// state 0=NONE 1=UNKNOWN 2=FOUND 3=DEAD   task 0=WANDER 1=AGGRO
+	// state 0=NONE 1=UNKNOWN 2=FOUND 3=DEAD 4=PAID   task 0=WANDER 1=AGGRO
 	bool  have   = TargetExists();
 	int   losRaw = have ? (ENTITY::HAS_ENTITY_CLEAR_LOS_TO_ENTITY(C.target, pedMe, 17) ? 1 : 0) : -1;
 	int   sees   = have ? (TargetCanSeePlayer() ? 1 : 0) : -1;
 	float dist   = have ? sqrtf(DistSq(playerPos, C.targetPos)) : -1.0f;
-	char dbg[180];
-	sprintf_s(dbg, "state=%d task=%d remember=%d losRaw=%d sees=%d dist=%.1f",
+	char line[200], money[16];
+	sprintf_s(line, "state=%d task=%d remember=%d losRaw=%d sees=%d dist=%.1f",
 		(int)g_state, (int)C.task, C.remembersPlayer ? 1 : 0, losRaw, sees, dist);
-	DrawTextToScreen(dbg, 0.05f, 0.08f, 0.4f, 255, 255, 0, 255);
+	DrawTextToScreen(line, 0.05f, 0.08f, 0.4f, 255, 255, 0, 255);
+
+	Hash cardState = TASK::GET_ITEM_INTERACTION_STATE(pedMe);
+	sprintf_s(line, "photo: taken=%d pedReady=%d txd=%d | card: obj=%d exam=%d hand=%d task=%d st=%s rt=%d | item=%d",
+		C.photoTaken ? 1 : 0, C.photoPedWasReady ? 1 : 0, TargetPhotoReady() ? 1 : 0,
+		Cd.obj ? 1 : 0, Cd.examining ? 1 : 0, Cd.inHand ? 1 : 0,
+		TASK::IS_PED_RUNNING_TASK_ITEM_INTERACTION(pedMe) ? 1 : 0, CardStateName(cardState), Cd.renderId,
+		ITEMDATABASE::_ITEMDATABASE_IS_KEY_VALID(Card::kItem, 0) ? 1 : 0);
+	DrawTextToScreen(line, 0.05f, 0.11f, 0.4f, 255, 255, 0, 255);
+
+	float minutes = C.startMs ? (float)((C.photoMs ? C.photoMs : GetTickCount64()) - C.startMs) / 60000.0f : 0.0f;
+	FormatMoney(money, sizeof money, C.startMs ? ComputePayoutCents() : 0);
+	sprintf_s(line, "pay: minutes=%.1f crime=%d wanted=%d lawActive=%d score=%d bounty=%d est=%s cash=%d",
+		minutes, C.crimeMs ? 1 : 0, C.gotWanted ? 1 : 0, LAW::IS_LAW_INCIDENT_ACTIVE(me) ? 1 : 0,
+		LAW::GET_WANTED_SCORE(me), LAW::GET_BOUNTY(me), money, C.cashObj ? 1 : 0);
+	DrawTextToScreen(line, 0.05f, 0.14f, 0.4f, 255, 255, 0, 255);
 #endif
 }
 
@@ -587,6 +919,10 @@ void ScriptMain()
 			ClearContract(false);
 		}
 
+		// Look at the contract card again.
+		if (ContractActive() && !Cd.obj && !C.cardOpenAtMs && IsKeyJustUp(Tune::kInspectCardKey)) OpenCard();
+		UpdateCard();
+
 		switch (g_state)
 		{
 		case CONTRACT_NONE:
@@ -596,17 +932,23 @@ void ScriptMain()
 			UpdateGiverPrompt();
 			UpdateTrails();
 			UpdateTargetAI();
+			UpdateCrimeTracking();
 			CheckTargetFound();
 			break;
 		case CONTRACT_FOUND:
 			UpdateGiverPrompt();
 			UpdateTrails();
 			UpdateTargetAI();
+			UpdateCrimeTracking();
 			CheckTargetDeath();
 			break;
 		case CONTRACT_DEAD:
 			UpdateTrails();
 			UpdateGiverPrompt();
+			UpdateCrimeTracking();
+			break;
+		case CONTRACT_PAID:
+			UpdatePayment();
 			break;
 		}
 		WAIT(0);

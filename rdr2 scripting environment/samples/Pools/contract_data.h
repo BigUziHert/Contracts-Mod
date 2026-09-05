@@ -61,8 +61,24 @@ namespace Tune
 	// --- giver interaction ---
 	constexpr float kGiverPlayerDist  = 1.8f;    // player must be this close to the giver's spot
 	constexpr float kGiverSpotDist    = 0.5f;    // giver must be this close to their own spot
-	// --- economy ---
-	constexpr int   kDefaultReward    = 2500;
+	// --- payout (all money is in CENTS: 2500 = $25.00) ---
+	constexpr int   kPayoutMinCents   = 2500;    // $25 floor
+	constexpr int   kPayoutMaxCents   = 17500;   // $175 ceiling
+	constexpr float kFullPayMinutes   = 20.0f;   // a contract this long (or longer) pays the ceiling; shorter pays proportionally less
+	constexpr float kWantedPayoutMult = 0.5f;    // multiplier if the player got wanted after the crime
+	constexpr int   kPayoutStepCents  = 25;      // payout is rounded down to this step
+	// --- hand-in: photo + money on the counter ---
+	constexpr DWORD kCashSpawnDelayMs = 1500;    // clerk anim runs this long before the cash appears
+	constexpr DWORD kHandInCardMs     = 2500;    // the corpse photo stays in the player's hand this long
+	constexpr float kCounterHeight    = 1.0f;    // cash spawns this far above the clerk's feet (drops onto the counter)
+	constexpr DWORD kCashTimeoutMs    = 120000;  // if the player never takes the cash, the contract closes anyway
+	// --- contract card ---
+	constexpr DWORD kCardOpenDelayMs  = 2500;    // wait for the clerk handoff anim before the player examines the card
+	constexpr int   kInspectCardKey   = 0x49;    // 'I' — look at the card again mid-contract
+	constexpr bool  kCardFaceRenderTarget = true;// draw the target's photo onto the card prop (render target). Back panel always draws.
+	constexpr bool  kPedshotHidden    = true;    // hide the target while his photo is taken next to the player
+	constexpr int   kPedshotReadyMs   = 4000;    // wait for the ped's assets to stream before the photo
+	constexpr int   kPedshotSettleMs  = 750;     // give the photo renderer this long before moving the ped away
 	// --- streaming ---
 	constexpr DWORD kStreamTimeoutMs  = 5000;    // give up on a model / anim that won't load instead of hanging the script
 	constexpr int   kSpawnAttempts    = 3;       // contract rerolls before "no contracts available"
@@ -86,19 +102,21 @@ extern const TargetBehavior kHumanTarget;   // script.cpp — armed townsman: wa
 struct ContractDef
 {
 	const char*           name;
+	const char*           targetDesc;   // card back, line 1: "The target is a dock worker"
+	const char*           hint;         // card back, line 2: "Works the docks in Saint Denis"
 	Vector3               spawn;
 	float                 searchRadius;
 	ModelSet              models;
-	int                   reward;
 	const TargetBehavior* behavior;
 	void (*onSpawned)(const ContractDef& def);  // optional: dress the location (camp, props, extra peds)
 	void (*onCleanup)();                        // optional: undo onSpawned when the contract ends
 };
 
 // A townsman wandering a radius around the spawn point.
-inline ContractDef Town(const char* name, float x, float y, float z, float searchRadius, ModelSet models, int reward = Tune::kDefaultReward)
+inline ContractDef Town(const char* name, const char* targetDesc, const char* hint,
+                        float x, float y, float z, float searchRadius, ModelSet models)
 {
-	return { name, Vector3(x, y, z), searchRadius, models, reward, &kHumanTarget, nullptr, nullptr };
+	return { name, targetDesc, hint, Vector3(x, y, z), searchRadius, models, &kHumanTarget, nullptr, nullptr };
 }
 
 enum GiverKind { GIVER_CLERK };   // future: GIVER_SHERIFF, GIVER_BARTENDER ...
@@ -201,30 +219,29 @@ static constexpr Hash RHODES[] = {
 };
 
 // ===== [ CONTRACTS ] =====
-//                     name                          spawn x     y          z       radius  models
 static const ContractDef kContracts[] = {
-	Town("Rhodes Bar",                1370.0f,  -1354.0f,   78.0f,   65.0f, Models(RHODES)),
-	Town("Rhodes Shops",              1309.5f,  -1292.5f,   76.0f,   50.0f, Models(RHODES)),
-	Town("Rhodes Mill",               1388.5f,  -1313.0f,   77.5f,   60.0f, Models(RHODES)),
-	Town("Rhodes Trapper",            1341.0f,  -1148.5f,   82.5f,   50.0f, Models(RHODES)),
+	Town("Rhodes Bar",              "The target is a regular at the saloon",   "Drinks at the saloon in Rhodes",              1370.0f,  -1354.0f,   78.0f, 65.0f, Models(RHODES)),
+	Town("Rhodes Shops",            "The target runs errands in town",         "Seen around the shops in Rhodes",             1309.5f,  -1292.5f,   76.0f, 50.0f, Models(RHODES)),
+	Town("Rhodes Mill",             "The target works at the lumber mill",     "Works the mill on the east side of Rhodes",   1388.5f,  -1313.0f,   77.5f, 60.0f, Models(RHODES)),
+	Town("Rhodes Trapper",          "The target trades in pelts",              "Hangs around the trapper north of Rhodes",    1341.0f,  -1148.5f,   82.5f, 50.0f, Models(RHODES)),
 
-	Town("Blackwater Bar",            -814.0f,  -1318.5f,   44.0f,   45.0f, Models(BLW_BAR)),
-	Town("Blackwater Harbor Right",   -730.0f,  -1275.0f,   44.0f,   60.0f, Models(BLW_DOCK_RIGHT)),
-	Town("Blackwater Harbor Left",    -732.0f,  -1243.0f,   45.0f,   60.0f, Models(BLW_DOCK_LEFT)),
-	Town("Blackwater Construction",   -809.0f,  -1220.0f,   43.5f,   55.0f, Models(BLW_CONSTRUCTION)),
+	Town("Blackwater Bar",          "The target is a heavy drinker",           "Drinks at the saloon in Blackwater",          -814.0f,  -1318.5f,   44.0f, 45.0f, Models(BLW_BAR)),
+	Town("Blackwater Harbor Right", "The target is a dock hand",               "Works the docks in Blackwater",               -730.0f,  -1275.0f,   44.0f, 60.0f, Models(BLW_DOCK_RIGHT)),
+	Town("Blackwater Harbor Left",  "The target is a dock hand",               "Works the docks in Blackwater",               -732.0f,  -1243.0f,   45.0f, 60.0f, Models(BLW_DOCK_LEFT)),
+	Town("Blackwater Construction", "The target is a laborer",                 "Works the building site in Blackwater",       -809.0f,  -1220.0f,   43.5f, 55.0f, Models(BLW_CONSTRUCTION)),
 
-	Town("Valentine Rich Bar",        -309.0f,    808.5f,  119.0f,   40.0f, Models(VAL_RICH_BAR)),
-	Town("Valentine Poor Bar",        -243.0f,    769.0f,  118.0f,   50.0f, Models(VAL_POOR_BAR)),
-	Town("Valentine Auction Yard",    -236.0f,    652.0f,  113.0f,   80.0f, Models(VAL_AUCTION)),
+	Town("Valentine Rich Bar",      "The target is a gambler",                 "Drinks at the big saloon in Valentine",       -309.0f,    808.5f,  119.0f, 40.0f, Models(VAL_RICH_BAR)),
+	Town("Valentine Poor Bar",      "The target is a drunk",                   "Drinks at the cheap saloon in Valentine",     -243.0f,    769.0f,  118.0f, 50.0f, Models(VAL_POOR_BAR)),
+	Town("Valentine Auction Yard",  "The target is a livestock hand",          "Works the auction yard in Valentine",         -236.0f,    652.0f,  113.0f, 80.0f, Models(VAL_AUCTION)),
 
-	Town("Strawberry Bottom Left",   -1828.0f,   -413.5f,  161.0f,   55.0f, Models(STRAWBERRY)),
-	Town("Strawberry Bottom Right",  -1789.0f,   -427.0f,  115.5f,   55.0f, Models(STRAWBERRY)),
-	Town("Strawberry Top Left",      -1795.0f,   -364.0f,  162.0f,   55.0f, Models(STRAWBERRY)),
-	Town("Strawberry Top Right",     -1775.0f,   -387.5f,  157.0f,   55.0f, Models(STRAWBERRY)),
+	Town("Strawberry Bottom Left",  "The target is a townsman",                "Hangs around the lower end of Strawberry",   -1828.0f,   -413.5f,  161.0f, 55.0f, Models(STRAWBERRY)),
+	Town("Strawberry Bottom Right", "The target is a townsman",                "Hangs around the lower end of Strawberry",   -1789.0f,   -427.0f,  115.5f, 55.0f, Models(STRAWBERRY)),
+	Town("Strawberry Top Left",     "The target is a townsman",                "Hangs around the upper end of Strawberry",   -1795.0f,   -364.0f,  162.0f, 55.0f, Models(STRAWBERRY)),
+	Town("Strawberry Top Right",    "The target is a townsman",                "Hangs around the upper end of Strawberry",   -1775.0f,   -387.5f,  157.0f, 55.0f, Models(STRAWBERRY)),
 
-	Town("Saint Denis Dock 1",        2778.5f,  -1462.5f,   45.5f,   35.0f, Models(SD_DOCK)),
-	Town("Saint Denis Dock 2",        2787.5f,  -1439.5f,   45.5f,   35.0f, Models(SD_DOCK)),
-	Town("Saint Denis Cool Bar",      2615.5f,  -1212.5f,   53.5f,   35.0f, Models(SD_RICH_BAR)),
+	Town("Saint Denis Dock 1",      "The target is a dock worker",             "Works the docks in Saint Denis",              2778.5f,  -1462.5f,   45.5f, 35.0f, Models(SD_DOCK)),
+	Town("Saint Denis Dock 2",      "The target is a dock worker",             "Works the docks in Saint Denis",              2787.5f,  -1439.5f,   45.5f, 35.0f, Models(SD_DOCK)),
+	Town("Saint Denis Cool Bar",    "The target is a well-dressed gentleman",  "Drinks at the saloon in Saint Denis",         2615.5f,  -1212.5f,   53.5f, 35.0f, Models(SD_RICH_BAR)),
 };
 static const int kContractCount = (int)(sizeof(kContracts) / sizeof(kContracts[0]));
 
@@ -262,3 +279,32 @@ static const GiverSpot kGivers[] = {
 	{ { 2933.0f,   1282.5f,   44.5f  }, CLERK_STATION, GIVER_CLERK }, // middle
 	{ { 2939.0f,   1287.0f,   44.5f  }, CLERK_STATION, GIVER_CLERK }, // left
 };
+
+// ===== [ CONTRACT CARD ] =====
+// The physical card the clerk hands over: a 4x6 photo card examined through the game's own item-inspect
+// task (Zoom / Flip / Put Away). Interaction states from femga rdr3_discoveries/tasks/TASK_ITEM_INTERACTION.
+namespace Card
+{
+	constexpr Hash kPropModel  = Joaat("p_cs_photonudie01x_4x6");            // CARD@W6-5_H10-7 portrait photo card
+	constexpr Hash kPropId     = Joaat("P_CS_PHOTONUDIE01X_4X6_PH_R_HAND");  // <prop>_PH_R_HAND, per the documented pattern
+	constexpr Hash kItem       = Joaat("document_cig_card_grl");             // vanilla cigarette-card inventory item that owns the card animations
+	constexpr Hash kStateIntro       = Joaat("CIGARETTE_CARD_W6-5_H10-7_SINGLE_INTRO");
+	constexpr Hash kStateBase        = Joaat("CIGARETTE_CARD_W6-5_H10-7_SINGLE_BASE");
+	constexpr Hash kStateFlipToBack  = Joaat("CIGARETTE_CARD_W6-5_H10-7_SINGLE_FLIP_TO_BACK");
+	constexpr Hash kStateFlippedBase = Joaat("CIGARETTE_CARD_W6-5_H10-7_SINGLE_FLIPPED_BASE");
+	constexpr Hash kStateFlipToFront = Joaat("CIGARETTE_CARD_W6-5_H10-7_SINGLE_FLIP_TO_FRONT");
+	constexpr Hash kStateHolster     = Joaat("CIGARETTE_CARD_W6-5_H10-7_SINGLE_HOLSTER");
+	constexpr Hash kStartState       = kStateIntro;
+	constexpr const char* kTitle        = "Contract Information";
+	constexpr const char* kPedshotName  = "CONTRACT_TARGET";   // texture the game writes the target's photo into
+	constexpr const char* kRenderTarget = "contract_card";
+	constexpr const char* kHandBone     = "PH_R_Hand";
+	constexpr Hash kCashPickup = Joaat("PICKUP_MONEY_VARIABLE");
+}
+// Hashes verified against femga's documented values.
+static_assert(Card::kStateIntro       == 0xAB6FE483, "card state hash");
+static_assert(Card::kStateBase        == 0xA266F046, "card state hash");
+static_assert(Card::kStateFlipToBack  == 0x4C0134F2, "card state hash");
+static_assert(Card::kStateFlippedBase == 0xF53D8689, "card state hash");
+static_assert(Card::kStateFlipToFront == 0x19946CB0, "card state hash");
+static_assert(Card::kStateHolster     == 0x1CFAA394, "card state hash");
