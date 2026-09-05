@@ -74,7 +74,8 @@ namespace Tune
 	constexpr DWORD kCashTimeoutMs    = 120000;  // if the player never takes the cash, the contract closes anyway
 	// --- contract card ---
 	constexpr DWORD kCardOpenDelayMs  = 2500;    // wait for the clerk handoff anim before the player examines the card
-	constexpr int   kInspectCardKey   = 0x49;    // 'I' — look at the card again mid-contract
+	constexpr int   kInspectCardKey   = 0x49;    // 'I' — look at the card again mid-contract (photograph recipe, as Contracts Remastered)
+	constexpr int   kInspectCardAltKey = 0x4F;   // 'O' — same card through the cigarette-card recipe (debug comparison; flips natively)
 	constexpr bool  kCardFaceRenderTarget = true;// draw the target's photo onto the card prop (render target). Back panel always draws.
 	constexpr bool  kPedshotHidden    = true;    // hide the target while his photo is taken next to the player
 	constexpr int   kPedshotReadyMs   = 4000;    // wait for the ped's assets to stream before the photo
@@ -299,15 +300,26 @@ namespace Card
 	constexpr const char* kFlipBlackboard = "GENERIC_DOCUMENT_FLIP_AVAILABLE";  // player-ped blackboard bool that enables the Flip prompt (R* generic_document_inspection)
 	constexpr DWORD kTaskStartWaitMs = 700;                                   // wait for the inspect task to report running before trying the fallback path
 	constexpr const char* kTitle        = "Contract Information";
+	constexpr const char* kTitleLabel   = "BC_CARD_TITLE";                    // GXT label from dist/lml/BountyContracts/strings.gxt2 (used when installed; literal text otherwise)
 	constexpr const char* kRenderTarget = "contract_card";
 	constexpr const char* kHandBone     = "PH_R_Hand";
 	constexpr Hash kCashPickup = Joaat("PICKUP_MONEY_VARIABLE");
 
-	// --- target portrait (the game's persona-photo / pedshot pipeline, as the MP persona_photos script drives it) ---
+	// Alternate recipe (debug key O): the cigarette-card item + states, which flip natively.
+	constexpr Hash kCigItem            = Joaat("document_cig_card_grl");
+	constexpr Hash kCigIntro           = Joaat("CIGARETTE_CARD_W6-5_H10-7_SINGLE_INTRO");
+	constexpr Hash kCigBase            = Joaat("CIGARETTE_CARD_W6-5_H10-7_SINGLE_BASE");
+	constexpr Hash kCigFlipToBack      = Joaat("CIGARETTE_CARD_W6-5_H10-7_SINGLE_FLIP_TO_BACK");
+	constexpr Hash kCigFlippedBase     = Joaat("CIGARETTE_CARD_W6-5_H10-7_SINGLE_FLIPPED_BASE");
+	constexpr Hash kCigFlipToFront     = Joaat("CIGARETTE_CARD_W6-5_H10-7_SINGLE_FLIP_TO_FRONT");
+
+	// --- target portrait (the game's persona-photo / pedshot pipeline) ---
 	constexpr const char* kPhotoName  = "MINIGAME_PROFILE_PHOTO";   // one of the three names the pedshot system accepts (MP_PROFILE_PHOTO, MP_MISSION_PHOTO, MINIGAME_PROFILE_PHOTO)
-	constexpr int   kPhotoType        = 1;                          // _PEDSHOT_SET_PERSONA_PHOTO_TYPE
-	constexpr int   kPhotoCacheType   = 2;                          // persona-photo local cache type used for the write
-	constexpr DWORD kPhotoStepMs      = 4000;                       // per-step timeout: previous upload, write, upload, texture name
+	constexpr float kPhotoPedOffsetY  = 2.0f;                       // the ped is parked this far IN FRONT of the player (in view, hidden) while the portrait is taken
+	constexpr DWORD kPhotoUploadMs    = 3000;                       // wait for a previous / current upload to finish
+	constexpr DWORD kPhotoAvailMs     = 1500;                       // wait for PEDSHOT_IS_AVAILABLE after generating
+	constexpr DWORD kPhotoWriteMs     = 2500;                       // poll _NETWORK_PERSONA_PHOTO_WRITE_LOCAL this long (cycling cache types)
+	constexpr DWORD kPhotoNameMs      = 2000;                       // poll _REQUEST_PEDSHOT_TEXTURE_LOCAL_BACKUP_DOWNLOAD this long
 }
 // Hashes verified against femga's documented values.
 static_assert(Card::kStateIntro       == 0x19FF3C2A, "card state hash");

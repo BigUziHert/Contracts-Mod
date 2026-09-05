@@ -1,0 +1,14 @@
+<EasyInstall>
+    <Name>BountyContracts</Name>
+    <Author>Caleb Pammett</Author>
+    <Version>1.0.0</Version>
+    <Link></Link>
+    <Metadata>
+    </Metadata>
+
+    <Resources>
+        <Resource>
+            <DataFile>strings.gxt2</DataFile>
+        </Resource>
+    </Resources>
+</EasyInstall>
