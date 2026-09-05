@@ -23,6 +23,7 @@
     <ClInclude Include="keyboard.h" />
     <ClInclude Include="global.h" />
     <ClInclude Include="common.hpp" />
+    <ClInclude Include="contract_data.h" />
   </ItemGroup>
   <ItemGroup>
     <Filter Include="include">
