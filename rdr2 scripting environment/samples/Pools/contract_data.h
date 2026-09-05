@@ -314,7 +314,9 @@ namespace Card
 	constexpr Hash kCigFlipToFront     = Joaat("CIGARETTE_CARD_W6-5_H10-7_SINGLE_FLIP_TO_FRONT");
 
 	// --- target portrait (the game's persona-photo / pedshot pipeline) ---
-	constexpr const char* kPhotoName  = "MINIGAME_PROFILE_PHOTO";   // one of the three names the pedshot system accepts (MP_PROFILE_PHOTO, MP_MISSION_PHOTO, MINIGAME_PROFILE_PHOTO)
+	constexpr const char* kPhotoName  = "MINIGAME_PROFILE_PHOTO";   // one of the three names the MP pedshot flow accepts (MP_PROFILE_PHOTO, MP_MISSION_PHOTO, MINIGAME_PROFILE_PHOTO)
+	constexpr const char* kPhotoCustomName = "BC_CONTRACT_TARGET"; // SP flow registers its own name (R* spd_agnesdowd1 uses "SPD_AGNES_DOWD_01")
+	constexpr DWORD kPhotoLookupMs    = 1200;                       // per no-write lookup (texture by name / local backup)
 	constexpr float kPhotoPedOffsetY  = 2.0f;                       // the ped is parked this far IN FRONT of the player (in view, hidden) while the portrait is taken
 	constexpr DWORD kPhotoUploadMs    = 3000;                       // wait for a previous / current upload to finish
 	constexpr DWORD kPhotoAvailMs     = 1500;                       // wait for PEDSHOT_IS_AVAILABLE after generating

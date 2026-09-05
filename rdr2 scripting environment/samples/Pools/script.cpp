@@ -17,7 +17,7 @@
 #include "keyboard.h"
 #include "contract_data.h"
 
-static const char* kBuildTag = "dev-4";   // shown on the HUD and in a banner at startup so an installed build is verifiable
+static const char* kBuildTag = "dev-5";   // shown on the HUD and in a banner at startup so an installed build is verifiable
 
 // ===== [ DEBUG TOGGLES ] ===== (overridable from the build: set CL=/DCONTRACTS_DEBUG_HUD=0)
 #ifndef CONTRACTS_DEBUG_KEYS
@@ -55,10 +55,11 @@ struct ActiveContract
 	bool        photoTaken = false;
 	bool        photoPedWasReady = false;
 	int         photoVariant = -1;      // which pipeline variant produced the texture (-1 = none)
-	int         photoCacheType = -1;    // cache type the write was accepted with
+	int         photoCacheType = -1;    // cache type a lookup / write succeeded with
+	bool        photoGenOk = false, photoRegOk = false, photoSceneOk = false; // return values of GENERATE / _0xFD05 / _0x402E (debug)
 	bool        photoAvailBefore = false, photoAvailAfter = false; // PEDSHOT_IS_AVAILABLE before / after generating (debug)
-	char        photoTexture[64] = "";  // texture name returned by the persona-photo cache ("" = none)
-	const char* photoStatus = "-";      // last step reached / failed (debug HUD)
+	char        photoTexture[64] = "";  // texture name to draw ("" = none)
+	const char* photoStatus = "-";      // how the texture was obtained, or the last step that failed (debug HUD)
 	ULONGLONG   cardOpenAtMs = 0;       // deferred card examine (after the handoff anim)
 
 	// hand-in
@@ -201,21 +202,33 @@ static void AddCorpseBlip()
 // persona-photo cache -> wait for the upload -> ask the cache for the texture name. Rockstar's MP script
 // (persona_photos) and SP script (spd_agnesdowd1) drive it slightly differently, so the variants below are
 // tried in order until one yields a texture; the HUD reports which.
-struct PhotoVariant { int type; bool spRegister; bool spScene; };
+// Variants: the SP flow (spd_agnesdowd1) registers its own photo name and places the portrait scene at the
+// ped, and never touches the network; the MP flow (persona_photos) writes to the Social Club-backed local
+// cache and requires being signed online.
+struct PhotoVariant { int type; const char* name; bool spRegister; bool spScene; bool netWrite; };
 static const PhotoVariant kPhotoVariants[] = {
-	{ 1, false, false },   // MP flow as-is
-	{ 0, true,  true  },   // SP flow: type 0, _0xFD05... registers the name, _0x402E... places the portrait scene at the ped
-	{ 1, true,  true  },
-	{ 0, false, true  },
+	{ 0, Card::kPhotoCustomName, true,  true,  false },   // SP flow, our own name
+	{ 0, Card::kPhotoName,       true,  true,  false },   // SP flow, the MP name
+	{ 1, Card::kPhotoName,       false, false, true  },   // MP flow (only meaningful when signed online)
 };
+static const int kPhotoCacheTypes[] = { 0, 2, 1 };
 
-static bool PhotoWriteLocal()
+// The persona-photo cache's texture name for the local player, any cache type. Empty when none.
+static const char* LookupPhotoTexture()
 {
-	// Cycle the cache types until the cache accepts the write.
-	static const int kCacheTypes[] = { 2, 0, 1 };
+	for (int ct : kPhotoCacheTypes)
+	{
+		const char* n = NETWORK::_REQUEST_PEDSHOT_TEXTURE_LOCAL_BACKUP_DOWNLOAD((int)me, ct);
+		if (n && *n) { C.photoCacheType = ct; return n; }
+	}
+	return nullptr;
+}
+
+static bool PhotoWriteLocal(const char* name)
+{
 	static int i = 0;
-	int ct = kCacheTypes[i++ % 3];
-	if (NETWORK::_NETWORK_PERSONA_PHOTO_WRITE_LOCAL(Card::kPhotoName, (int)me, 1, ct) != 0) { C.photoCacheType = ct; return true; }
+	int ct = kPhotoCacheTypes[i++ % 3];
+	if (NETWORK::_NETWORK_PERSONA_PHOTO_WRITE_LOCAL(name, (int)me, 1, ct) != 0) { C.photoCacheType = ct; return true; }
 	return false;
 }
 
@@ -223,51 +236,69 @@ static bool TakeTargetPhoto(Ped ped)
 {
 	C.photoStatus = "ped not ready";
 	C.photoPedWasReady = WaitUntil(Tune::kPedshotReadyMs, [&] { return PED::IS_PED_READY_TO_RENDER(ped) != 0; });
+	bool online = NETWORK::NETWORK_IS_SIGNED_ONLINE() != 0;
+	const char* lastName = nullptr;
 
 	for (int v = 0; v < (int)(sizeof(kPhotoVariants) / sizeof(kPhotoVariants[0])); ++v)
 	{
 		const PhotoVariant& pv = kPhotoVariants[v];
+		if (pv.netWrite && !online) continue;   // the network write cannot succeed offline
+		lastName = pv.name;
 
-		C.photoStatus = "prev upload pending";
 		WaitUntil(Card::kPhotoUploadMs, [] { return !NETWORK::_NETWORK_IS_PREVIOUS_UPLOAD_PENDING(); });
 		C.photoAvailBefore = GRAPHICS::PEDSHOT_IS_AVAILABLE() != 0;
 		if (v > 0) { GRAPHICS::_PEDSHOT_INIT_CLEANUP_DATA(); GRAPHICS::_PEDSHOT_FINISH_CLEANUP_DATA(); }
 
 		GRAPHICS::_PEDSHOT_PREVIOUS_PERSONA_PHOTO_DATA_CLEANUP();
 		GRAPHICS::_PEDSHOT_SET_PERSONA_PHOTO_TYPE(pv.type);
-		if (pv.spRegister) GRAPHICS::_0xFD05B1DDE83749FA(Card::kPhotoName);
-		GRAPHICS::_PEDSHOT_GENERATE_PERSONA_PHOTO(Card::kPhotoName, ped, 0);
-		if (pv.spScene) GRAPHICS::_0x402E1A61D2587FCD(0, ENTITY::GET_ENTITY_COORDS(ped, true, false), 0.0f, 0.0f, ENTITY::GET_ENTITY_HEADING(ped));
+		if (pv.spRegister) C.photoRegOk = GRAPHICS::_0xFD05B1DDE83749FA(pv.name) != 0;
+		C.photoGenOk = GRAPHICS::_PEDSHOT_GENERATE_PERSONA_PHOTO(pv.name, ped, 0) != 0;
+		if (pv.spScene) C.photoSceneOk = GRAPHICS::_0x402E1A61D2587FCD(0, ENTITY::GET_ENTITY_COORDS(ped, true, false), 0.0f, 0.0f, ENTITY::GET_ENTITY_HEADING(ped)) != 0;
 		PED::FORCE_PED_MOTION_STATE(ped, joaat("MotionState_DoNothing"), false, 0, false);
 		C.photoTaken = true;
 
 		C.photoStatus = "waiting for shot";
 		C.photoAvailAfter = WaitUntil(Card::kPhotoAvailMs, [] { return GRAPHICS::PEDSHOT_IS_AVAILABLE() != 0; });
 
-		C.photoStatus = "write failed";
-		if (!WaitUntil(Card::kPhotoWriteMs, PhotoWriteLocal)) continue;
-
-		C.photoStatus = "upload pending";
-		WaitUntil(Card::kPhotoUploadMs, [] { return !NETWORK::_NETWORK_IS_PREVIOUS_UPLOAD_PENDING(); });
-
-		C.photoStatus = "no texture name";
-		const char* name = nullptr;
-		WaitUntil(Card::kPhotoNameMs, [&]
+		// A: the registered name is directly a texture dictionary.
+		if (WaitUntil(Card::kPhotoLookupMs, [&] { return TXD::DOES_STREAMED_TEXTURE_DICT_EXIST(pv.name) != 0; }))
 		{
-			static const int kCacheTypes[] = { 2, 0, 1 };
-			for (int ct : kCacheTypes)
+			strcpy_s(C.photoTexture, pv.name);
+			C.photoVariant = v; C.photoStatus = "txd by name";
+			return true;
+		}
+		// B: the local persona-photo cache already holds it (no write).
+		const char* name = nullptr;
+		if (WaitUntil(Card::kPhotoLookupMs, [&] { name = LookupPhotoTexture(); return name != nullptr; }))
+		{
+			strcpy_s(C.photoTexture, name);
+			C.photoVariant = v; C.photoStatus = "cache lookup";
+			return true;
+		}
+		// C: write it into the cache first (Social Club-backed; needs sign-in), then look it up.
+		if (pv.netWrite)
+		{
+			C.photoStatus = "write failed";
+			if (!WaitUntil(Card::kPhotoWriteMs, [&] { return PhotoWriteLocal(pv.name); })) continue;
+			WaitUntil(Card::kPhotoUploadMs, [] { return !NETWORK::_NETWORK_IS_PREVIOUS_UPLOAD_PENDING(); });
+			if (WaitUntil(Card::kPhotoNameMs, [&] { name = LookupPhotoTexture(); return name != nullptr; }))
 			{
-				const char* n = NETWORK::_REQUEST_PEDSHOT_TEXTURE_LOCAL_BACKUP_DOWNLOAD((int)me, ct);
-				if (n && *n) { name = n; return true; }
+				strcpy_s(C.photoTexture, name);
+				C.photoVariant = v; C.photoStatus = "write+lookup";
+				return true;
 			}
-			return false;
-		});
-		if (!name) continue;
+			C.photoStatus = "written, no name";
+			continue;
+		}
+		C.photoStatus = "no txd / no cache entry";
+	}
 
-		strcpy_s(C.photoTexture, name);
-		C.photoVariant = v;
-		C.photoStatus = "ok";
-		return true;
+	// Nothing reported a texture. Draw by the last registered name anyway — DOES_STREAMED_TEXTURE_DICT_EXIST
+	// may simply not know about pedshot textures; the card will show whether the game does.
+	if (lastName)
+	{
+		strcpy_s(C.photoTexture, lastName);
+		C.photoStatus = "blind draw";
 	}
 	return false;
 }
@@ -1018,9 +1049,11 @@ static void DebugUpdate()
 		kBuildTag, (int)g_state, (int)C.task, C.remembersPlayer ? 1 : 0, losRaw, sees, dist);
 	DrawTextToScreen(line, 0.05f, 0.08f, 0.4f, 255, 255, 0, 255);
 
-	sprintf_s(line, "photo: taken=%d pedReady=%d avail=%d/%d variant=%d cache=%d status=%s tex=%s",
-		C.photoTaken ? 1 : 0, C.photoPedWasReady ? 1 : 0, C.photoAvailBefore ? 1 : 0, C.photoAvailAfter ? 1 : 0,
-		C.photoVariant, C.photoCacheType, C.photoStatus, C.photoTexture[0] ? C.photoTexture : "-");
+	sprintf_s(line, "photo: gen=%d reg=%d scene=%d avail=%d/%d online=%d ros=%d cloud=%d var=%d cache=%d how=%s tex=%s txd=%d",
+		C.photoGenOk ? 1 : 0, C.photoRegOk ? 1 : 0, C.photoSceneOk ? 1 : 0, C.photoAvailBefore ? 1 : 0, C.photoAvailAfter ? 1 : 0,
+		NETWORK::NETWORK_IS_SIGNED_ONLINE() ? 1 : 0, NETWORK::NETWORK_HAS_VALID_ROS_CREDENTIALS() ? 1 : 0, NETWORK::NETWORK_IS_CLOUD_AVAILABLE() ? 1 : 0,
+		C.photoVariant, C.photoCacheType, C.photoStatus, C.photoTexture[0] ? C.photoTexture : "-",
+		C.photoTexture[0] ? (TXD::DOES_STREAMED_TEXTURE_DICT_EXIST(C.photoTexture) ? 1 : 0) : 0);
 	DrawTextToScreen(line, 0.05f, 0.11f, 0.4f, 255, 255, 0, 255);
 
 	Hash cardState = TASK::GET_ITEM_INTERACTION_STATE(pedMe);
