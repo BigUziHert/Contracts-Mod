@@ -65,11 +65,14 @@ struct ActiveContract
 // The card prop while it is out (being examined, or in hand during the hand-in).
 struct CardRuntime
 {
-	Object    obj = 0;
-	bool      examining = false;
-	bool      inHand = false;
-	ULONGLONG openedMs = 0;
-	int       renderId = 0;
+	Object      obj = 0;
+	bool        ownsObj = false;     // we created it (delete on close); false = the game's own item prop
+	bool        examining = false;
+	bool        inHand = false;
+	ULONGLONG   openedMs = 0;
+	int         renderId = 0;
+	int         path = 0;            // 0 none, 1 our photo card via _TASK_ITEM_INTERACTION_2, 2 game-spawned card via START_TASK_ITEM_INTERACTION
+	const char* lastError = "";      // why the last OpenCard() failed (debug HUD)
 };
 
 static ActiveContract  C;
@@ -235,11 +238,13 @@ static Ped SpawnTargetWithPhoto(Hash model, const ContractDef& def)
 }
 
 // ===== [ CONTRACT CARD ] =====
-static void LinkCardRenderTarget()
+static int g_cardLastPath = 0;   // which OpenCard() path last succeeded (debug HUD)
+
+static void LinkCardRenderTarget(Hash cardModel)
 {
 	if (!Tune::kCardFaceRenderTarget) return;
 	if (!HUD::IS_NAMED_RENDERTARGET_REGISTERED(Card::kRenderTarget)) HUD::REGISTER_NAMED_RENDERTARGET(Card::kRenderTarget, false);
-	if (!HUD::IS_NAMED_RENDERTARGET_LINKED(Card::kPropModel)) HUD::LINK_NAMED_RENDERTARGET(Card::kPropModel);
+	if (!HUD::IS_NAMED_RENDERTARGET_LINKED(cardModel)) HUD::LINK_NAMED_RENDERTARGET(cardModel);
 	Cd.renderId = HUD::GET_NAMED_RENDERTARGET_RENDER_ID(Card::kRenderTarget);
 }
 
@@ -250,28 +255,76 @@ static bool CreateCardObject()
 	Cd.obj = OBJECT::CREATE_OBJECT(Card::kPropModel, ENTITY::GET_OFFSET_FROM_ENTITY_IN_WORLD_COORDS(pedMe, 0.0f, 0.5f, 0.0f), true, true, true, false, false);
 	STREAMING::SET_MODEL_AS_NO_LONGER_NEEDED(Card::kPropModel);
 	if (!ENTITY::DOES_ENTITY_EXIST(Cd.obj)) { Cd.obj = 0; return false; }
+	Cd.ownsObj = true;
 	OBJECT::_SET_OBJECT_PROMPT_NAME(Cd.obj, Card::kTitle);
-	LinkCardRenderTarget();
+	LinkCardRenderTarget(Card::kPropModel);
 	return true;
 }
 
 static void DestroyCardObject()
 {
-	if (Cd.obj && ENTITY::DOES_ENTITY_EXIST(Cd.obj))
+	if (Cd.obj && Cd.ownsObj && ENTITY::DOES_ENTITY_EXIST(Cd.obj))
 	{
 		if (ENTITY::IS_ENTITY_ATTACHED(Cd.obj)) ENTITY::DETACH_ENTITY(Cd.obj, true, false);
 		OBJECT::DELETE_OBJECT(&Cd.obj);
 	}
+	const char* keepError = Cd.lastError;
 	Cd = CardRuntime();
+	Cd.lastError = keepError;
 }
 
+static bool CardTaskRunning() { return TASK::IS_PED_RUNNING_TASK_ITEM_INTERACTION(pedMe) != 0; }
+
 // Player takes the card out and examines it (Zoom / Flip / Put Away are the game's own prompts).
+//  Path 1: our photo card held through the item-interaction task with the "PrimaryItem" prop slot
+//          (the slot every card/book/document state uses) — this is the Remastered look.
+//  Path 2: if that task refuses to start, do it the way Rockstar's document scripts do: let the game
+//          spawn the item's own card, then take over that prop (title + render target).
 static bool OpenCard()
 {
-	if (Cd.obj || !CreateCardObject()) return false;
-	TASK::_TASK_ITEM_INTERACTION_2(pedMe, Card::kItem, Cd.obj, Card::kPropId, Card::kStartState, 1, 0, -1.0f);
+	if (Cd.obj || Cd.examining) return false;
+	Cd.lastError = "";
+
+	if (CreateCardObject())
+	{
+		TASK::_TASK_ITEM_INTERACTION_2(pedMe, Card::kItem, Cd.obj, Card::kPrimaryItem, Card::kStartState, 1, 0, -1.0f);
+		if (WaitUntil(Card::kTaskStartWaitMs, CardTaskRunning))
+		{
+			Cd.examining = true;
+			Cd.openedMs = GetTickCount64();
+			Cd.path = g_cardLastPath = 1;
+			return true;
+		}
+		DestroyCardObject();
+		Cd.lastError = "p1: task did not start";
+	}
+	else
+	{
+		Cd.lastError = "p1: card object failed";
+	}
+
+	TASK::START_TASK_ITEM_INTERACTION(pedMe, Card::kItem, Card::kStartState, 1, 0, -1.0f);
+	if (!WaitUntil(Card::kTaskStartWaitMs, CardTaskRunning))
+	{
+		Cd.lastError = "p1+p2: task did not start";
+		return false;
+	}
+	Entity held = 0;
+	WaitUntil(500, [&] { held = TASK::_GET_ITEM_INTERACTION_ENTITY_FROM_PED(pedMe, Card::kPrimaryItem); return ENTITY::DOES_ENTITY_EXIST(held) != 0; });
+	if (ENTITY::DOES_ENTITY_EXIST(held))
+	{
+		Cd.obj = (Object)held;   // the game's prop — it deletes it when the task ends
+		Cd.ownsObj = false;
+		OBJECT::_SET_OBJECT_PROMPT_NAME(Cd.obj, Card::kTitle);
+		LinkCardRenderTarget(ENTITY::GET_ENTITY_MODEL(Cd.obj));
+	}
+	else
+	{
+		Cd.lastError = "p2: running, no PrimaryItem prop";
+	}
 	Cd.examining = true;
 	Cd.openedMs = GetTickCount64();
+	Cd.path = g_cardLastPath = 2;
 	return true;
 }
 
@@ -877,11 +930,11 @@ static void DebugUpdate()
 	DrawTextToScreen(line, 0.05f, 0.08f, 0.4f, 255, 255, 0, 255);
 
 	Hash cardState = TASK::GET_ITEM_INTERACTION_STATE(pedMe);
-	sprintf_s(line, "photo: taken=%d pedReady=%d txd=%d | card: obj=%d exam=%d hand=%d task=%d st=%s rt=%d | item=%d",
+	sprintf_s(line, "photo: taken=%d pedReady=%d txd=%d | card: obj=%d exam=%d hand=%d task=%d st=%s rt=%d path=%d/%d item=%d err=%s",
 		C.photoTaken ? 1 : 0, C.photoPedWasReady ? 1 : 0, TargetPhotoReady() ? 1 : 0,
 		Cd.obj ? 1 : 0, Cd.examining ? 1 : 0, Cd.inHand ? 1 : 0,
 		TASK::IS_PED_RUNNING_TASK_ITEM_INTERACTION(pedMe) ? 1 : 0, CardStateName(cardState), Cd.renderId,
-		ITEMDATABASE::_ITEMDATABASE_IS_KEY_VALID(Card::kItem, 0) ? 1 : 0);
+		Cd.path, g_cardLastPath, ITEMDATABASE::_ITEMDATABASE_IS_KEY_VALID(Card::kItem, 0) ? 1 : 0, Cd.lastError);
 	DrawTextToScreen(line, 0.05f, 0.11f, 0.4f, 255, 255, 0, 255);
 
 	float minutes = C.startMs ? (float)((C.photoMs ? C.photoMs : GetTickCount64()) - C.startMs) / 60000.0f : 0.0f;

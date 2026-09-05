@@ -286,8 +286,9 @@ static const GiverSpot kGivers[] = {
 namespace Card
 {
 	constexpr Hash kPropModel  = Joaat("p_cs_photonudie01x_4x6");            // CARD@W6-5_H10-7 portrait photo card
-	constexpr Hash kPropId     = Joaat("P_CS_PHOTONUDIE01X_4X6_PH_R_HAND");  // <prop>_PH_R_HAND, per the documented pattern
+	constexpr Hash kPrimaryItem = Joaat("PrimaryItem");                      // the held-prop slot every card/book/document state uses (femga table; R* scripts fetch it as "PRIMARYITEM")
 	constexpr Hash kItem       = Joaat("document_cig_card_grl");             // vanilla cigarette-card inventory item that owns the card animations
+	constexpr DWORD kTaskStartWaitMs = 700;                                  // how long to wait for the inspect task to report running before trying the fallback path
 	constexpr Hash kStateIntro       = Joaat("CIGARETTE_CARD_W6-5_H10-7_SINGLE_INTRO");
 	constexpr Hash kStateBase        = Joaat("CIGARETTE_CARD_W6-5_H10-7_SINGLE_BASE");
 	constexpr Hash kStateFlipToBack  = Joaat("CIGARETTE_CARD_W6-5_H10-7_SINGLE_FLIP_TO_BACK");
