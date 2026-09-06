@@ -15,7 +15,7 @@ New-Item -ItemType Directory -Path $bountyOutput -Force | Out-Null
 $bountySource = [IO.File]::ReadAllText($bountySourcePath)
 $bountyData = [IO.File]::ReadAllText($bountyDataPath)
 $bountyStateHeader = @('#pragma once', '// Generated from production source; do not edit.', 'namespace Card {')
-foreach ($bountyConstant in @('kPhotoSlot', 'kPhotoCacheType', 'kPhotoNameMs')) {
+foreach ($bountyConstant in @('kPhotoSlot', 'kPhotoSlotCount', 'kPhotoCacheType', 'kPhotoNameMs')) {
     $bountyMatches = [regex]::Matches($bountyData, ('constexpr\s+[^;\r\n]+?\b' + $bountyConstant + '\s*=[^;]+;'))
     if ($bountyMatches.Count -ne 1) { throw "Expected exactly one production constant: $bountyConstant" }
     $bountyStateHeader += $bountyMatches[0].Value

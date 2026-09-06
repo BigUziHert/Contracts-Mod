@@ -70,6 +70,7 @@ struct ActiveContract
 	bool        photoTaken = false;     // this mod currently owns capture resources that still need cleanup
 	bool        photoPedWasReady = false;
 	int         photoCacheType = -1;    // cache type used for both writing and requesting the portrait
+	int         photoSlot = -1;         // local cache slot written by the latest capture; requests use the same slot
 	bool        photoGenOk = false;
 	char        photoTexture[64] = "";  // texture name to draw ("" = none)
 	int         photoDownload = -1;     // owned local-cache download; positive handles require release
@@ -209,10 +210,10 @@ static void LogContractStartFailure(Hash model, int attempt)
 	if (_wfopen_s(&file, path, L"a") != 0 || !file) return;
 	SYSTEMTIME time;
 	GetSystemTime(&time);
-	fprintf(file, "%04u-%02u-%02uT%02u:%02u:%02uZ start-v4 failure=%d photo=%s attempt=%d model=%08X player=%d current=%d alive=%d freePeds=%d download=%d status=%d name=\"%s\" nameValid=%d ready=%d generated=%d written=%d writeComplete=%d commitProbe=%d commitBefore=%d busyBefore=%d busyAfter=%d busyRequest=%d requests=%u\n",
+	fprintf(file, "%04u-%02u-%02uT%02u:%02u:%02uZ start-v5 failure=%d photo=%s attempt=%d model=%08X player=%d current=%d alive=%d freePeds=%d slot=%d download=%d status=%d name=\"%s\" nameValid=%d ready=%d generated=%d written=%d writeComplete=%d commitProbe=%d commitBefore=%d busyBefore=%d busyAfter=%d busyRequest=%d requests=%u\n",
 		time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond,
 		static_cast<int>(lastStartFailure), lastPhotoStage, attempt, model, pedMe, PLAYER::PLAYER_PED_ID(),
-		LivingPed(pedMe) ? 1 : 0, PED::_GET_NUM_FREE_SLOTS_IN_PED_POOL(), C.photoDownload,
+		LivingPed(pedMe) ? 1 : 0, PED::_GET_NUM_FREE_SLOTS_IN_PED_POOL(), C.photoSlot, C.photoDownload,
 		C.photoDownloadStatus, C.photoLookupName, C.photoLookupValid ? 1 : 0, C.photoTextureValid ? 1 : 0,
 		C.photoGenOk ? 1 : 0, C.photoWritten ? 1 : 0, C.photoWriteComplete ? 1 : 0,
 		C.photoCommitReady ? 1 : 0, C.photoCommitBefore ? 1 : 0, C.photoBusyBefore ? 1 : 0,
@@ -470,9 +471,24 @@ static void AddCorpseBlip()
 // another frame. The SP A1/CC4 and post-generate cleanup sequence belongs to a different path.
 
 // Cache type 2 uses an owned download handle (R* persona_photos / map_app_event_handler),
-// released before rewriting the same slot. Do not mix that ownership with the SP backup loader.
+// released before rewriting a slot. Do not mix that ownership with the SP backup loader.
 static bool LookupPhotoTexture(int cacheType, char (&out)[64]);
 static void ReleaseTargetPhoto();
+
+// Every capture writes the next of Card::kPhotoSlotCount consecutive slots instead of always
+// slot 0. The download texture is named after its slot, and the diagnostics point to an inspected
+// card keeping that texture referenced after its prop and item task retire: rewriting the same
+// slot then left every download request returning -1 (start-v4 logs), while the same rewrite
+// succeeded whenever no card had been inspected. A fresh slot name cannot collide with a retained
+// one. The cursor survives contract reset, so consecutive contracts and the retry after a failed
+// capture all differ.
+static int photoSlotCursor = 0;
+static int NextPhotoSlot()
+{
+	int slot = Card::kPhotoSlot + photoSlotCursor;
+	photoSlotCursor = (photoSlotCursor + 1) % Card::kPhotoSlotCount;
+	return slot;
+}
 
 // Maintain the retained download, card material and flip flag during yielding waits,
 // which do not run UpdateCard().
@@ -505,6 +521,7 @@ static bool LookupPhotoTexture(int cacheType, char (&out)[64])
 {
 	C.photoTextureValid = false;
 	C.photoLookupValid = false;
+	if (C.photoSlot < 0) return false; // nothing has been written yet
 	if (C.photoDownload <= 0)
 	{
 		if (GetTickCount64() < C.photoNextRequestMs) return false;
@@ -514,7 +531,7 @@ static bool LookupPhotoTexture(int cacheType, char (&out)[64])
 		C.photoBusyAtRequest = GRAPHICS::PEDSHOT_IS_AVAILABLE() != 0;
 		++C.photoRequestAttempts;
 		ULONGLONG requestedAt = GetTickCount64();
-		C.photoDownload = NETWORK::_LOCAL_PLAYER_PEDSHOT_TEXTURE_DOWNLOAD_REQUEST(Card::kPhotoSlot, cacheType);
+		C.photoDownload = NETWORK::_LOCAL_PLAYER_PEDSHOT_TEXTURE_DOWNLOAD_REQUEST(C.photoSlot, cacheType);
 		ULONGLONG requestMs = GetTickCount64() - requestedAt;
 		if (requestMs > C.photoRequestCallMaxMs) C.photoRequestCallMaxMs = requestMs;
 		if (C.photoDownload <= 0) return false;
@@ -572,6 +589,7 @@ static bool PhotographPed(Ped subject)
 	lastPhotoStage = "subject";
 	const int ct = Card::kPhotoCacheType;
 	C.photoCacheType = ct;
+	C.photoSlot = NextPhotoSlot(); // a slot the previous card cannot still be holding
 	C.photoPedWasReady = C.photoGenOk = false;
 	C.photoWritten = false;
 	C.photoUploadPending = C.photoCommitReady = C.photoTextureValid = false;
@@ -629,7 +647,7 @@ static bool PhotographPed(Ped subject)
 		PED::FORCE_PED_MOTION_STATE(subject, joaat("MotionState_DoNothing"), false, 0, false);
 		C.photoUploadPending = NETWORK::_NETWORK_IS_PREVIOUS_UPLOAD_PENDING() != 0;
 		ULONGLONG writeAt = GetTickCount64();
-		bool written = NETWORK::_NETWORK_PERSONA_PHOTO_WRITE_LOCAL(photoName, Card::kPhotoSlot, 1, ct) != 0;
+		bool written = NETWORK::_NETWORK_PERSONA_PHOTO_WRITE_LOCAL(photoName, C.photoSlot, 1, ct) != 0;
 		ULONGLONG writeMs = GetTickCount64() - writeAt;
 		if (writeMs > C.photoWriteCallMaxMs) C.photoWriteCallMaxMs = writeMs;
 		return written;
@@ -715,7 +733,7 @@ static void LogPhotoCacheTest(const char* phase, bool success, ULONGLONG started
 	Hash itemState = itemRunning ? TASK::GET_ITEM_INTERACTION_STATE(pedMe) : 0;
 	fprintf(file, "%04u-%02u-%02uT%02u:%02u:%02uZ photo-test-v4 phase=%s ok=%d elapsedMs=%llu captures=%u slot=%d cache=%d stage=%s download=%d status=%d requests=%u name=\"%s\" previous=\"%s\" previousValid=%d nameValid=%d ready=%d generated=%d written=%d writeComplete=%d busyBefore=%d busyAfter=%d busyRequest=%d freePeds=%d card=%d cardOwned=%d cardExists=%d binds=%u bindingResets=%u itemRunning=%d itemState=%08X renderId=%d renderName=\"%s\" faceDraws=%u panelDraws=%u control=%s plainCard=%d\n",
 		time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond,
-		phase, success ? 1 : 0, GetTickCount64() - started, captures, Card::kPhotoSlot, Card::kPhotoCacheType,
+		phase, success ? 1 : 0, GetTickCount64() - started, captures, C.photoSlot, Card::kPhotoCacheType,
 		lastPhotoStage, C.photoDownload, C.photoDownloadStatus, C.photoRequestAttempts, observedName,
 		previousName, previousValid ? 1 : 0, C.photoLookupValid ? 1 : 0, TargetPhotoReady() ? 1 : 0, C.photoGenOk ? 1 : 0,
 		C.photoWritten ? 1 : 0, C.photoWriteComplete ? 1 : 0, C.photoBusyBefore ? 1 : 0,
@@ -1887,7 +1905,7 @@ static void UpdatePlayer()
 static void StartRemoteContract()
 {
 	Ped requestedPlayer = pedMe;
-	DisplaySubtitle("PREPARING CONTRACT");
+	DisplaySubtitle(ContractActive() ? "REPLACING CONTRACT" : "PREPARING CONTRACT");
 	// Run creation on a fresh game frame after the keyboard event, then refresh the player snapshot.
 	WAIT(0);
 	UpdatePlayer();
@@ -1941,13 +1959,12 @@ void ScriptMain()
 			ClearContract(false);
 		}
 
-		// U bypasses the clerk for a new contract; an existing hunt is never silently discarded.
+		// U bypasses the clerk for a new contract. An unfinished hunt is ended and replaced, the way
+		// End Contract at a clerk would; a photographed corpse keeps its pending reward, so U reopens
+		// that card instead until the clerk has paid.
 		if (bypassPressed && !handoff.active && !Cd.obj && CanStartInteraction())
 		{
-			if (g_state == CONTRACT_NONE)
-			{
-				StartRemoteContract();
-			}
+			if (g_state == CONTRACT_NONE || g_state == CONTRACT_UNKNOWN || g_state == CONTRACT_FOUND) StartRemoteContract();
 			else if (ContractActive()) C.cardOpenPending = true;
 		}
 		if (inspectPressed && ContractActive() && !handoff.active && !Cd.obj) C.cardOpenPending = true;

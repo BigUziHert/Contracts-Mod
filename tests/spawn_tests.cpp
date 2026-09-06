@@ -67,6 +67,7 @@ static struct World
     bool interactionAllowed = true;
     unsigned interactionBlockedFrame = std::numeric_limits<unsigned>::max();
     bool remoteStartSucceeds = true;
+    bool contractActive = false;
     unsigned playerRefreshes = 0;
     unsigned contractStarts = 0;
     unsigned failureLogs = 0;
@@ -220,6 +221,7 @@ static struct { bool cardOpenPending = false; } C;
 static void DisplaySubtitle(const char* message) { world.messages.push_back(message); }
 static void UpdatePlayer();
 static bool CanStartInteraction();
+static bool ContractActive();
 static bool StartContract();
 static void LogContractStartFailure(Hash model, int attempt);
 static void ReportContractStartFailure();
@@ -227,6 +229,7 @@ static void LogOwnedPedCleanup(const char*) {}
 
 #include "spawn_under_test.h"
 
+static bool ContractActive() { return world.contractActive; }
 static void UpdatePlayer()
 {
     Check(world.frame > 0, "remote start refreshes its snapshot after the fresh-frame yield");
@@ -456,6 +459,14 @@ static void TestRemoteStart()
     Check(world.messages.size() == 2 && std::strcmp(world.messages[0], "PREPARING CONTRACT") == 0 &&
         std::strcmp(world.messages[1], "FIND THE TARGET") == 0,
         "successful remote creation reports preparation followed by the hunt objective");
+
+    Reset();
+    world.contractActive = true;
+    StartRemoteContract();
+    Check(world.contractStarts == 1 && C.cardOpenPending && world.messages.size() == 2 &&
+        std::strcmp(world.messages[0], "REPLACING CONTRACT") == 0 &&
+        std::strcmp(world.messages[1], "FIND THE TARGET") == 0,
+        "a remote request during an open hunt announces the replacement before the new hunt objective");
 
     Reset();
     world.playerChangeFrame = 1;

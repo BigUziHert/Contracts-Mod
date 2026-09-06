@@ -320,7 +320,8 @@ namespace Card
 	constexpr const char* kPhotoName  = "MINIGAME_PROFILE_PHOTO";   // one of the three names the MP pedshot flow accepts (MP_PROFILE_PHOTO, MP_MISSION_PHOTO, MINIGAME_PROFILE_PHOTO)
 	constexpr const char* kPhotoFemaleName = "MINIGAME_PROFILE_PHOTO_F";
 	constexpr int   kPhotoType        = 1;                          // _PEDSHOT_SET_PERSONA_PHOTO_TYPE, as used by persona_photos
-	constexpr int   kPhotoSlot        = 0;                          // this mod retains one NPC portrait; this is not PLAYER_ID()
+	constexpr int   kPhotoSlot        = 0;                          // first local persona-photo slot used by this mod; this is not PLAYER_ID()
+	constexpr int   kPhotoSlotCount   = 8;                          // consecutive slots from kPhotoSlot, one per capture in rotation; MP fills slots 0-31 with this cache type
 	constexpr int   kPhotoCacheType   = 2;                          // local persona-photo cache slot ("..._MPG_0"); dev-8 saw the generated shot land here
 	constexpr float kPhotoPedOffsetY  = 2.0f;                       // the ped is parked this far IN FRONT of the player (in view, hidden) while the portrait is taken
 	constexpr DWORD kPhotoUploadMs    = 5000;                       // wait for a previous / current upload to finish

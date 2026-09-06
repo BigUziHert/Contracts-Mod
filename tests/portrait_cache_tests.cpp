@@ -99,6 +99,7 @@ static struct World
     unsigned flipWrites = 0;
     std::vector<Download> downloads;
     std::vector<ULONGLONG> requestTimes;
+    std::vector<int> captureSlots; // slot written by each capture that reached its write
     char borrowedName[128] = "";
 } world;
 
@@ -249,9 +250,18 @@ static bool _NETWORK_IS_PREVIOUS_UPLOAD_PENDING()
 static bool _0xCC4E72C339461ED1() { return world.commitReady; }
 static bool _NETWORK_PERSONA_PHOTO_WRITE_LOCAL(const char*, int slot, int format, int cacheType)
 {
-    Check(world.captureActive && slot == 0 && format == 1 && cacheType == 2,
-        "write arguments preserve the verified local slot and cache type");
-    Check(ActiveDownloads() == 0, "a retained download cannot survive into a same-slot overwrite");
+    // The engine's local persona-photo cache has 32 slots (one per MP player index).
+    Check(world.captureActive && slot >= 0 && slot < 32 && format == 1 && cacheType == 2,
+        "write arguments address a valid local slot and preserve the verified cache type");
+    if (world.captureSlots.size() < world.captureStarts)
+    {
+        // An inspected card can keep the previous slot's texture alive; the next capture must not rewrite it.
+        Check(world.captureSlots.empty() || slot != world.captureSlots.back(),
+            "a capture never rewrites the slot written by the capture before it");
+        world.captureSlots.push_back(slot);
+    }
+    Check(slot == world.captureSlots.back(), "every write poll of one capture addresses the same slot");
+    Check(ActiveDownloads() == 0, "a retained download cannot survive into the next capture's write");
     Check(world.frame > world.generatedFrame, "write starts on a later frame than generation");
     ++world.writeCalls;
     world.nowMs += world.writeCallMs;
@@ -268,7 +278,8 @@ static bool _NETWORK_PERSONA_PHOTO_WRITE_LOCAL(const char*, int slot, int format
 }
 static int _LOCAL_PLAYER_PEDSHOT_TEXTURE_DOWNLOAD_REQUEST(int slot, int cacheType)
 {
-    Check(slot == 0 && cacheType == 2, "download uses the exact slot and cache type written");
+    Check(!world.captureSlots.empty() && slot == world.captureSlots.back() && cacheType == 2,
+        "download uses the exact slot and cache type written");
     Check(world.writes > 0 && !world.captureActive, "download begins after capture commit and cleanup");
     Check(world.frame > world.cleanupFrame, "download starts on a later frame than capture cleanup");
     Check(ActiveDownloads() == 0, "only one download is owned at a time");
@@ -286,7 +297,7 @@ static int _LOCAL_PLAYER_PEDSHOT_TEXTURE_DOWNLOAD_REQUEST(int slot, int cacheTyp
     const int status = world.failedDownloads ? 2 : 0;
     if (world.failedDownloads) --world.failedDownloads;
     world.downloads.push_back(Download{ id, world.nowMs + world.downloadDelayMs, status,
-        "portrait_" + std::to_string(world.writes) + "_" + std::to_string(id) });
+        "portrait_slot" + std::to_string(slot) + "_" + std::to_string(world.writes) + "_" + std::to_string(id) });
     return id;
 }
 static int GET_STATUS_OF_TEXTURE_DOWNLOAD(int id)
@@ -347,6 +358,7 @@ static void Reset()
     Cd = CardState();
     C = PortraitState();
     lastPhotoStage = "none";
+    photoSlotCursor = 0;
 }
 static void CheckFullyReleased()
 {
@@ -362,7 +374,10 @@ static void TestRepeatedCapture()
     for (unsigned capture = 1; capture <= 3; ++capture)
     {
         world.subjectMale = capture != 2;
-        Check(PhotographPed(kSubject), "successive same-slot captures complete");
+        Check(PhotographPed(kSubject), "successive captures complete on rotated slots");
+        Check(C.photoSlot == Card::kPhotoSlot + static_cast<int>((capture - 1) % static_cast<unsigned>(Card::kPhotoSlotCount)) &&
+            world.captureSlots.size() == capture && world.captureSlots.back() == C.photoSlot,
+            "each capture writes the next configured slot and records it for its downloads");
         Check(world.writes == capture && world.writeCalls == capture,
             "every successful capture writes once without re-evaluating the success predicate");
         Check(world.requests == capture && ActiveDownloads() == 1 && world.releases == capture - 1,
@@ -501,7 +516,7 @@ static void TestCaptureTiming()
     world.releaseCallMs = 19;
     world.uploadFrames = 0;
     world.downloadDelayMs = 0;
-    Check(PhotographPed(kSubject), "the timed capture can be replaced on the same slot");
+    Check(PhotographPed(kSubject), "the timed capture can be replaced on the next slot");
     Check(C.photoReleaseMs == 19 && C.photoAssetsMs == 0 && C.photoIdleMs == 0 &&
         C.photoPreviousCleanupMs == 0 && C.photoGenerateMs == 0 && C.photoWriteMs == 0 &&
         C.photoWriteCallMaxMs == 0 && C.photoUploadMs == 0 && C.photoCleanupMs == 0 &&
@@ -544,7 +559,7 @@ static void TestFailureAndCancellationCleanup()
     Check(!PhotographPed(kSubject), "first attempt can fail while owning a pending download");
     world.downloadDelayMs = 0;
     Check(PhotographPed(kSubject) && world.requests == 2 && world.releases == 1,
-        "a retake releases a failed attempt's handle before overwriting the slot");
+        "a retake releases a failed attempt's handle before writing the next slot");
     ReleaseTargetPhoto();
     CheckFullyReleased();
 
@@ -639,10 +654,63 @@ static void TestMaintenanceRebinding()
     CheckFullyReleased();
 }
 
+static void TestSlotRotation()
+{
+    Reset();
+    char name[64] = "";
+    Check(!LookupPhotoTexture(Card::kPhotoCacheType, name) && world.requests == 0 && C.photoDownload == -1,
+        "no download is requested before any capture has written a slot");
+    const unsigned rounds = static_cast<unsigned>(Card::kPhotoSlotCount) + 2;
+    for (unsigned capture = 0; capture < rounds; ++capture)
+    {
+        Check(PhotographPed(kSubject), "captures beyond the slot count keep completing");
+        Check(C.photoSlot == Card::kPhotoSlot + static_cast<int>(capture % static_cast<unsigned>(Card::kPhotoSlotCount)) &&
+            world.captureSlots.back() == C.photoSlot,
+            "captures rotate through every configured slot before reusing the first one");
+        Check(std::strcmp(C.photoTexture, world.downloads.back().name.c_str()) == 0,
+            "each rotated slot yields its own accepted texture name");
+    }
+    Check(world.captureSlots.size() == rounds, "every completed capture wrote exactly one slot");
+    ReleaseTargetPhoto();
+    CheckFullyReleased();
+
+    // A capture that fails before its write still consumed its slot: the retake on the same
+    // subject never returns to the slot it just touched, and a later contract keeps rotating.
+    Reset();
+    world.generateSucceeds = false;
+    Check(!PhotographPed(kSubject) && C.photoSlot == Card::kPhotoSlot && world.captureSlots.empty(),
+        "a failed first capture used the first slot without writing it");
+    world.generateSucceeds = true;
+    Check(PhotographPed(kSubject) && C.photoSlot == Card::kPhotoSlot + 1 &&
+        world.captureSlots.size() == 1 && world.captureSlots[0] == Card::kPhotoSlot + 1,
+        "the retry after a failed capture writes the next slot");
+
+    // The diagnostic reopen releases the handle but keeps the slot, so it re-requests what was written.
+    ReleaseTargetPhoto();
+    Check(C.photoSlot == Card::kPhotoSlot + 1 && !C.photoTexture[0] && C.photoDownload == -1,
+        "release keeps the last written slot for a read-only reopen");
+    Check(WaitUntil(Card::kPhotoNameMs, [&] { return LookupPhotoTexture(Card::kPhotoCacheType, name); }) &&
+        world.requests == 2 && C.photoDownload > 0 && C.photoTextureValid,
+        "a read-only reopen requests the last written slot");
+    ReleaseTargetPhoto();
+    CheckFullyReleased();
+
+    C = PortraitState(); // contract reset does not restart the rotation
+    Check(C.photoSlot == -1 && !LookupPhotoTexture(Card::kPhotoCacheType, name) && world.requests == 2,
+        "a reset contract owns no slot until its own capture writes one");
+    Check(PhotographPed(kSubject) && C.photoSlot == Card::kPhotoSlot + 2,
+        "the next contract continues the rotation instead of rewriting the previous card's slot");
+    ReleaseTargetPhoto();
+    CheckFullyReleased();
+}
+
 int main()
 {
     Check(Card::kPhotoRequestRetryMs > 0 && Card::kPhotoNameMs > Card::kPhotoRequestRetryMs,
         "production timing permits bounded request recovery");
+    Check(Card::kPhotoSlot >= 0 && Card::kPhotoSlotCount >= 2 && Card::kPhotoSlot + Card::kPhotoSlotCount <= 32,
+        "production rotates through at least two of the engine's 32 local persona-photo slots");
+    TestSlotRotation();
     TestRepeatedCapture();
     TestCaptureAvailabilityAndPublication();
     TestPendingAndFailedDownloads();

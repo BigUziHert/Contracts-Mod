@@ -17,7 +17,7 @@ $bountyData = [IO.File]::ReadAllText($bountyDataPath)
 $bountyHeader = @('#pragma once', '// Generated from production source; do not edit.')
 $bountyGroups = [ordered]@{
     Tune = @('kPedshotHidden', 'kPedshotReadyMs')
-    Card = @('kPhotoName', 'kPhotoFemaleName', 'kPhotoType', 'kPhotoSlot', 'kPhotoCacheType',
+    Card = @('kPhotoName', 'kPhotoFemaleName', 'kPhotoType', 'kPhotoSlot', 'kPhotoSlotCount', 'kPhotoCacheType',
         'kPhotoUploadMs', 'kPhotoWriteMs', 'kPhotoNameMs', 'kPhotoRequestRetryMs',
         'kTextureSettleMs', 'kTextureBindCount', 'kTextureBindDelaysMs', 'kCardCustomTexture', 'kFlipBlackboard')
 }
@@ -37,6 +37,8 @@ $bountyHeader += $bountyState[0].Groups[1].Value
 $bountyHeader += '} C;'
 $bountyPatterns = @(
     '(?m)^static const char\* lastPhotoStage[^\r\n]+;',
+    '(?m)^static int photoSlotCursor[^\r\n]+;',
+    '(?ms)^static int NextPhotoSlot\(\)\s*\{.*?^\}',
     '(?ms)^template<typename Pred> static bool WaitUntil\([^\r\n]+\)\s*\{.*?^\}',
     '(?ms)^static bool LookupPhotoTexture\(int cacheType, char \(&out\)\[64\]\)\s*\{.*?^\}',
     '(?ms)^static void FinishPhotoCapture\(\)\s*\{.*?^\}',

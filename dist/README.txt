@@ -13,7 +13,10 @@ it. Without the resource, the code attempts a fallback, but the native title may
 be missing. The no-LML configuration has not yet been tested in-game.
 
 Playing
-- Visit a station clerk and select Get Contract to receive the target's card.
+- Visit a station clerk and select Get Contract to receive the target's card,
+  or press U to receive a contract remotely. Pressing U during an unfinished
+  hunt ends it and issues a new contract; after the corpse photo, U reopens
+  the card so the reward can still be collected.
 - Find the target and complete the hunt.
 - Photograph the target's corpse when prompted, then return to the clerk for
   payment.

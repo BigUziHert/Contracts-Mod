@@ -107,6 +107,7 @@ static bool PhotographPed(Ped subject)
     Check(photoTestPlainCard == (world.captures < 4),
         "baseline and plain consumers keep portrait binding disabled through their capture checkpoints");
     ReleaseTargetPhoto();
+    C.photoSlot = Card::kPhotoSlot + static_cast<int>(world.captures % static_cast<unsigned>(Card::kPhotoSlotCount)); // production rotates slots per capture
     const CaptureOutcome outcome = world.captureOutcomes[world.captures++];
     world.operations.push_back(std::string(photoTestControl) + "/capture");
     C.photoRequestAttempts = 0;
@@ -127,8 +128,8 @@ static bool PhotographPed(Ped subject)
 }
 static bool LookupPhotoTexture(int cacheType, char (&name)[64])
 {
-    Check(cacheType == Card::kPhotoCacheType && !C.photoTexture[0],
-        "reopen uses the configured cache with normal accepted-name polling disabled");
+    Check(cacheType == Card::kPhotoCacheType && !C.photoTexture[0] && C.photoSlot >= 0,
+        "reopen uses the configured cache and the last written slot with normal accepted-name polling disabled");
     ++world.lookupCalls;
     ++C.photoRequestAttempts;
     if (world.newExplicitProbe)
