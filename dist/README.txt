@@ -25,7 +25,8 @@ Playing
 
 Validation
 The portrait fix was confirmed working in-game from the user's screenshots of
-dev-10-sp. This subsequent cleanup build has not yet been tested in-game.
+dev-10-sp. Repeated contracts through U, with a new target on every card, were
+confirmed in-game with the portrait slot rotation and download-handle fix.
 
 Development
 Ongoing work uses dev. Updates to main are made when explicitly requested.
