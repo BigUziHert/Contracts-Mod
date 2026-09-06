@@ -301,7 +301,13 @@ namespace Card
 	constexpr DWORD kTaskStartWaitMs = 700;                                   // wait for the inspect task to report running before trying the fallback path
 	constexpr const char* kTitle        = "Contract Information";
 	constexpr const char* kTitleLabel   = "BC_CARD_TITLE";                    // GXT label from dist/lml/BountyContracts/strings.gxt2 (used when installed; literal text otherwise)
-	constexpr const char* kRenderTarget = "contract_card";
+	// Named render targets only take if the name matches the texture the prop's material samples (R*'s photo
+	// studio uses "cata_mp_stamp_ct" for its catalogue). Candidates are tried until IS_NAMED_RENDERTARGET_LINKED
+	// reports the link; the debug HUD shows which one.
+	constexpr const char* kRenderTargetNames[] = {
+		"p_cs_photonudie05x_4x6", "photonudie05x_4x6", "photonudie05x", "photonudie", "p_cs_photo_4x6", "photo_4x6", "script_rt_photo", "contract_card",
+	};
+	constexpr bool kCardCustomTexture = true;      // also try OBJECT::SET_CUSTOM_TEXTURES_ON_OBJECT with the portrait (R* uses it for letter textures)
 	constexpr const char* kHandBone     = "PH_R_Hand";
 	constexpr Hash kCashPickup = Joaat("PICKUP_MONEY_VARIABLE");
 
@@ -315,13 +321,13 @@ namespace Card
 
 	// --- target portrait (the game's persona-photo / pedshot pipeline) ---
 	constexpr const char* kPhotoName  = "MINIGAME_PROFILE_PHOTO";   // one of the three names the MP pedshot flow accepts (MP_PROFILE_PHOTO, MP_MISSION_PHOTO, MINIGAME_PROFILE_PHOTO)
-	constexpr const char* kPhotoCustomName = "BC_CONTRACT_TARGET"; // SP flow registers its own name (R* spd_agnesdowd1 uses "SPD_AGNES_DOWD_01")
+	constexpr int   kPhotoType        = 1;                          // _PEDSHOT_SET_PERSONA_PHOTO_TYPE (1 = the MP persona_photos flow)
 	constexpr DWORD kPhotoLookupMs    = 1200;                       // per no-write lookup (texture by name / local backup)
 	constexpr float kPhotoPedOffsetY  = 2.0f;                       // the ped is parked this far IN FRONT of the player (in view, hidden) while the portrait is taken
-	constexpr DWORD kPhotoUploadMs    = 3000;                       // wait for a previous / current upload to finish
+	constexpr DWORD kPhotoUploadMs    = 5000;                       // wait for a previous / current upload to finish
 	constexpr DWORD kPhotoAvailMs     = 1500;                       // wait for PEDSHOT_IS_AVAILABLE after generating
-	constexpr DWORD kPhotoWriteMs     = 2500;                       // poll _NETWORK_PERSONA_PHOTO_WRITE_LOCAL this long (cycling cache types)
-	constexpr DWORD kPhotoNameMs      = 2000;                       // poll _REQUEST_PEDSHOT_TEXTURE_LOCAL_BACKUP_DOWNLOAD this long
+	constexpr DWORD kPhotoWriteMs     = 8000;                       // poll _NETWORK_PERSONA_PHOTO_WRITE_LOCAL with FIXED arguments this long (it is a multi-frame operation)
+	constexpr DWORD kPhotoNameMs      = 3000;                       // poll _REQUEST_PEDSHOT_TEXTURE_LOCAL_BACKUP_DOWNLOAD this long
 }
 // Hashes verified against femga's documented values.
 static_assert(Card::kStateIntro       == 0x19FF3C2A, "card state hash");
