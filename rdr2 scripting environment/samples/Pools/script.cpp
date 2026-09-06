@@ -1437,8 +1437,9 @@ static int ComputePayoutCents()
 // law incident, wanted score or bounty increase counts as getting wanted.
 static void UpdateCrimeTracking()
 {
-	if (!TargetExists()) return;
-	if (!C.crimeMs)
+	// A photographed corpse may disappear before collection. Once hostile contact is
+	// recorded, later law incidents still count even without the target entity.
+	if (!C.crimeMs && TargetExists())
 	{
 		if (PED::IS_PED_IN_COMBAT(C.target, pedMe) || C.damagedByPlayer || C.ai.state == TargetAI::State::Engaged)
 		{
@@ -1459,7 +1460,6 @@ static void ClearContract(bool deleteTarget)
 	StopHandoff();
 	RemoveBlip(C.searchBlip);
 	RemoveBlip(C.targetBlip);
-	PLAYER::_CLEAR_PED_EAGLE_EYE_TRAILS_FOR_PLAYER(me);
 	if (TargetExists()) PLAYER::_UNREGISTER_EAGLE_EYE_FOR_ENTITY(me, C.target);
 	DestroyCardObject(true);
 	ReleaseTargetPhoto();
@@ -1471,6 +1471,16 @@ static void ClearContract(bool deleteTarget)
 	ResetPrompt(giverPrompt);
 	ResetPrompt(camPrompt);
 	g_state = CONTRACT_NONE;
+}
+
+static void CheckTargetLost()
+{
+	// Proof and pending payment survive corpse disappearance; an unfinished hunt cannot.
+	if ((g_state == CONTRACT_UNKNOWN || g_state == CONTRACT_FOUND) && !TargetExists())
+	{
+		DisplaySubtitle("TARGET LOST");
+		ClearContract(false);
+	}
 }
 
 // Reject known preparation failures before ending an existing hunt or releasing its portrait.
@@ -1553,7 +1563,7 @@ static void UpdateTargetAI()
 static void UpdateTrails()
 {
 	bool want = (g_state == CONTRACT_UNKNOWN || g_state == CONTRACT_FOUND) &&
-	            Within(playerPos, C.targetPos, Tune::kTrailEnableDist);
+	            TargetExists() && Within(playerPos, C.targetPos, Tune::kTrailEnableDist);
 	if (want == C.trailsActive) return;
 	if (want)
 	{
@@ -1562,8 +1572,7 @@ static void UpdateTrails()
 	}
 	else
 	{
-		PLAYER::_CLEAR_PED_EAGLE_EYE_TRAILS_FOR_PLAYER(me);
-		PLAYER::_UNREGISTER_EAGLE_EYE_FOR_ENTITY(me, C.target);
+		if (TargetExists()) PLAYER::_UNREGISTER_EAGLE_EYE_FOR_ENTITY(me, C.target);
 	}
 	C.trailsActive = want;
 }
@@ -2044,13 +2053,7 @@ void ScriptMain()
 			continue;
 		}
 
-		// A contract whose target vanished (deleted by another script, fell out of the world) can never
-		// be completed — end it instead of leaving stale blips on the map.
-		if ((g_state == CONTRACT_UNKNOWN || g_state == CONTRACT_FOUND) && !TargetExists())
-		{
-			DisplaySubtitle("TARGET LOST");
-			ClearContract(false);
-		}
+		CheckTargetLost();
 
 		// U bypasses the clerk for a new contract. An unfinished hunt is ended and replaced, the way
 		// End Contract at a clerk would; a photographed corpse keeps its pending reward, so U reopens
@@ -2065,7 +2068,15 @@ void ScriptMain()
 		UpdateHandoff();
 		// Select the contract state only AFTER processing a prompt that can clear/change it.
 		if (g_state != CONTRACT_PAID) UpdateGiverPrompt();
-		if (!PlayerAvailable()) { WAIT(0); continue; }
+		if (!PlayerAvailable() || HUD::IS_PAUSE_MENU_ACTIVE() || CAMERA::IS_SCREEN_FADED_OUT())
+		{
+			ShowPrompt(giverPrompt, false);
+			ShowPrompt(camPrompt, false);
+			WAIT(0);
+			continue;
+		}
+		// Preparation above can yield; revalidate before any state-specific target natives.
+		CheckTargetLost();
 		if (TargetExists())
 		{
 			C.targetPos = ENTITY::GET_ENTITY_COORDS(C.target, true, false);
