@@ -210,10 +210,10 @@ static void LogContractStartFailure(Hash model, int attempt)
 	if (_wfopen_s(&file, path, L"a") != 0 || !file) return;
 	SYSTEMTIME time;
 	GetSystemTime(&time);
-	fprintf(file, "%04u-%02u-%02uT%02u:%02u:%02uZ start-v5 failure=%d photo=%s attempt=%d model=%08X player=%d current=%d alive=%d freePeds=%d slot=%d download=%d status=%d name=\"%s\" nameValid=%d ready=%d generated=%d written=%d writeComplete=%d commitProbe=%d commitBefore=%d busyBefore=%d busyAfter=%d busyRequest=%d requests=%u\n",
+	fprintf(file, "%04u-%02u-%02uT%02u:%02u:%02uZ start-v5 failure=%d photo=%s attempt=%d model=%08X player=%d current=%d alive=%d freePeds=%d slot=%d boundSlots=%08X download=%d status=%d name=\"%s\" nameValid=%d ready=%d generated=%d written=%d writeComplete=%d commitProbe=%d commitBefore=%d busyBefore=%d busyAfter=%d busyRequest=%d requests=%u\n",
 		time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond,
 		static_cast<int>(lastStartFailure), lastPhotoStage, attempt, model, pedMe, PLAYER::PLAYER_PED_ID(),
-		LivingPed(pedMe) ? 1 : 0, PED::_GET_NUM_FREE_SLOTS_IN_PED_POOL(), C.photoSlot, C.photoDownload,
+		LivingPed(pedMe) ? 1 : 0, PED::_GET_NUM_FREE_SLOTS_IN_PED_POOL(), C.photoSlot, photoSlotsBound, C.photoDownload,
 		C.photoDownloadStatus, C.photoLookupName, C.photoLookupValid ? 1 : 0, C.photoTextureValid ? 1 : 0,
 		C.photoGenOk ? 1 : 0, C.photoWritten ? 1 : 0, C.photoWriteComplete ? 1 : 0,
 		C.photoCommitReady ? 1 : 0, C.photoCommitBefore ? 1 : 0, C.photoBusyBefore ? 1 : 0,
@@ -475,19 +475,31 @@ static void AddCorpseBlip()
 static bool LookupPhotoTexture(int cacheType, char (&out)[64]);
 static void ReleaseTargetPhoto();
 
-// Every capture writes the next of Card::kPhotoSlotCount consecutive slots instead of always
-// slot 0. The download texture is named after its slot, and the diagnostics point to an inspected
-// card keeping that texture referenced after its prop and item task retire: rewriting the same
-// slot then left every download request returning -1 (start-v4 logs), while the same rewrite
+// Every capture writes a slot whose texture no card has been bound to, instead of always slot 0.
+// The download texture is named after its slot, and the diagnostics point to an inspected card
+// keeping that texture referenced after its prop and item task retire: rewriting the same slot
+// then left every download request returning -1 (start-v4 logs), while the same rewrite
 // succeeded whenever no card had been inspected. A fresh slot name cannot collide with a retained
-// one. The cursor survives contract reset, so consecutive contracts and the retry after a failed
-// capture all differ.
+// one. Both records survive contract reset: slots bound during this session are skipped for the
+// rest of it, and the cursor spreads the remaining writes so a retry never repeats its slot.
+// Only once every slot has been bound does the least recently used one get rewritten.
+static unsigned photoSlotsBound = 0; // one bit per slot offset from Card::kPhotoSlot
 static int photoSlotCursor = 0;
+static void MarkPhotoSlotBound()
+{
+	int offset = C.photoSlot - Card::kPhotoSlot;
+	if (offset >= 0 && offset < Card::kPhotoSlotCount) photoSlotsBound |= 1u << offset;
+}
 static int NextPhotoSlot()
 {
-	int slot = Card::kPhotoSlot + photoSlotCursor;
-	photoSlotCursor = (photoSlotCursor + 1) % Card::kPhotoSlotCount;
-	return slot;
+	int offset = photoSlotCursor;
+	for (int i = 0; i < Card::kPhotoSlotCount; ++i)
+	{
+		int candidate = (photoSlotCursor + i) % Card::kPhotoSlotCount;
+		if (!(photoSlotsBound & (1u << candidate))) { offset = candidate; break; }
+	}
+	photoSlotCursor = (offset + 1) % Card::kPhotoSlotCount;
+	return Card::kPhotoSlot + offset;
 }
 
 // Maintain the retained download, card material and flip flag during yielding waits,
@@ -1078,6 +1090,7 @@ static void ApplyCardCustomTexture()
 	ULONGLONG elapsed = now - Cd.textureRefreshStartedMs;
 	if (Cd.textureBindIndex >= Card::kTextureBindCount || elapsed < Card::kTextureBindDelaysMs[Cd.textureBindIndex]) return;
 	OBJECT::SET_CUSTOM_TEXTURES_ON_OBJECT(Cd.obj, joaat(C.photoTexture), 0, 0);
+	MarkPhotoSlotBound(); // a card now references this slot's texture name; later captures avoid the slot
 #ifdef BOUNTY_PHOTO_SELF_TEST
 	++photoTestBindAttempts;
 #endif

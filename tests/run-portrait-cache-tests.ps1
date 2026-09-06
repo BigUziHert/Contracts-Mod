@@ -37,7 +37,9 @@ $bountyHeader += $bountyState[0].Groups[1].Value
 $bountyHeader += '} C;'
 $bountyPatterns = @(
     '(?m)^static const char\* lastPhotoStage[^\r\n]+;',
+    '(?m)^static unsigned photoSlotsBound[^\r\n]+;',
     '(?m)^static int photoSlotCursor[^\r\n]+;',
+    '(?ms)^static void MarkPhotoSlotBound\(\)\s*\{.*?^\}',
     '(?ms)^static int NextPhotoSlot\(\)\s*\{.*?^\}',
     '(?ms)^template<typename Pred> static bool WaitUntil\([^\r\n]+\)\s*\{.*?^\}',
     '(?ms)^static bool LookupPhotoTexture\(int cacheType, char \(&out\)\[64\]\)\s*\{.*?^\}',

@@ -100,6 +100,8 @@ static struct World
     std::vector<Download> downloads;
     std::vector<ULONGLONG> requestTimes;
     std::vector<int> captureSlots; // slot written by each capture that reached its write
+    unsigned pinnedSlots = 0;      // engine model: a card bound this slot's texture name for the session
+    unsigned poisonedSlots = 0;    // engine model: a pinned slot was rewritten, so its downloads are refused
     char borrowedName[128] = "";
 } world;
 
@@ -273,6 +275,7 @@ static bool _NETWORK_PERSONA_PHOTO_WRITE_LOCAL(const char*, int slot, int format
         world.writeFrame = world.frame;
         world.activeUploadNeverCompletes = world.uploadNeverCompletes;
         world.uploadCompleteFrame = world.frame + world.uploadFrames;
+        if (world.pinnedSlots & (1u << slot)) world.poisonedSlots |= 1u << slot;
     }
     return succeeded;
 }
@@ -287,6 +290,7 @@ static int _LOCAL_PLAYER_PEDSHOT_TEXTURE_DOWNLOAD_REQUEST(int slot, int cacheTyp
     world.requestTimes.push_back(world.nowMs);
     world.nowMs += world.requestCallMs;
     if (world.cancelOnRequest) world.playerAvailable = false;
+    if (world.poisonedSlots & (1u << slot)) return -1; // the engine refuses a name a card still pins
     if (world.nowMs < world.publishAt) return -1;
     if (world.unavailableRequests)
     {
@@ -340,8 +344,10 @@ namespace OBJECT
 static void SET_CUSTOM_TEXTURES_ON_OBJECT(Object obj, Hash texture, int p2, int p3)
 {
     Check(obj == kCard && p2 == 0 && p3 == 0, "material updates target only the tracked contract card");
+    Check(!world.captureSlots.empty(), "a card is only bound to a texture that a capture wrote");
     ++world.binds;
     world.boundTexture = texture;
+    world.pinnedSlots |= 1u << world.captureSlots.back(); // the bound name stays referenced for the session
 }
 }
 
@@ -359,6 +365,7 @@ static void Reset()
     C = PortraitState();
     lastPhotoStage = "none";
     photoSlotCursor = 0;
+    photoSlotsBound = 0;
 }
 static void CheckFullyReleased()
 {
@@ -704,6 +711,38 @@ static void TestSlotRotation()
     CheckFullyReleased();
 }
 
+static void TestBoundSlotsAreSkipped()
+{
+    // A capture binds its slot as soon as a card is out; later captures avoid that slot for the session.
+    Reset();
+    Cd.obj = kCard;
+    Check(PhotographPed(kSubject) && world.binds == 1 && photoSlotsBound == 1u && C.photoSlot == Card::kPhotoSlot,
+        "a capture with a card out binds its texture and records the bound slot");
+    Cd.obj = 0;
+    for (int i = 1; i < Card::kPhotoSlotCount; ++i)
+        Check(PhotographPed(kSubject) && C.photoSlot == Card::kPhotoSlot + i, "unbound slots rotate in order");
+    Check(PhotographPed(kSubject) && C.photoSlot == Card::kPhotoSlot + 1 && world.poisonedSlots == 0,
+        "the rotation skips the bound slot instead of rewriting the texture a card referenced");
+    Check(world.binds == 1 && photoSlotsBound == 1u, "captures without a card neither bind nor mark slots");
+    ReleaseTargetPhoto();
+    CheckFullyReleased();
+
+    // Once every slot has been bound in a session, the least recently used one is rewritten and
+    // the engine may refuse its download: the capture fails at the download stage without a handle.
+    Reset();
+    Cd.obj = kCard;
+    for (int i = 0; i < Card::kPhotoSlotCount; ++i)
+        Check(PhotographPed(kSubject) && C.photoSlot == Card::kPhotoSlot + i, "each bound capture takes the next slot");
+    const unsigned allBound = Card::kPhotoSlotCount == 32 ? 0xFFFFFFFFu : (1u << Card::kPhotoSlotCount) - 1u;
+    Check(photoSlotsBound == allBound && world.binds == static_cast<unsigned>(Card::kPhotoSlotCount),
+        "every slot is recorded as bound once a card has shown each of them");
+    Check(!PhotographPed(kSubject) && C.photoSlot == Card::kPhotoSlot && C.photoDownload == -1 &&
+        std::strcmp(lastPhotoStage, "texture_download") == 0,
+        "with every slot bound the oldest is rewritten and a refused download fails cleanly");
+    ReleaseTargetPhoto();
+    CheckFullyReleased();
+}
+
 int main()
 {
     Check(Card::kPhotoRequestRetryMs > 0 && Card::kPhotoNameMs > Card::kPhotoRequestRetryMs,
@@ -711,6 +750,7 @@ int main()
     Check(Card::kPhotoSlot >= 0 && Card::kPhotoSlotCount >= 2 && Card::kPhotoSlot + Card::kPhotoSlotCount <= 32,
         "production rotates through at least two of the engine's 32 local persona-photo slots");
     TestSlotRotation();
+    TestBoundSlotsAreSkipped();
     TestRepeatedCapture();
     TestCaptureAvailabilityAndPublication();
     TestPendingAndFailedDownloads();
