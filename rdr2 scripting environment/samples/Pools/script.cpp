@@ -17,7 +17,7 @@
 #include "keyboard.h"
 #include "contract_data.h"
 
-static const char* kBuildTag = "dev-6";   // shown on the HUD and in a banner at startup so an installed build is verifiable
+static const char* kBuildTag = "dev-7";   // shown on the HUD and in a banner at startup so an installed build is verifiable
 
 // ===== [ DEBUG TOGGLES ] ===== (overridable from the build: set CL=/DCONTRACTS_DEBUG_HUD=0)
 #ifndef CONTRACTS_DEBUG_KEYS
@@ -208,7 +208,13 @@ static void AddCorpseBlip()
 // every frame WITH THE SAME ARGUMENTS until it returns true (it is a multi-frame operation — alternating
 // the arguments per frame, as dev-4 did, restarts it), wait for the upload, ask the cache for the name.
 // Variants differ only in the cache type the write targets.
-static const int kPhotoCacheTypes[] = { 2, 0, 1 };
+// Generation works in single player (dev-6: gen=1, shot held). What does not is the Social Club-backed
+// _NETWORK_PERSONA_PHOTO_WRITE_LOCAL. Variants try the other persona-photo types with the network write,
+// and _0xA1A86055792FB249(cacheType) — a pedshot native that takes a local cache type and that no R* script
+// uses, i.e. the plausible single-player "write to local cache". Whatever happens, the cache's texture name
+// for that slot is taken so the card and the back panel can show whether it holds the new portrait.
+struct PhotoVariant { int type; int cacheType; };
+static const PhotoVariant kPhotoVariants[] = { { 1, 2 }, { 2, 2 }, { 0, 0 }, { 1, 0 } };
 
 // The persona-photo cache's texture name for the local player and cache type. Null when none.
 static const char* LookupPhotoTexture(int cacheType)
@@ -221,10 +227,13 @@ static bool TakeTargetPhoto(Ped ped)
 {
 	C.photoStatus = "ped not ready";
 	C.photoPedWasReady = WaitUntil(Tune::kPedshotReadyMs, [&] { return PED::IS_PED_READY_TO_RENDER(ped) != 0; });
+	const char* fallbackName = nullptr;
+	int fallbackType = -1;
 
-	for (int v = 0; v < (int)(sizeof(kPhotoCacheTypes) / sizeof(kPhotoCacheTypes[0])); ++v)
+	for (int v = 0; v < (int)(sizeof(kPhotoVariants) / sizeof(kPhotoVariants[0])); ++v)
 	{
-		int ct = kPhotoCacheTypes[v];
+		const int type = kPhotoVariants[v].type;
+		const int ct   = kPhotoVariants[v].cacheType;
 		C.photoCacheType = ct;
 
 		C.photoStatus = "prev upload pending";
@@ -234,7 +243,7 @@ static bool TakeTargetPhoto(Ped ped)
 		C.photoAvailBefore = GRAPHICS::PEDSHOT_IS_AVAILABLE() != 0;
 
 		GRAPHICS::_PEDSHOT_PREVIOUS_PERSONA_PHOTO_DATA_CLEANUP();
-		GRAPHICS::_PEDSHOT_SET_PERSONA_PHOTO_TYPE(Card::kPhotoType);
+		GRAPHICS::_PEDSHOT_SET_PERSONA_PHOTO_TYPE(type);
 		C.photoGenOk = GRAPHICS::_PEDSHOT_GENERATE_PERSONA_PHOTO(Card::kPhotoName, ped, 0) != 0;
 		PED::FORCE_PED_MOTION_STATE(ped, joaat("MotionState_DoNothing"), false, 0, false);
 		C.photoTaken = true;
@@ -242,25 +251,36 @@ static bool TakeTargetPhoto(Ped ped)
 		C.photoStatus = "waiting for shot";
 		C.photoAvailAfter = WaitUntil(Card::kPhotoAvailMs, [] { return GRAPHICS::PEDSHOT_IS_AVAILABLE() != 0; });
 
+		// Single-player local-cache write (unverified native), then the network write.
+		GRAPHICS::_0xA1A86055792FB249(ct);
 		C.photoStatus = "write failed";
 		bool written = WaitUntil(Card::kPhotoWriteMs, [&]
 		{
 			PED::FORCE_PED_MOTION_STATE(ped, joaat("MotionState_DoNothing"), false, 0, false);
 			return NETWORK::_NETWORK_PERSONA_PHOTO_WRITE_LOCAL(Card::kPhotoName, (int)me, 1, ct) != 0;
 		});
-		if (!written) continue;
+		if (written) WaitUntil(Card::kPhotoUploadMs, [] { return !NETWORK::_NETWORK_IS_PREVIOUS_UPLOAD_PENDING(); });
 
-		C.photoStatus = "upload pending";
-		WaitUntil(Card::kPhotoUploadMs, [] { return !NETWORK::_NETWORK_IS_PREVIOUS_UPLOAD_PENDING(); });
-
-		C.photoStatus = "written, no name";
 		const char* name = nullptr;
-		if (!WaitUntil(Card::kPhotoNameMs, [&] { name = LookupPhotoTexture(ct); return name != nullptr; })) continue;
+		WaitUntil(written ? Card::kPhotoNameMs : 500, [&] { name = LookupPhotoTexture(ct); return name != nullptr; });
+		if (written && name)
+		{
+			strcpy_s(C.photoTexture, name);
+			C.photoVariant = v;
+			C.photoStatus = "ok";
+			return true;
+		}
+		if (name && !fallbackName) { fallbackName = name; fallbackType = v; }
+		C.photoStatus = written ? "written, no name" : "write failed";
+	}
 
-		strcpy_s(C.photoTexture, name);
-		C.photoVariant = v;
-		C.photoStatus = "ok";
-		return true;
+	// No confirmed write. Use the cache slot's name anyway: after _0xA1A8... it may hold the new portrait,
+	// and the back panel / custom texture will show whether it does.
+	if (fallbackName)
+	{
+		strcpy_s(C.photoTexture, fallbackName);
+		C.photoVariant = fallbackType;
+		C.photoStatus = "unverified slot";
 	}
 	return false;
 }
@@ -375,14 +395,22 @@ static bool OpenCard(bool cig)
 
 	if (CreateCardObject())
 	{
-		TASK::_TASK_ITEM_INTERACTION_2(pedMe, item, Cd.obj, Card::kPrimaryItem, state, 1, 0, -1.0f);
-		if (WaitUntil(Card::kTaskStartWaitMs, CardTaskRunning))
+		// natives.h calls the first parameter propNameGxt: when our title label is installed, try it there
+		// first (Remastered ships a label and an item name), then the item hash.
+		Hash firstParam[2] = { item, item };
+		int  tries = 1;
+		if (!cig && HUD::DOES_TEXT_LABEL_EXIST(Card::kTitleLabel)) { firstParam[0] = joaat(Card::kTitleLabel); tries = 2; }
+		for (int t = 0; t < tries; ++t)
 		{
-			Cd.examining = true;
-			Cd.cig = cig;
-			Cd.openedMs = GetTickCount64();
-			Cd.path = g_cardLastPath = 1;
-			return true;
+			TASK::_TASK_ITEM_INTERACTION_2(pedMe, firstParam[t], Cd.obj, Card::kPrimaryItem, state, 1, 0, -1.0f);
+			if (WaitUntil(Card::kTaskStartWaitMs, CardTaskRunning))
+			{
+				Cd.examining = true;
+				Cd.cig = cig;
+				Cd.openedMs = GetTickCount64();
+				Cd.path = g_cardLastPath = (t == 0 && tries == 2) ? 3 : 1;   // 3 = label as first param
+				return true;
+			}
 		}
 		DestroyCardObject();
 		Cd.lastError = "p1: task did not start";

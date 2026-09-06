@@ -326,7 +326,7 @@ namespace Card
 	constexpr float kPhotoPedOffsetY  = 2.0f;                       // the ped is parked this far IN FRONT of the player (in view, hidden) while the portrait is taken
 	constexpr DWORD kPhotoUploadMs    = 5000;                       // wait for a previous / current upload to finish
 	constexpr DWORD kPhotoAvailMs     = 1500;                       // wait for PEDSHOT_IS_AVAILABLE after generating
-	constexpr DWORD kPhotoWriteMs     = 8000;                       // poll _NETWORK_PERSONA_PHOTO_WRITE_LOCAL with FIXED arguments this long (it is a multi-frame operation)
+	constexpr DWORD kPhotoWriteMs     = 4000;                       // poll _NETWORK_PERSONA_PHOTO_WRITE_LOCAL with FIXED arguments this long (it is a multi-frame operation)
 	constexpr DWORD kPhotoNameMs      = 3000;                       // poll _REQUEST_PEDSHOT_TEXTURE_LOCAL_BACKUP_DOWNLOAD this long
 }
 // Hashes verified against femga's documented values.
