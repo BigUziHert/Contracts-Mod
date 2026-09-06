@@ -24,12 +24,16 @@ $bountyStateHeader += '}'
 $bountyState = [regex]::Matches($bountySource, '(?ms)^\s*// target portrait\s*\r?\n(.*?)^\s*// hand-in')
 if ($bountyState.Count -ne 1) { throw 'Expected exactly one target portrait state block.' }
 $bountyStateHeader += 'static struct PortraitState {'
+$bountyDefinition = [regex]::Matches($bountySource, '(?m)^\s*const ContractDef\* def = nullptr;')
+if ($bountyDefinition.Count -ne 1) { throw 'Expected exactly one production contract definition pointer.' }
+$bountyStateHeader += $bountyDefinition[0].Value
 $bountyStateHeader += $bountyState[0].Groups[1].Value
 $bountyStateHeader += '} C;'
 foreach ($bountyPattern in @(
     '(?m)^enum class ContractStartFailure[^\r\n]+;',
     '(?m)^static ContractStartFailure lastStartFailure[^\r\n]+;',
-    '(?m)^static const char\* lastPhotoStage[^\r\n]+;'
+    '(?m)^static const char\* lastPhotoStage[^\r\n]+;',
+    '(?m)^static unsigned photoTestBindAttempts[^\r\n]+;'
 )) {
     $bountyMatches = [regex]::Matches($bountySource, $bountyPattern)
     if ($bountyMatches.Count -ne 1) { throw "Expected exactly one production declaration: $bountyPattern" }
@@ -51,6 +55,7 @@ foreach ($bountyPattern in @(
 $bountyCaller = [regex]::Matches($bountySource, '(?ms)^#ifdef BOUNTY_PHOTO_SELF_TEST\s*\r?\n(\s*ENTITY::SET_ENTITY_VISIBLE\(ped, false\);.*?)(?=^#endif)')
 if ($bountyCaller.Count -ne 1) { throw 'Expected exactly one diagnostic caller branch.' }
 $bountyHeader += 'static Ped RunPhotoTestAsCaller(Ped ped) {'
+$bountyHeader += 'const ContractDef def{}; // Stand-in metadata supplied by the real caller parameter.'
 $bountyHeader += $bountyCaller[0].Groups[1].Value
 $bountyHeader += '}'
 [IO.File]::WriteAllText((Join-Path $bountyOutput 'photo_self_test_state.h'), ($bountyStateHeader -join "`r`n"))

@@ -638,11 +638,14 @@ static bool EnsureTargetPhotoReady()
 }
 
 #ifdef BOUNTY_PHOTO_SELF_TEST
-// Opt-in diagnostic build: one provisional subject, no contract/card, no cache rotation.
+// Opt-in diagnostic build: one provisional subject, a real inspected card, no bounty.
 // In particular, probe A never generates or writes: it tests whether a released
-// consumer can reopen the SAME published photo before testing a second write.
+// consumer can reopen the SAME published photo after card use, before another write.
+static unsigned photoTestBindAttempts = 0;
+static bool ProbePhotoCard(ULONGLONG started, unsigned captures);
 static void LogPhotoCacheTest(const char* phase, bool success, ULONGLONG started,
-	unsigned captures, const char* previousName, const char* observedName)
+	unsigned captures, const char* previousName, const char* observedName,
+	Object observedCard = 0, bool cardOwned = false)
 {
 	HMODULE module = nullptr;
 	wchar_t path[MAX_PATH] = {};
@@ -657,13 +660,17 @@ static void LogPhotoCacheTest(const char* phase, bool success, ULONGLONG started
 	SYSTEMTIME time;
 	GetSystemTime(&time);
 	bool previousValid = previousName[0] && NETWORK::_TEXTURE_DOWNLOAD_TEXTURE_NAME_IS_VALID(previousName);
-	fprintf(file, "%04u-%02u-%02uT%02u:%02u:%02uZ photo-test-v1 phase=%s ok=%d elapsedMs=%llu captures=%u slot=%d cache=%d stage=%s download=%d status=%d requests=%u name=\"%s\" previous=\"%s\" previousValid=%d nameValid=%d generated=%d written=%d writeComplete=%d busyBefore=%d busyAfter=%d busyRequest=%d freePeds=%d\n",
+	bool itemRunning = LivingPed(pedMe) && TASK::IS_PED_RUNNING_TASK_ITEM_INTERACTION(pedMe);
+	Hash itemState = itemRunning ? TASK::GET_ITEM_INTERACTION_STATE(pedMe) : 0;
+	fprintf(file, "%04u-%02u-%02uT%02u:%02u:%02uZ photo-test-v2 phase=%s ok=%d elapsedMs=%llu captures=%u slot=%d cache=%d stage=%s download=%d status=%d requests=%u name=\"%s\" previous=\"%s\" previousValid=%d nameValid=%d ready=%d generated=%d written=%d writeComplete=%d busyBefore=%d busyAfter=%d busyRequest=%d freePeds=%d card=%d cardOwned=%d cardExists=%d binds=%u itemRunning=%d itemState=%08X\n",
 		time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond,
 		phase, success ? 1 : 0, GetTickCount64() - started, captures, Card::kPhotoSlot, Card::kPhotoCacheType,
 		lastPhotoStage, C.photoDownload, C.photoDownloadStatus, C.photoRequestAttempts, observedName,
-		previousName, previousValid ? 1 : 0, C.photoLookupValid ? 1 : 0, C.photoGenOk ? 1 : 0,
+		previousName, previousValid ? 1 : 0, C.photoLookupValid ? 1 : 0, TargetPhotoReady() ? 1 : 0, C.photoGenOk ? 1 : 0,
 		C.photoWritten ? 1 : 0, C.photoWriteComplete ? 1 : 0, C.photoBusyBefore ? 1 : 0,
-		C.photoBusyAfterCleanup ? 1 : 0, C.photoBusyAtRequest ? 1 : 0, PED::_GET_NUM_FREE_SLOTS_IN_PED_POOL());
+		C.photoBusyAfterCleanup ? 1 : 0, C.photoBusyAtRequest ? 1 : 0, PED::_GET_NUM_FREE_SLOTS_IN_PED_POOL(),
+		observedCard, cardOwned ? 1 : 0, observedCard && ENTITY::DOES_ENTITY_EXIST(observedCard) ? 1 : 0,
+		photoTestBindAttempts, itemRunning ? 1 : 0, itemState);
 	fclose(file);
 }
 
@@ -700,6 +707,7 @@ static bool RunPhotoCacheSelfTest(Ped subject)
 {
 	ULONGLONG started = GetTickCount64();
 	unsigned captures = 0;
+	photoTestBindAttempts = 0;
 	char previousName[64] = "";
 	char name[64] = "";
 	LogPhotoCacheTest("begin", true, started, captures, previousName, name);
@@ -711,6 +719,11 @@ static bool RunPhotoCacheSelfTest(Ped subject)
 	LogPhotoCacheTest("initial", initial, started, captures, previousName, C.photoLookupName);
 	if (!initial || !PlayerAvailable()) return PlayerAvailable();
 	strcpy_s(previousName, C.photoTexture);
+
+	bool inspected = ProbePhotoCard(started, captures);
+	if (inspected && C.photoTexture[0]) strcpy_s(previousName, C.photoTexture);
+	LogPhotoCacheTest("card_inspection", inspected, started, captures, previousName, C.photoLookupName);
+	if (!inspected || !PlayerAvailable()) return PlayerAvailable();
 
 	bool reopened = ProbeExistingPhoto(name);
 	LogPhotoCacheTest("A_reopen_without_write", reopened, started, captures, previousName, name);
@@ -777,7 +790,9 @@ static Ped SpawnTargetWithPhoto(Hash model, const ContractDef& def)
 
 #ifdef BOUNTY_PHOTO_SELF_TEST
 	ENTITY::SET_ENTITY_VISIBLE(ped, false);
+	C.def = &def; // show the normal flipped information panel during this diagnostic
 	bool testComplete = RunPhotoCacheSelfTest(ped);
+	C.def = nullptr;
 	ReleaseTargetPhoto();
 	RequestOwnedPedCleanup(ped);
 	lastStartFailure = testComplete ? ContractStartFailure::PhotoDiagnosticComplete : ContractStartFailure::Interrupted;
@@ -1003,6 +1018,9 @@ static void ApplyCardCustomTexture()
 	if (!Card::kCardCustomTexture || !Cd.obj || !ENTITY::DOES_ENTITY_EXIST(Cd.obj) || !TargetPhotoReady()) return;
 	if (Cd.customApplied && RuntimeNowMs() >= Cd.textureRefreshUntilMs) return;
 	OBJECT::SET_CUSTOM_TEXTURES_ON_OBJECT(Cd.obj, joaat(C.photoTexture), 0, 0);
+#ifdef BOUNTY_PHOTO_SELF_TEST
+	++photoTestBindAttempts;
+#endif
 	Cd.customApplied = true;
 }
 
@@ -1072,6 +1090,42 @@ static void UpdateCard()
 		DrawCardFace(g_state == CONTRACT_DEAD || g_state == CONTRACT_PAID);
 	}
 }
+
+#ifdef BOUNTY_PHOTO_SELF_TEST
+static bool ProbePhotoCard(ULONGLONG started, unsigned captures)
+{
+	lastPhotoStage = "probe_card";
+	bool opened = OpenCard();
+	Object originalCard = Cd.obj;
+	Ped inspector = Cd.inspectingPed;
+	bool owned = Cd.ownsObj;
+	LogPhotoCacheTest("card_opened", opened, started, captures, "", C.photoLookupName, originalCard, owned);
+	if (!opened)
+	{
+		DestroyCardObject(true);
+		return false;
+	}
+	DisplaySubtitle("PHOTO TEST: FLIP THE CARD, THEN PUT IT AWAY.");
+	bool putAway = WaitUntil(60000, []
+	{
+		if (HUD::IS_PAUSE_MENU_ACTIVE()) return false;
+		UpdateCard(); // same task-transition binding, flip panel and cleanup as normal gameplay
+		return !Cd.obj;
+	});
+	LogPhotoCacheTest("card_put_away", putAway, started, captures, "", C.photoLookupName, originalCard, owned);
+	DestroyCardObject(true); // also closes our inspection on timeout or interruption
+	// Preserve the original handle across Cd reset. A cleared handle alone cannot
+	// establish that the native material consumer and the inspection task retired.
+	bool retired = WaitUntil(1500, [&]
+	{
+		return (!originalCard || !ENTITY::DOES_ENTITY_EXIST(originalCard)) &&
+			(!inspector || !ENTITY::DOES_ENTITY_EXIST(inspector) ||
+				!TASK::IS_PED_RUNNING_TASK_ITEM_INTERACTION(inspector));
+	});
+	LogPhotoCacheTest("card_removed", retired, started, captures, "", C.photoLookupName, originalCard, owned);
+	return putAway && retired && PlayerAvailable();
+}
+#endif
 
 // ===== [ HUMAN TARGET: SETUP ] =====
 static void StartWander(Ped ped, const ContractDef& def)

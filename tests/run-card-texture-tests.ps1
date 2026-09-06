@@ -33,7 +33,8 @@ foreach ($bountyFunction in @('ApplyCardCustomTexture', 'RefreshCardTextureAfter
 }
 foreach ($bountyPattern in @(
     '(?ms)^template<typename Pred> static bool WaitUntil\(DWORD timeoutMs, Pred pred\)\s*\{.*?^\}',
-    '(?ms)^static bool EnsureTargetPhotoReady\(\)\s*\{.*?^\}'
+    '(?ms)^static bool EnsureTargetPhotoReady\(\)\s*\{.*?^\}',
+    '(?ms)^static bool ProbePhotoCard\(ULONGLONG started, unsigned captures\)\s*\{.*?^\}'
 )) {
     $bountyMatches = [regex]::Matches($bountySource, $bountyPattern)
     if ($bountyMatches.Count -ne 1) { throw 'Expected exactly one production readiness gate or wait function.' }

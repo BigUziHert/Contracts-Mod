@@ -11,6 +11,7 @@
 using DWORD = std::uint32_t;
 using ULONGLONG = std::uint64_t;
 using Ped = int;
+struct ContractDef {}; // Only the diagnostic caller's metadata pointer is exercised here.
 constexpr Ped kSubject = 77;
 static unsigned checks = 0;
 static void Check(bool value, const char* description)
@@ -41,6 +42,9 @@ static struct TestWorld
     bool playerAvailable = true;
     unsigned frames = 0;
     unsigned captures = 0;
+    unsigned cardInspections = 0;
+    bool cardInspectionSucceeds = true;
+    std::string cardAcceptedName;
     unsigned explicitProbes = 0;
     unsigned lookupCalls = 0;
     unsigned backupCalls = 0;
@@ -156,6 +160,21 @@ static bool LookupPhotoTexture(int cacheType, char (&name)[64])
     C.photoTextureValid = true;
     return true;
 }
+static bool ProbePhotoCard(ULONGLONG started, unsigned captures)
+{
+    Check(started <= world.nowMs && captures == 1 && world.captures == 1 && C.def &&
+        C.photoTexture[0] && C.photoDownload > 0 &&
+        world.activeHandles.size() == 1,
+        "card inspection uses the initial accepted portrait while its handle remains owned");
+    ++world.cardInspections;
+    world.operations.push_back("card");
+    if (!world.cardAcceptedName.empty())
+    {
+        strcpy_s(C.photoTexture, world.cardAcceptedName.c_str());
+        strcpy_s(C.photoLookupName, C.photoTexture);
+    }
+    return world.cardInspectionSucceeds;
+}
 static void LogPhotoCacheTest(const char* phase, bool success, ULONGLONG started,
     unsigned captures, const char* previousName, const char* observedName)
 {
@@ -232,6 +251,7 @@ static void RunCallerAndCheck(bool interrupted = false)
         "the real diagnostic caller releases all positive handles on every exit");
     Check(world.cleanupRequests == 1 && world.visibilityChanges == 1,
         "the caller hides and requests checked cleanup of its one provisional ped");
+    Check(!C.def, "the diagnostic caller clears temporary back-panel metadata on every exit");
     Check(lastStartFailure == (interrupted ? ContractStartFailure::Interrupted
         : ContractStartFailure::PhotoDiagnosticComplete),
         "completed diagnostics use the dedicated no-retry outcome while interruption stays distinct");
@@ -250,11 +270,21 @@ static void TestReopenAndRewrite()
 {
     Reset();
     RunCallerAndCheck();
-    CheckPhases({ "begin", "initial", "A_reopen_without_write", "B_second_capture" });
+    CheckPhases({ "begin", "initial", "card_inspection", "A_reopen_without_write", "B_second_capture" });
     Check(world.captures == 2 && world.explicitProbes == 1 && world.handlesReleased == 3,
         "successful A performs exactly one same-subject rewrite and caller cleanup retains no handle");
-    Check(world.operations == std::vector<std::string>({ "capture", "explicit", "capture" }),
-        "A runs between the two captures without generating or writing a photo");
+    Check(world.operations == std::vector<std::string>({ "capture", "card", "explicit", "capture" }),
+        "the initial card is inspected before A runs between captures without writing a photo");
+}
+static void TestCardInspectionFailure()
+{
+    Reset();
+    world.cardInspectionSucceeds = false;
+    RunCallerAndCheck();
+    CheckPhases({ "begin", "initial", "card_inspection" });
+    Check(world.captures == 1 && world.cardInspections == 1 && world.explicitProbes == 0 &&
+        world.nameReleases == 0 && world.backupCalls == 0 && world.handlesReleased == 1,
+        "failed or timed-out card inspection stops all cache probes and releases the initial handle");
 }
 static void TestNameRecoveryWithoutRewrite()
 {
@@ -263,14 +293,28 @@ static void TestNameRecoveryWithoutRewrite()
         Reset();
         world.lookupOutcomes = { failure, LookupOutcome::Success };
         RunCallerAndCheck();
-        CheckPhases({ "begin", "initial", "A_reopen_without_write", "C_before_name_release", "C_name_invalidation",
+        CheckPhases({ "begin", "initial", "card_inspection", "A_reopen_without_write", "C_before_name_release", "C_name_invalidation",
             "C_reopen_without_write" });
         Check(world.captures == 1 && world.explicitProbes == 2 && world.nameReleases == 1 &&
             world.backupCalls == 0,
             "A failure and C recovery cannot generate or write another capture");
-        Check(world.operations == std::vector<std::string>({ "capture", "explicit", "invalidate", "explicit" }),
+        Check(world.operations == std::vector<std::string>({ "capture", "card", "explicit", "invalidate", "explicit" }),
             "name recovery changes cache invalidation only, after ownership is released");
     }
+}
+static void TestInspectionNameRefresh()
+{
+    Reset();
+    world.cardAcceptedName = "card_refreshed_portrait";
+    world.expectedReleasedName = world.cardAcceptedName;
+    world.lookupOutcomes = { LookupOutcome::Unavailable, LookupOutcome::Success };
+    world.lookupNames = { "", world.cardAcceptedName };
+    RunCallerAndCheck();
+    CheckPhases({ "begin", "initial", "card_inspection", "A_reopen_without_write",
+        "C_before_name_release", "C_name_invalidation", "C_reopen_without_write" });
+    Check(world.captures == 1 && world.logs[2].previous == world.cardAcceptedName &&
+        world.logs.back().previous == world.cardAcceptedName && world.nameReleases == 1,
+        "name invalidation uses the latest texture accepted during card inspection after A fails");
 }
 static void TestRewriteFailureRecovery()
 {
@@ -280,7 +324,7 @@ static void TestRewriteFailureRecovery()
     world.lookupNames = { "reopened_portrait", "recovered_portrait" };
     world.expectedReleasedName = "reopened_portrait";
     RunCallerAndCheck();
-    CheckPhases({ "begin", "initial", "A_reopen_without_write", "B_second_capture",
+    CheckPhases({ "begin", "initial", "card_inspection", "A_reopen_without_write", "B_second_capture",
         "C_before_name_release", "C_name_invalidation", "C_reopen_without_write" });
     Check(world.captures == 2 && world.explicitProbes == 2 && world.backupCalls == 0,
         "failed rewritten download can recover through C without a third capture");
@@ -292,7 +336,7 @@ static void TestRewriteFailureRecovery()
         Reset();
         world.captureOutcomes = { {}, { false, !failedWrite, false, false } };
         RunCallerAndCheck();
-        CheckPhases({ "begin", "initial", "A_reopen_without_write", "B_second_capture" });
+        CheckPhases({ "begin", "initial", "card_inspection", "A_reopen_without_write", "B_second_capture" });
         Check(world.nameReleases == 0 && world.backupCalls == 0,
             "an incomplete second write cannot enter readback recovery probes");
     }
@@ -306,10 +350,10 @@ static void TestBackupIsLastAndIsolated()
         world.lookupOutcomes = { LookupOutcome::Pending, LookupOutcome::Pending };
         RunCallerAndCheck();
         if (invalidates)
-            CheckPhases({ "begin", "initial", "A_reopen_without_write", "C_before_name_release", "C_name_invalidation",
+            CheckPhases({ "begin", "initial", "card_inspection", "A_reopen_without_write", "C_before_name_release", "C_name_invalidation",
                 "C_reopen_without_write", "D_backup_without_write" });
         else
-            CheckPhases({ "begin", "initial", "A_reopen_without_write", "C_before_name_release", "C_name_invalidation",
+            CheckPhases({ "begin", "initial", "card_inspection", "A_reopen_without_write", "C_before_name_release", "C_name_invalidation",
                 "D_backup_without_write" });
         Check(world.captures == 1 && world.operations.back() == "backup" && world.backupCalls == 1,
             "backup is the final isolated readback phase and performs no capture");
@@ -324,14 +368,14 @@ static void TestAlreadyInvalidName()
     world.oldNameValid = false;
     world.lookupOutcomes = { LookupOutcome::Unavailable, LookupOutcome::Success };
     RunCallerAndCheck();
-    CheckPhases({ "begin", "initial", "A_reopen_without_write", "C_before_name_release",
+    CheckPhases({ "begin", "initial", "card_inspection", "A_reopen_without_write", "C_before_name_release",
         "C_name_already_invalid", "C_reopen_without_write" });
-    Check(!world.logs[3].success && world.logs[4].success && world.captures == 1,
+    Check(!world.logs[4].success && world.logs[5].success && world.captures == 1,
         "an already-invalid name is logged distinctly and its reopen still performs no write");
 }
 static void TestInterruption()
 {
-    for (const char* phase : { "begin", "initial", "A_reopen_without_write",
+    for (const char* phase : { "begin", "initial", "card_inspection", "A_reopen_without_write",
         "C_before_name_release", "C_name_invalidation", "C_reopen_without_write", "D_backup_without_write" })
     {
         Reset();
@@ -350,7 +394,9 @@ int main()
 {
     TestInitialFailure();
     TestReopenAndRewrite();
+    TestCardInspectionFailure();
     TestNameRecoveryWithoutRewrite();
+    TestInspectionNameRefresh();
     TestRewriteFailureRecovery();
     TestBackupIsLastAndIsolated();
     TestAlreadyInvalidName();

@@ -3,6 +3,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+#include <vector>
 
 using DWORD = std::uint32_t;
 using ULONGLONG = std::uint64_t;
@@ -21,6 +23,7 @@ static struct
     char photoTexture[64] = "test_portrait";
     bool photoTextureValid = true;
     int photoCacheType = 1;
+    char photoLookupName[64] = "test_portrait";
 } C;
 
 static struct
@@ -48,6 +51,18 @@ static unsigned visibilityWrites = 0;
 static unsigned waitCalls = 0;
 static unsigned flipWrites = 0;
 static unsigned checks = 0;
+static const char* lastPhotoStage = "none";
+static bool probeOpenSucceeds = true;
+static bool probeTaskRunning = false;
+static ULONGLONG probePutAwayAtMs = 0;
+static ULONGLONG probeObjectGoneAtMs = 0;
+static ULONGLONG probeTaskEndsAtMs = 0;
+static ULONGLONG probePauseUntilMs = 0;
+static ULONGLONG probeCancelAtMs = 0;
+static unsigned probeUpdates = 0;
+static unsigned probeDestroys = 0;
+struct ProbeLog { std::string phase; bool success; Object original; bool owned; };
+static std::vector<ProbeLog> probeLogs;
 
 static void Check(bool condition, const char* description)
 {
@@ -69,6 +84,9 @@ static void WAIT(DWORD milliseconds)
     ++waitCalls;
     nowMs += 10;
     if (textureAvailableAtMs && nowMs >= textureAvailableAtMs) textureAvailable = true;
+    if (probeObjectGoneAtMs && nowMs >= probeObjectGoneAtMs) objectAlive = false;
+    if (probeTaskEndsAtMs && nowMs >= probeTaskEndsAtMs) probeTaskRunning = false;
+    if (probeCancelAtMs && nowMs >= probeCancelAtMs) playerAvailable = false;
 }
 static bool TargetPhotoReady() { return C.photoTexture[0] && C.photoTextureValid; }
 static Hash joaat(const char* text) { return std::strcmp(text, "test_portrait") == 0 ? 123u : 0u; }
@@ -114,6 +132,58 @@ static void _SET_PED_BLACKBOARD_BOOL(Ped ped, const char* key, bool value, int d
     ++flipWrites;
 }
 }
+namespace HUD
+{
+static bool IS_PAUSE_MENU_ACTIVE() { return nowMs < probePauseUntilMs; }
+}
+namespace TASK
+{
+static bool IS_PED_RUNNING_TASK_ITEM_INTERACTION(Ped ped)
+{
+    Check(ped == 88, "retirement checks the original inspector even after card state resets");
+    return probeTaskRunning;
+}
+}
+// This suite exercises the real probe's polling and retirement conditions. OpenCard/UpdateCard
+// are boundary stubs so material maintenance remains covered without reproducing native tasks.
+static bool OpenCard()
+{
+    if (!probeOpenSucceeds || !PlayerAvailable()) return false;
+    Cd.obj = 7;
+    Cd.ownsObj = true;
+    Cd.examining = true;
+    Cd.inspectingPed = 88;
+    return true;
+}
+static void UpdateCard()
+{
+    Check(!HUD::IS_PAUSE_MENU_ACTIVE(), "the inspection probe does not update card input while paused");
+    ++probeUpdates;
+    if (probePutAwayAtMs && nowMs >= probePutAwayAtMs)
+    {
+        Cd.obj = 0;
+        Cd.examining = false;
+        Cd.inspectingPed = 0;
+        Cd.ownsObj = false;
+    }
+}
+static void DestroyCardObject(bool cancelInspection)
+{
+    Check(cancelInspection, "probe exits request cancellation of their own inspection");
+    ++probeDestroys;
+    Cd.obj = 0;
+    Cd.examining = false;
+    Cd.inspectingPed = 0;
+    Cd.ownsObj = false;
+}
+static void DisplaySubtitle(const char* message) { Check(message && *message, "inspection instructions are present"); }
+static void LogPhotoCacheTest(const char* phase, bool success, ULONGLONG started,
+    unsigned captures, const char*, const char* observedName, Object original = 0, bool owned = false)
+{
+    Check(started <= nowMs && captures == 1 && std::strcmp(observedName, "test_portrait") == 0,
+        "card probe logs retain the initial capture and its observed portrait name");
+    probeLogs.push_back({ phase, success, original, owned });
+}
 
 #ifdef CARD_TEXTURE_OLD_ONESHOT
 #include "card_texture_old_under_test.h"
@@ -131,6 +201,12 @@ static void Reset()
     objectVisible = textureAvailable = playerAvailable = true;
     textureAvailableAtMs = 0;
     binds = cacheRequests = flipWrites = visibilityWrites = waitCalls = 0;
+    lastPhotoStage = "none";
+    probeOpenSucceeds = true;
+    probeTaskRunning = false;
+    probePutAwayAtMs = probeObjectGoneAtMs = probeTaskEndsAtMs = probePauseUntilMs = probeCancelAtMs = 0;
+    probeUpdates = probeDestroys = 0;
+    probeLogs.clear();
 }
 
 static void TestHandoffToInspection()
@@ -280,6 +356,72 @@ static void TestMissingObjectsAndInspector()
     Check(flipWrites == 1, "deleted inspectors do not receive blackboard writes");
 }
 
+static void TestInspectionProbeRetirement()
+{
+    Reset();
+    probePutAwayAtMs = nowMs + 30;
+    probeObjectGoneAtMs = nowMs + 50;
+    probeTaskEndsAtMs = nowMs + 80;
+    probeTaskRunning = true;
+    const ULONGLONG started = nowMs;
+    Check(ProbePhotoCard(started, 1) && nowMs == started + 80 && probeDestroys == 1,
+        "inspection waits for both the original object and original task after the tracked handle clears");
+    Check(probeLogs.size() == 3 && probeLogs[0].phase == "card_opened" &&
+        probeLogs[1].phase == "card_put_away" && probeLogs[2].phase == "card_removed",
+        "inspection logs opening, put-away and confirmed retirement in order");
+    for (const ProbeLog& entry : probeLogs)
+        Check(entry.success && entry.original == 7 && entry.owned,
+            "logs preserve original card identity and ownership across Cd reset");
+
+    Reset();
+    probePutAwayAtMs = nowMs + 10;
+    probeTaskEndsAtMs = nowMs + 20;
+    probeTaskRunning = true;
+    const ULONGLONG ghostStarted = nowMs;
+    Check(!ProbePhotoCard(ghostStarted, 1) && !Cd.obj && objectAlive &&
+        nowMs == ghostStarted + 10 + 1500,
+        "a cleared tracked handle cannot hide an original object that outlives retirement timeout");
+    Check(probeLogs.back().phase == "card_removed" && !probeLogs.back().success,
+        "unconfirmed object retirement is reported as a failed card probe");
+
+    Reset();
+    probePutAwayAtMs = nowMs + 10;
+    probeObjectGoneAtMs = nowMs + 20;
+    probeTaskRunning = true;
+    Check(!ProbePhotoCard(nowMs, 1) && !objectAlive && probeTaskRunning,
+        "object deletion alone cannot establish retirement while the original inspector task remains");
+}
+
+static void TestInspectionProbeStopping()
+{
+    Reset();
+    probeOpenSucceeds = false;
+    Check(!ProbePhotoCard(nowMs, 1) && probeDestroys == 1 && !probeUpdates && !waitCalls &&
+        probeLogs.size() == 1 && !probeLogs[0].success,
+        "failed card opening stops before inspection polling and still requests cleanup");
+
+    Reset();
+    probeObjectGoneAtMs = nowMs + 60000;
+    const ULONGLONG started = nowMs;
+    Check(!ProbePhotoCard(started, 1) && nowMs == started + 60000 && probeDestroys == 1,
+        "a user who never puts the card away reaches the bounded inspection timeout");
+    Check(!probeLogs[1].success && probeLogs[2].success,
+        "later object retirement does not convert a timed-out inspection into success");
+
+    Reset();
+    probeCancelAtMs = nowMs + 20;
+    Check(!ProbePhotoCard(nowMs, 1) && probeDestroys == 1 && !playerAvailable &&
+        !probeLogs[1].success && !probeLogs[2].success,
+        "player interruption stops polling and cancels the owned inspection");
+
+    Reset();
+    probePauseUntilMs = nowMs + 40;
+    probePutAwayAtMs = nowMs + 10;
+    probeObjectGoneAtMs = nowMs + 50;
+    Check(ProbePhotoCard(nowMs, 1) && probeUpdates == 1,
+        "inspection polling resumes after pause before detecting put-away");
+}
+
 int main()
 {
     Check(Card::kTextureSettleMs > 0, "production settling interval is positive");
@@ -288,5 +430,7 @@ int main()
     TestResidencyLossAfterSuccessfulBinding();
     TestReadinessGate();
     TestMissingObjectsAndInspector();
+    TestInspectionProbeRetirement();
+    TestInspectionProbeStopping();
     std::printf("All %u card texture checks passed (actual production functions).\n", checks);
 }
