@@ -748,7 +748,7 @@ static void TestBoundSlotsAreSkipped()
     Cd.obj = kCard;
     for (int i = 0; i < Card::kPhotoSlotCount; ++i)
         Check(PhotographPed(kSubject) && C.photoSlot == Card::kPhotoSlot + i, "each bound capture takes the next slot");
-    const unsigned allBound = Card::kPhotoSlotCount == 32 ? 0xFFFFFFFFu : (1u << Card::kPhotoSlotCount) - 1u;
+    const unsigned allBound = 0xFFFFFFFFu >> (32 - Card::kPhotoSlotCount);
     Check(photoSlotsBound == allBound && world.binds == static_cast<unsigned>(Card::kPhotoSlotCount),
         "every slot is recorded as bound once a card has shown each of them");
     Check(!PhotographPed(kSubject) && C.photoSlot == Card::kPhotoSlot && C.photoDownload == -1 &&
