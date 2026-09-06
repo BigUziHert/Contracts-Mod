@@ -75,11 +75,9 @@ namespace Tune
 	// --- contract card ---
 	constexpr DWORD kCardOpenDelayMs  = 2500;    // wait for the clerk handoff anim before the player examines the card
 	constexpr int   kInspectCardKey   = 0x49;    // 'I' — look at the card again mid-contract (photograph recipe, as Contracts Remastered)
-	constexpr int   kInspectCardAltKey = 0x4F;   // 'O' — same card through the cigarette-card recipe (debug comparison; flips natively)
-	constexpr bool  kCardFaceRenderTarget = true;// draw the target's photo onto the card prop (render target). Back panel always draws.
+	constexpr bool  kCardFaceRenderTarget = true;// retain render-target support for compatible props; custom textures draw the normal card face
 	constexpr bool  kPedshotHidden    = true;    // hide the target while his photo is taken next to the player
 	constexpr int   kPedshotReadyMs   = 4000;    // wait for the ped's assets to stream before the photo
-	constexpr int   kPedshotSettleMs  = 750;     // give the photo renderer this long before moving the ped away
 	// --- streaming ---
 	constexpr DWORD kStreamTimeoutMs  = 5000;    // give up on a model / anim that won't load instead of hanging the script
 	constexpr int   kSpawnAttempts    = 3;       // contract rerolls before "no contracts available"
@@ -288,7 +286,7 @@ static const GiverSpot kGivers[] = {
 namespace Card
 {
 	constexpr Hash kItem        = Joaat("generic_photograph");                // the inventory item whose inspect animations we borrow
-	constexpr Hash kPropModel   = Joaat("p_cs_photonudie05x_4x6");            // the photo card prop (its picture is replaced through a render target)
+	constexpr Hash kPropModel   = Joaat("p_cs_photonudie05x_4x6");            // the photo card prop (its picture is replaced through custom textures)
 	constexpr Hash kPrimaryItem = Joaat("primaryItem");                       // the held-prop slot every card/book/document state uses
 	constexpr Hash kStateIntro       = Joaat("DOCUMENT_INSPECT@Paper_w10-16_H15-24_INTRO");
 	constexpr Hash kStateBase        = Joaat("DOCUMENT_INSPECT@Paper_w10-16_H15-24_BASE");
@@ -303,7 +301,7 @@ namespace Card
 	constexpr const char* kTitleLabel   = "BC_CARD_TITLE";                    // GXT label from dist/lml/BountyContracts/strings.gxt2 (used when installed; literal text otherwise)
 	// Named render targets only take if the name matches the texture the prop's material samples (R*'s photo
 	// studio uses "cata_mp_stamp_ct" for its catalogue). Candidates are tried until IS_NAMED_RENDERTARGET_LINKED
-	// reports the link; the debug HUD shows which one.
+	// reports the link.
 	constexpr const char* kRenderTargetNames[] = {
 		"p_cs_photonudie05x_4x6", "photonudie05x_4x6", "photonudie05x", "photonudie", "p_cs_photo_4x6", "photo_4x6", "script_rt_photo", "contract_card",
 	};
@@ -311,23 +309,15 @@ namespace Card
 	constexpr const char* kHandBone     = "PH_R_Hand";
 	constexpr Hash kCashPickup = Joaat("PICKUP_MONEY_VARIABLE");
 
-	// Alternate recipe (debug key O): the cigarette-card item + states, which flip natively.
-	constexpr Hash kCigItem            = Joaat("document_cig_card_grl");
-	constexpr Hash kCigIntro           = Joaat("CIGARETTE_CARD_W6-5_H10-7_SINGLE_INTRO");
-	constexpr Hash kCigBase            = Joaat("CIGARETTE_CARD_W6-5_H10-7_SINGLE_BASE");
-	constexpr Hash kCigFlipToBack      = Joaat("CIGARETTE_CARD_W6-5_H10-7_SINGLE_FLIP_TO_BACK");
-	constexpr Hash kCigFlippedBase     = Joaat("CIGARETTE_CARD_W6-5_H10-7_SINGLE_FLIPPED_BASE");
-	constexpr Hash kCigFlipToFront     = Joaat("CIGARETTE_CARD_W6-5_H10-7_SINGLE_FLIP_TO_FRONT");
-
 	// --- target portrait (the game's persona-photo / pedshot pipeline) ---
 	constexpr const char* kPhotoName  = "MINIGAME_PROFILE_PHOTO";   // one of the three names the MP pedshot flow accepts (MP_PROFILE_PHOTO, MP_MISSION_PHOTO, MINIGAME_PROFILE_PHOTO)
-	constexpr int   kPhotoType        = 1;                          // _PEDSHOT_SET_PERSONA_PHOTO_TYPE (1 = the MP persona_photos flow)
+	constexpr const char* kPhotoFemaleName = "MINIGAME_PROFILE_PHOTO_F";
+	constexpr int   kPhotoType        = 1;                          // _PEDSHOT_SET_PERSONA_PHOTO_TYPE, as used in SP short_update
+	constexpr int   kPhotoSlot        = 0;                          // this mod retains one NPC portrait; this is not PLAYER_ID()
 	constexpr int   kPhotoCacheType   = 2;                          // local persona-photo cache slot ("..._MPG_0"); dev-8 saw the generated shot land here
-	constexpr DWORD kPhotoLookupMs    = 1200;                       // per no-write lookup (texture by name / local backup)
 	constexpr float kPhotoPedOffsetY  = 2.0f;                       // the ped is parked this far IN FRONT of the player (in view, hidden) while the portrait is taken
 	constexpr DWORD kPhotoUploadMs    = 5000;                       // wait for a previous / current upload to finish
-	constexpr DWORD kPhotoAvailMs     = 1500;                       // wait for PEDSHOT_IS_AVAILABLE after generating
-	constexpr DWORD kPhotoWriteMs     = 4000;                       // poll _NETWORK_PERSONA_PHOTO_WRITE_LOCAL with FIXED arguments this long (it is a multi-frame operation)
+	constexpr DWORD kPhotoWriteMs     = 8000;                       // poll _NETWORK_PERSONA_PHOTO_WRITE_LOCAL with fixed arguments
 	constexpr DWORD kPhotoNameMs      = 3000;                       // poll _REQUEST_PEDSHOT_TEXTURE_LOCAL_BACKUP_DOWNLOAD this long
 }
 // Hashes verified against femga's documented values.

@@ -22,6 +22,7 @@ tmp/
 *.ipch
 *.aps
 *.cache
+dist/*.zip
 
 # Claude Code local settings (personal)
 .claude/settings.local.json
