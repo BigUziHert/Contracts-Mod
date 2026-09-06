@@ -322,6 +322,7 @@ namespace Card
 	// --- target portrait (the game's persona-photo / pedshot pipeline) ---
 	constexpr const char* kPhotoName  = "MINIGAME_PROFILE_PHOTO";   // one of the three names the MP pedshot flow accepts (MP_PROFILE_PHOTO, MP_MISSION_PHOTO, MINIGAME_PROFILE_PHOTO)
 	constexpr int   kPhotoType        = 1;                          // _PEDSHOT_SET_PERSONA_PHOTO_TYPE (1 = the MP persona_photos flow)
+	constexpr int   kPhotoCacheType   = 2;                          // local persona-photo cache slot ("..._MPG_0"); dev-8 saw the generated shot land here
 	constexpr DWORD kPhotoLookupMs    = 1200;                       // per no-write lookup (texture by name / local backup)
 	constexpr float kPhotoPedOffsetY  = 2.0f;                       // the ped is parked this far IN FRONT of the player (in view, hidden) while the portrait is taken
 	constexpr DWORD kPhotoUploadMs    = 5000;                       // wait for a previous / current upload to finish
