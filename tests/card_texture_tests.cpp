@@ -62,6 +62,7 @@ static void Check(bool condition, const char* description)
 static ULONGLONG RuntimeNowMs() { return nowMs; }
 static ULONGLONG GetTickCount64() { return nowMs; }
 static bool PlayerAvailable() { return playerAvailable; }
+static void MaintainOwnedPedCleanup() {}
 static void WAIT(DWORD milliseconds)
 {
     Check(milliseconds == 0, "readiness polling yields one game frame");

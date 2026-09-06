@@ -187,6 +187,12 @@ static void ReleaseTargetPhoto()
     ++world.releases;
 }
 
+// Cleanup's delayed/failed native behavior is exercised by owned_ped_cleanup_tests.
+static void RequestOwnedPedCleanup(Ped ped)
+{
+    if (ENTITY::DOES_ENTITY_EXIST(ped)) PED::DELETE_PED(&ped);
+}
+
 static void LogContractStartFailure(Hash model, int attempt);
 #include "portrait_start_under_test.h"
 

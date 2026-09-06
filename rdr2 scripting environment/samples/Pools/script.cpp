@@ -25,9 +25,25 @@
 
 // ===== [ STATE ] =====
 enum ContractState { CONTRACT_NONE, CONTRACT_UNKNOWN, CONTRACT_FOUND, CONTRACT_DEAD, CONTRACT_PAID };
-enum class ContractStartFailure { None, Interrupted, InvalidModel, ModelLoadTimeout, PedCreationFailed, PortraitFailed, PedPoolFull };
+enum class ContractStartFailure { None, Interrupted, InvalidModel, ModelLoadTimeout, PedCreationFailed, PortraitFailed, PedPoolFull, CleanupPending };
 static ContractStartFailure lastStartFailure = ContractStartFailure::None;
 static const char* lastPhotoStage = "none";
+
+// The single ped created by this mod remains tracked even if DELETE_PED clears its argument.
+// Keeping this outside C prevents contract reset from losing an unconfirmed deletion.
+struct OwnedPedRuntime
+{
+	Ped ped = 0;
+	Hash model = 0;
+	bool cleanupPending = false;
+	bool blockedLogged = false;
+	ULONGLONG requestedMs = 0;
+	ULONGLONG nextAttemptMs = 0;
+};
+static OwnedPedRuntime ownedPed;
+static unsigned long long ownedPedsCreated = 0, ownedPedsDeleted = 0, ownedPedsReleased = 0;
+static constexpr DWORD kOwnedPedDeleteRetryMs = 250;
+static constexpr DWORD kOwnedPedCleanupWaitMs = 1500;
 
 struct ActiveContract
 {
@@ -63,6 +79,10 @@ struct ActiveContract
 	ULONGLONG   photoNextRequestMs = 0;
 	bool        photoWritten = false;
 	bool        photoUploadPending = false, photoCommitReady = false, photoTextureValid = false;
+	bool        photoWriteComplete = false;
+	bool        photoBusyBefore = false, photoBusyAfterCleanup = false, photoBusyAtRequest = false;
+	bool        photoCommitBefore = false;
+	unsigned    photoRequestAttempts = 0;
 	bool        cardOpenPending = false;
 
 	// hand-in
@@ -173,13 +193,108 @@ static void LogContractStartFailure(Hash model, int attempt)
 	if (_wfopen_s(&file, path, L"a") != 0 || !file) return;
 	SYSTEMTIME time;
 	GetSystemTime(&time);
-	fprintf(file, "%04u-%02u-%02uT%02u:%02u:%02uZ start-v3 failure=%d photo=%s attempt=%d model=%08X player=%d current=%d alive=%d freePeds=%d download=%d status=%d name=\"%s\" nameValid=%d ready=%d generated=%d written=%d committed=%d\n",
+	fprintf(file, "%04u-%02u-%02uT%02u:%02u:%02uZ start-v4 failure=%d photo=%s attempt=%d model=%08X player=%d current=%d alive=%d freePeds=%d download=%d status=%d name=\"%s\" nameValid=%d ready=%d generated=%d written=%d writeComplete=%d commitProbe=%d commitBefore=%d busyBefore=%d busyAfter=%d busyRequest=%d requests=%u\n",
 		time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond,
 		static_cast<int>(lastStartFailure), lastPhotoStage, attempt, model, pedMe, PLAYER::PLAYER_PED_ID(),
 		LivingPed(pedMe) ? 1 : 0, PED::_GET_NUM_FREE_SLOTS_IN_PED_POOL(), C.photoDownload,
 		C.photoDownloadStatus, C.photoLookupName, C.photoLookupValid ? 1 : 0, C.photoTextureValid ? 1 : 0,
-		C.photoGenOk ? 1 : 0, C.photoWritten ? 1 : 0, C.photoCommitReady ? 1 : 0);
+		C.photoGenOk ? 1 : 0, C.photoWritten ? 1 : 0, C.photoWriteComplete ? 1 : 0,
+		C.photoCommitReady ? 1 : 0, C.photoCommitBefore ? 1 : 0, C.photoBusyBefore ? 1 : 0,
+		C.photoBusyAfterCleanup ? 1 : 0, C.photoBusyAtRequest ? 1 : 0, C.photoRequestAttempts);
 	fclose(file);
+}
+
+static void LogOwnedPedCleanup(const char* event)
+{
+	HMODULE module = nullptr;
+	wchar_t path[MAX_PATH] = {};
+	if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+		reinterpret_cast<LPCWSTR>(&LogOwnedPedCleanup), &module)) return;
+	DWORD length = GetModuleFileNameW(module, path, MAX_PATH);
+	if (!length || length >= MAX_PATH) return;
+	wchar_t* slash = std::wcsrchr(path, L'\\');
+	if (!slash || wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - path), L"BountyContracts-cleanup.log") != 0) return;
+	FILE* file = nullptr;
+	if (_wfopen_s(&file, path, L"a") != 0 || !file) return;
+	SYSTEMTIME time;
+	GetSystemTime(&time);
+	bool exists = ownedPed.ped && ENTITY::DOES_ENTITY_EXIST(ownedPed.ped);
+	fprintf(file, "%04u-%02u-%02uT%02u:%02u:%02uZ cleanup-v1 event=%s ped=%d model=%08X exists=%d actualModel=%08X owner=%d persistence=%d freePeds=%d created=%llu deleted=%llu released=%llu\n",
+		time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond,
+		event, ownedPed.ped, ownedPed.model, exists ? 1 : 0,
+		exists ? ENTITY::GET_ENTITY_MODEL(ownedPed.ped) : 0,
+		exists ? ENTITY::DOES_ENTITY_BELONG_TO_THIS_SCRIPT(ownedPed.ped, false) : 0,
+		exists ? ENTITY::_IS_ENTITY_OWNED_BY_PERSISTENCE_SYSTEM(ownedPed.ped) : 0,
+		PED::_GET_NUM_FREE_SLOTS_IN_PED_POOL(), ownedPedsCreated, ownedPedsDeleted, ownedPedsReleased);
+	fclose(file);
+}
+
+static void TrackOwnedPed(Ped ped, Hash model)
+{
+	if (!ped || ownedPed.ped) return;
+	ownedPed.ped = ped;
+	ownedPed.model = model;
+	++ownedPedsCreated;
+}
+
+static bool OwnedPedIdentityMatches()
+{
+	return ENTITY::GET_ENTITY_MODEL(ownedPed.ped) == ownedPed.model &&
+		ENTITY::DOES_ENTITY_BELONG_TO_THIS_SCRIPT(ownedPed.ped, false) &&
+		!ENTITY::_IS_ENTITY_OWNED_BY_PERSISTENCE_SYSTEM(ownedPed.ped);
+}
+
+static void MaintainOwnedPedCleanup()
+{
+	if (!ownedPed.ped || !ownedPed.cleanupPending) return;
+	if (!ENTITY::DOES_ENTITY_EXIST(ownedPed.ped))
+	{
+		++ownedPedsDeleted;
+		LogOwnedPedCleanup("confirmed");
+		ownedPed = OwnedPedRuntime();
+		return;
+	}
+	ULONGLONG now = GetTickCount64();
+	if (now < ownedPed.nextAttemptMs) return;
+	ownedPed.nextAttemptMs = now + kOwnedPedDeleteRetryMs;
+	if (!OwnedPedIdentityMatches())
+	{
+		if (!ownedPed.blockedLogged) { LogOwnedPedCleanup("ownership_blocked"); ownedPed.blockedLogged = true; }
+		return;
+	}
+	if (!ownedPed.blockedLogged && now - ownedPed.requestedMs >= kOwnedPedCleanupWaitMs)
+	{
+		LogOwnedPedCleanup("still_exists");
+		ownedPed.blockedLogged = true;
+	}
+	if (!PED::IS_PED_DEAD_OR_DYING(ownedPed.ped, true)) ENTITY::SET_ENTITY_LOAD_COLLISION_FLAG(ownedPed.ped, false);
+	Ped deleteArgument = ownedPed.ped;
+	PED::DELETE_PED(&deleteArgument);
+	// Confirmation uses the original handle on a later maintenance poll, never the native's output.
+}
+
+static void RequestOwnedPedCleanup(Ped ped)
+{
+	if (!ped || ped != ownedPed.ped || ownedPed.cleanupPending) return;
+	ownedPed.cleanupPending = true;
+	ownedPed.requestedMs = GetTickCount64();
+	LogOwnedPedCleanup("requested");
+	MaintainOwnedPedCleanup();
+}
+
+static void ReleaseOwnedPed(Ped ped)
+{
+	if (!ped || ped != ownedPed.ped) return;
+	if (ownedPed.cleanupPending) return;
+	if (ENTITY::DOES_ENTITY_EXIST(ped))
+	{
+		if (!OwnedPedIdentityMatches()) { RequestOwnedPedCleanup(ped); return; }
+		Ped releaseArgument = ped;
+		ENTITY::SET_ENTITY_AS_NO_LONGER_NEEDED(&releaseArgument);
+	}
+	++ownedPedsReleased;
+	LogOwnedPedCleanup("released");
+	ownedPed = OwnedPedRuntime();
 }
 
 static const char* Literal(const char* text) { return MISC::VAR_STRING(10, "LITERAL_STRING", text); }
@@ -196,6 +311,7 @@ static void ReportContractStartFailure()
 	case ContractStartFailure::PedCreationFailed: DisplaySubtitle("TARGET COULD NOT SPAWN. TRY AGAIN."); break;
 	case ContractStartFailure::PortraitFailed: DisplaySubtitle("TARGET PHOTO COULD NOT BE PREPARED. TRY AGAIN."); break;
 	case ContractStartFailure::PedPoolFull: DisplaySubtitle("NO ROOM FOR ANOTHER TARGET. TRY AGAIN AFTER LEAVING THE AREA."); break;
+	case ContractStartFailure::CleanupPending: DisplaySubtitle("PREVIOUS TARGET IS STILL BEING REMOVED. TRY AGAIN SHORTLY."); break;
 	case ContractStartFailure::None: DisplaySubtitle("CONTRACT REQUEST FAILED. TRY AGAIN."); break;
 	}
 }
@@ -232,6 +348,7 @@ template<typename Pred> static bool WaitUntil(DWORD timeoutMs, Pred pred)
 	ULONGLONG deadline = GetTickCount64() + timeoutMs;
 	for (;;)
 	{
+		MaintainOwnedPedCleanup();
 		if (!PlayerAvailable()) return false;
 		MaintainPortraitAndCard();
 		if (pred()) return true;
@@ -252,6 +369,11 @@ static Ped SpawnPed(Hash model, const Vector3& pos)
 {
 	lastStartFailure = ContractStartFailure::None;
 	if (!PlayerAvailable()) { lastStartFailure = ContractStartFailure::Interrupted; return 0; }
+	if (ownedPed.ped && !WaitUntil(kOwnedPedCleanupWaitMs, [] { return ownedPed.ped == 0; }))
+	{
+		lastStartFailure = PlayerAvailable() ? ContractStartFailure::CleanupPending : ContractStartFailure::Interrupted;
+		return 0;
+	}
 	if (!STREAMING::IS_MODEL_VALID(model) || !STREAMING::IS_MODEL_IN_CDIMAGE(model) || !STREAMING::IS_MODEL_A_PED(model))
 	{
 		lastStartFailure = ContractStartFailure::InvalidModel;
@@ -276,6 +398,7 @@ static Ped SpawnPed(Hash model, const Vector3& pos)
 		nextAttemptMs = now + Tune::kPedSpawnRetryDelayMs;
 		if (PED::_GET_NUM_FREE_SLOTS_IN_PED_POOL() <= 0) return false;
 		ped = PED::CREATE_PED(model, pos, 0.0f, false, true, true, true);
+		TrackOwnedPed(ped, model);
 		return ped && ENTITY::DOES_ENTITY_EXIST(ped);
 	});
 	if (!created || !PlayerAvailable())
@@ -283,7 +406,7 @@ static Ped SpawnPed(Hash model, const Vector3& pos)
 		lastStartFailure = !PlayerAvailable() ? ContractStartFailure::Interrupted
 			: PED::_GET_NUM_FREE_SLOTS_IN_PED_POOL() <= 0 ? ContractStartFailure::PedPoolFull
 			: ContractStartFailure::PedCreationFailed;
-		if (ped && ENTITY::DOES_ENTITY_EXIST(ped)) PED::DELETE_PED(&ped);
+		RequestOwnedPedCleanup(ped);
 		STREAMING::SET_MODEL_AS_NO_LONGER_NEEDED(model);
 		return 0;
 	}
@@ -291,7 +414,7 @@ static Ped SpawnPed(Hash model, const Vector3& pos)
 	PED::_SET_RANDOM_OUTFIT_VARIATION(ped, true);
 	ENTITY::PLACE_ENTITY_ON_GROUND_PROPERLY(ped, 1);
 	STREAMING::SET_MODEL_AS_NO_LONGER_NEEDED(model);
-	if (!ENTITY::DOES_ENTITY_EXIST(ped)) { lastStartFailure = ContractStartFailure::PedCreationFailed; return 0; }
+	if (!ENTITY::DOES_ENTITY_EXIST(ped)) { RequestOwnedPedCleanup(ped); lastStartFailure = ContractStartFailure::PedCreationFailed; return 0; }
 	return ped;
 }
 
@@ -323,11 +446,10 @@ static void AddCorpseBlip()
 }
 
 // ===== [ TARGET PORTRAIT ] =====
-// SP reference: Halen84/RDR3-Decompiled-Scripts, 1491.50/short_update.c, func_490.
-// Type(1), A1(0), ready -> previous cleanup / generate / previous cleanup -> successful write ->
-// !uploadPending && CC4 -> capture cleanup. A1's meaning is undocumented;
-// its fixed argument is deliberately independent of the network cache type. The hidden subject,
-// portrait texture, card face, and flipped information panel were verified together in-game.
+// Reference: 1491.50/script_mp_rel/persona_photos.ysc.c, func_3 / func_10 / func_11.
+// The type-2 producer waits for !PEDSHOT_IS_AVAILABLE and !previousUpload, clears old data
+// BEFORE generation, writes on a later frame, waits for upload completion, and cleans up on
+// another frame. The SP A1/CC4 and post-generate cleanup sequence belongs to a different path.
 
 // Cache type 2 uses an owned download handle (R* persona_photos / map_app_event_handler),
 // released before rewriting the same slot. Do not mix that ownership with the SP backup loader.
@@ -372,6 +494,8 @@ static bool LookupPhotoTexture(int cacheType, char (&out)[64])
 		C.photoNextRequestMs = GetTickCount64() + Card::kPhotoRequestRetryMs;
 		C.photoDownloadStatus = -1;
 		C.photoLookupName[0] = '\0';
+		C.photoBusyAtRequest = GRAPHICS::PEDSHOT_IS_AVAILABLE() != 0;
+		++C.photoRequestAttempts;
 		C.photoDownload = NETWORK::_LOCAL_PLAYER_PEDSHOT_TEXTURE_DOWNLOAD_REQUEST(Card::kPhotoSlot, cacheType);
 		if (C.photoDownload <= 0) return false;
 	}
@@ -400,6 +524,7 @@ static void FinishPhotoCapture()
 	GRAPHICS::_PEDSHOT_INIT_CLEANUP_DATA();
 	GRAPHICS::_PEDSHOT_FINISH_CLEANUP_DATA();
 	C.photoTaken = false;
+	C.photoBusyAfterCleanup = GRAPHICS::PEDSHOT_IS_AVAILABLE() != 0;
 }
 
 static bool FinishPhotoAttempt(bool success)
@@ -420,22 +545,16 @@ static bool PhotographPed(Ped subject)
 	C.photoPedWasReady = C.photoGenOk = false;
 	C.photoWritten = false;
 	C.photoUploadPending = C.photoCommitReady = C.photoTextureValid = false;
+	C.photoWriteComplete = false;
+	C.photoBusyBefore = GRAPHICS::PEDSHOT_IS_AVAILABLE() != 0;
+	C.photoBusyAfterCleanup = C.photoBusyAtRequest = false;
+	C.photoCommitBefore = NETWORK::_0xCC4E72C339461ED1() != 0;
+	C.photoRequestAttempts = 0;
 	C.photoTexture[0] = '\0';
 	Cd.customApplied = false;
 	if (!ENTITY::DOES_ENTITY_EXIST(subject)) return FinishPhotoAttempt(false);
 
 	ENTITY::SET_ENTITY_VISIBLE(subject, !Tune::kPedshotHidden);
-	lastPhotoStage = "previous_upload";
-	if (!WaitUntil(Card::kPhotoUploadMs, []
-	{
-		C.photoUploadPending = NETWORK::_NETWORK_IS_PREVIOUS_UPLOAD_PENDING() != 0;
-		return !C.photoUploadPending;
-	})) return FinishPhotoAttempt(false);
-
-	// Do not touch shared capture data until a previous upload has finished.
-	C.photoTaken = true;
-	GRAPHICS::_PEDSHOT_SET_PERSONA_PHOTO_TYPE(Card::kPhotoType);
-	GRAPHICS::_0xA1A86055792FB249(0);
 	const char* photoName = PED::IS_PED_MALE(subject) ? Card::kPhotoName : Card::kPhotoFemaleName;
 	lastPhotoStage = "ped_assets";
 	C.photoPedWasReady = WaitUntil(Tune::kPedshotReadyMs, [&]
@@ -445,13 +564,24 @@ static bool PhotographPed(Ped subject)
 	});
 	if (!C.photoPedWasReady) return FinishPhotoAttempt(false);
 
+	// PEDSHOT_IS_AVAILABLE is counterintuitive: the MP producer defers while it is true.
+	// Check after streaming the subject, before taking ownership or clearing any shared data.
+	lastPhotoStage = "capture_busy";
+	if (!WaitUntil(Card::kPhotoUploadMs, [&]
+	{
+		PED::FORCE_PED_MOTION_STATE(subject, joaat("MotionState_DoNothing"), false, 0, false);
+		bool busy = GRAPHICS::PEDSHOT_IS_AVAILABLE() != 0;
+		C.photoUploadPending = NETWORK::_NETWORK_IS_PREVIOUS_UPLOAD_PENDING() != 0;
+		return !busy && !C.photoUploadPending;
+	})) return FinishPhotoAttempt(false);
+	C.photoTaken = true;
 	GRAPHICS::_PEDSHOT_PREVIOUS_PERSONA_PHOTO_DATA_CLEANUP();
+	GRAPHICS::_PEDSHOT_SET_PERSONA_PHOTO_TYPE(Card::kPhotoType);
 	lastPhotoStage = "generate";
 	C.photoGenOk = GRAPHICS::_PEDSHOT_GENERATE_PERSONA_PHOTO(photoName, subject, 0) != 0;
-	GRAPHICS::_PEDSHOT_PREVIOUS_PERSONA_PHOTO_DATA_CLEANUP();
 	PED::FORCE_PED_MOTION_STATE(subject, joaat("MotionState_DoNothing"), false, 0, false);
 	if (!C.photoGenOk) return FinishPhotoAttempt(false);
-	WAIT(0); // the SP script enters the write state on a later frame
+	WAIT(0);
 
 	lastPhotoStage = "write";
 	C.photoWritten = WaitUntil(Card::kPhotoWriteMs, [&]
@@ -463,15 +593,18 @@ static bool PhotographPed(Ped subject)
 	if (!C.photoWritten) return FinishPhotoAttempt(false);
 
 	WAIT(0);
-	lastPhotoStage = "commit";
-	if (!WaitUntil(Card::kPhotoUploadMs, [&]
+	lastPhotoStage = "upload";
+	C.photoWriteComplete = WaitUntil(Card::kPhotoUploadMs, [&]
 	{
 		PED::FORCE_PED_MOTION_STATE(subject, joaat("MotionState_DoNothing"), false, 0, false);
 		C.photoUploadPending = NETWORK::_NETWORK_IS_PREVIOUS_UPLOAD_PENDING() != 0;
 		C.photoCommitReady = NETWORK::_0xCC4E72C339461ED1() != 0;
-		return !C.photoUploadPending && C.photoCommitReady;
-	})) return FinishPhotoAttempt(false);
+		return !C.photoUploadPending; // CC4 is diagnostic only for the type-2 MP producer
+	});
+	if (!C.photoWriteComplete) return FinishPhotoAttempt(false);
+	WAIT(0); // MP case 2 -> case 3: cleanup follows completion on another frame
 	FinishPhotoCapture();
+	WAIT(0); // let the cache publish the completed capture before requesting its download
 
 	char name[64] = "";
 	lastPhotoStage = "texture_download";
@@ -531,7 +664,7 @@ static Ped SpawnTargetWithPhoto(Hash model, const ContractDef& def)
 	}
 	if (!photographed)
 	{
-		if (ENTITY::DOES_ENTITY_EXIST(ped)) PED::DELETE_PED(&ped);
+		RequestOwnedPedCleanup(ped);
 		ReleaseTargetPhoto();
 		return 0;
 	}
@@ -983,8 +1116,8 @@ static void ClearContract(bool deleteTarget)
 	ReleaseTargetPhoto();
 	if (C.cashObj && ENTITY::DOES_ENTITY_EXIST(C.cashObj)) OBJECT::DELETE_OBJECT(&C.cashObj);
 	if (C.def && C.def->onCleanup) C.def->onCleanup();
-	if (deleteTarget && TargetExists()) PED::DELETE_PED(&C.target);
-	if (TargetExists()) ENTITY::SET_ENTITY_AS_NO_LONGER_NEEDED(&C.target);
+	if (deleteTarget) RequestOwnedPedCleanup(C.target);
+	else ReleaseOwnedPed(C.target);
 	C = ActiveContract();
 	ResetPrompt(giverPrompt);
 	ResetPrompt(camPrompt);
@@ -1014,13 +1147,13 @@ static bool StartContract()
 			if (lastStartFailure != ContractStartFailure::PortraitFailed) LogContractStartFailure(model, attempt + 1);
 			// Capture already retried this subject. Do not multiply capture timeouts by rerolling models.
 			if (lastStartFailure == ContractStartFailure::Interrupted || lastStartFailure == ContractStartFailure::PortraitFailed ||
-				lastStartFailure == ContractStartFailure::PedPoolFull) break;
+				lastStartFailure == ContractStartFailure::PedPoolFull || lastStartFailure == ContractStartFailure::CleanupPending) break;
 			if (attempt + 1 < Tune::kSpawnAttempts) WAIT(0);
 			continue;
 		}
 		if (!PlayerAvailable())
 		{
-			PED::DELETE_PED(&ped);
+			RequestOwnedPedCleanup(ped);
 			ReleaseTargetPhoto();
 			lastStartFailure = ContractStartFailure::Interrupted;
 			LogContractStartFailure(model, attempt + 1);
@@ -1472,6 +1605,7 @@ void ScriptMain()
 	CreateGiverPrompt();
 	while (true)
 	{
+		MaintainOwnedPedCleanup();
 		Ped previousPlayer = pedMe;
 		UpdatePlayer();
 		SetRuntimePaused(!PlayerAvailable() || HUD::IS_PAUSE_MENU_ACTIVE() || CAMERA::IS_SCREEN_FADED_OUT());

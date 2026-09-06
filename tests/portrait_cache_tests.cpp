@@ -53,7 +53,25 @@ static struct World
     bool generateSucceeds = true;
     bool writeSucceeds = true;
     bool commitReady = true;
+    unsigned busyUntilFrame = 0;
+    bool permanentlyBusy = false;
+    unsigned previousUploadUntilFrame = 0;
+    unsigned uploadFrames = 0;
+    bool uploadNeverCompletes = false;
+    bool activeUploadNeverCompletes = false;
+    unsigned uploadCompleteFrame = 0;
+    unsigned writeFrame = 0;
+    bool writeQueued = false;
     bool captureActive = false;
+    bool generatedDataValid = false;
+    unsigned generatedFrame = 0;
+    unsigned commitObservedFrame = std::numeric_limits<unsigned>::max();
+    unsigned cleanupFrame = 0;
+    ULONGLONG publicationDelayMs = 0;
+    ULONGLONG publishAt = 0;
+    unsigned previousCleanups = 0;
+    unsigned generatedDataInvalidations = 0;
+    unsigned busyChecks = 0;
     unsigned captureStarts = 0;
     unsigned captureCleanups = 0;
     unsigned cleanupInitializations = 0;
@@ -102,6 +120,7 @@ static unsigned ActiveDownloads()
 static ULONGLONG GetTickCount64() { return world.nowMs; }
 static ULONGLONG RuntimeNowMs() { return world.nowMs; }
 static bool PlayerAvailable() { return world.playerAvailable; }
+static void MaintainOwnedPedCleanup() {} // The independent spawn suite exercises ped ownership.
 static void WAIT(DWORD delay)
 {
     Check(delay == 0, "capture polling yields game frames");
@@ -145,21 +164,40 @@ static void _SET_PED_BLACKBOARD_BOOL(Ped ped, const char*, bool value, int durat
 }
 namespace GRAPHICS
 {
+static bool PEDSHOT_IS_AVAILABLE()
+{
+    ++world.busyChecks;
+    return world.permanentlyBusy || world.frame < world.busyUntilFrame || world.captureActive;
+}
 static void _PEDSHOT_SET_PERSONA_PHOTO_TYPE(int type)
 {
-    Check(type == 1 && !world.captureActive, "each capture starts with the verified SP photo type");
+    Check(type == 1 && !world.captureActive, "each capture starts with the verified persona photo type");
     Check(ActiveDownloads() == 0, "previous downloads are released before the next capture starts");
+    Check(!world.permanentlyBusy && world.frame >= world.busyUntilFrame &&
+        world.frame >= world.previousUploadUntilFrame,
+        "new capture setup waits for shared capture and prior upload availability");
+    Check(world.previousCleanups == world.captureStarts + 1,
+        "previous capture data is cleared once before configuring each new photo");
+    world.writeQueued = false;
+    world.commitObservedFrame = std::numeric_limits<unsigned>::max();
     world.captureActive = true;
     ++world.captureStarts;
 }
-static void _0xA1A86055792FB249(int type) { Check(type == 0, "the independent SP capture argument remains zero"); }
-static void _PEDSHOT_PREVIOUS_PERSONA_PHOTO_DATA_CLEANUP() {}
+static void _PEDSHOT_PREVIOUS_PERSONA_PHOTO_DATA_CLEANUP()
+{
+    // Model data loss if cleanup is moved after generation; successful pipeline tests reject that order.
+    ++world.previousCleanups;
+    if (world.generatedDataValid) ++world.generatedDataInvalidations;
+    world.generatedDataValid = false;
+}
 static bool _PEDSHOT_GENERATE_PERSONA_PHOTO(const char* name, Ped ped, int slot)
 {
     Check(world.captureActive && ped == kSubject && slot == 0, "capture generation retains its verified arguments");
     Check(std::strcmp(name, world.subjectMale ? "MINIGAME_PROFILE_PHOTO" : "MINIGAME_PROFILE_PHOTO_F") == 0,
         "male and female captures preserve their respective names");
     ++world.generates;
+    world.generatedFrame = world.frame;
+    world.generatedDataValid = world.generateSucceeds;
     return world.generateSucceeds;
 }
 static void _PEDSHOT_INIT_CLEANUP_DATA()
@@ -172,30 +210,54 @@ static void _PEDSHOT_FINISH_CLEANUP_DATA()
     Check(world.captureActive && world.cleanupInitializations == world.captureCleanups + 1,
         "capture cleanup start and finish remain paired");
     world.captureActive = false;
+    world.generatedDataValid = false;
+    world.cleanupFrame = world.frame;
+    world.publishAt = world.nowMs + world.publicationDelayMs;
     ++world.captureCleanups;
 }
 }
 namespace NETWORK
 {
-static bool _NETWORK_IS_PREVIOUS_UPLOAD_PENDING() { return false; }
+static bool _NETWORK_IS_PREVIOUS_UPLOAD_PENDING()
+{
+    if (!world.writeQueued) return world.frame < world.previousUploadUntilFrame;
+    const bool pending = world.activeUploadNeverCompletes || world.frame < world.uploadCompleteFrame;
+    if (!pending && world.commitObservedFrame == std::numeric_limits<unsigned>::max())
+    {
+        Check(world.frame > world.writeFrame, "upload completion is observed on a later frame than write acceptance");
+        world.commitObservedFrame = world.frame;
+    }
+    return pending;
+}
 static bool _0xCC4E72C339461ED1() { return world.commitReady; }
 static bool _NETWORK_PERSONA_PHOTO_WRITE_LOCAL(const char*, int slot, int format, int cacheType)
 {
     Check(world.captureActive && slot == 0 && format == 1 && cacheType == 2,
         "write arguments preserve the verified local slot and cache type");
     Check(ActiveDownloads() == 0, "a retained download cannot survive into a same-slot overwrite");
+    Check(world.frame > world.generatedFrame, "write starts on a later frame than generation");
     ++world.writeCalls;
-    if (world.writeSucceeds) ++world.writes;
-    return world.writeSucceeds;
+    const bool succeeded = world.writeSucceeds && world.generatedDataValid;
+    if (succeeded)
+    {
+        ++world.writes;
+        world.writeQueued = true;
+        world.writeFrame = world.frame;
+        world.activeUploadNeverCompletes = world.uploadNeverCompletes;
+        world.uploadCompleteFrame = world.frame + world.uploadFrames;
+    }
+    return succeeded;
 }
 static int _LOCAL_PLAYER_PEDSHOT_TEXTURE_DOWNLOAD_REQUEST(int slot, int cacheType)
 {
     Check(slot == 0 && cacheType == 2, "download uses the exact slot and cache type written");
     Check(world.writes > 0 && !world.captureActive, "download begins after capture commit and cleanup");
+    Check(world.frame > world.cleanupFrame, "download starts on a later frame than capture cleanup");
     Check(ActiveDownloads() == 0, "only one download is owned at a time");
     ++world.requests;
     world.requestTimes.push_back(world.nowMs);
     if (world.cancelOnRequest) world.playerAvailable = false;
+    if (world.nowMs < world.publishAt) return -1;
     if (world.unavailableRequests)
     {
         --world.unavailableRequests;
@@ -284,6 +346,10 @@ static void TestRepeatedCapture()
             "every successful capture writes once without re-evaluating the success predicate");
         Check(world.requests == capture && ActiveDownloads() == 1 && world.releases == capture - 1,
             "each accepted capture replaces the preceding retained handle");
+        Check(world.previousCleanups == capture && world.generatedDataInvalidations == 0,
+            "repeated captures preserve generated data until the write is accepted");
+        Check(world.cleanupFrame > world.commitObservedFrame,
+            "capture cleanup occurs on a later frame than upload completion");
         Check(TargetPhotoReady() && C.photoDownloadStatus == 0 &&
             std::strcmp(C.photoTexture, world.downloads.back().name.c_str()) == 0 &&
             std::strcmp(C.photoLookupName, C.photoTexture) == 0,
@@ -292,6 +358,56 @@ static void TestRepeatedCapture()
     ReleaseTargetPhoto();
     ReleaseTargetPhoto();
     Check(world.releases == 3, "repeated cleanup never releases a handle twice");
+    CheckFullyReleased();
+}
+
+static void TestCaptureAvailabilityAndPublication()
+{
+    Reset();
+    world.busyUntilFrame = 4;
+    world.previousUploadUntilFrame = 7;
+    world.uploadFrames = 6;
+    world.publicationDelayMs = Card::kPhotoRequestRetryMs + kFrameMs;
+    Check(PhotographPed(kSubject), "capture waits through busy state, prior upload and delayed publication");
+    Check(world.generatedFrame >= world.previousUploadUntilFrame && world.captureStarts == 1,
+        "shared readiness polling does not repeatedly initialize the capture");
+    Check(world.commitObservedFrame >= world.uploadCompleteFrame &&
+        world.cleanupFrame > world.commitObservedFrame,
+        "queued upload completion is observed before cleanup on a separate frame");
+    Check(world.requests > 1 && world.downloads.size() == 1 &&
+        world.requestTimes.back() >= world.publishAt,
+        "publication lag retries allocation without phantom handle ownership");
+    Check(C.photoBusyBefore && !C.photoBusyAfterCleanup && !C.photoBusyAtRequest &&
+        C.photoWriteComplete && C.photoRequestAttempts == world.requests,
+        "capture and request diagnostics describe the completed delayed pipeline");
+    ReleaseTargetPhoto();
+    CheckFullyReleased();
+
+    Reset();
+    world.permanentlyBusy = true;
+    Check(!PhotographPed(kSubject) && world.captureStarts == 0 && world.generates == 0 &&
+        world.previousCleanups == 0 && world.requests == 0,
+        "permanent shared capture busy state times out before touching capture data");
+    Check(C.photoBusyBefore && !C.photoTaken && std::strcmp(lastPhotoStage, "capture_busy") == 0,
+        "a busy timeout preserves its diagnostic without claiming capture ownership");
+    Check(world.nowMs <= 1000 + Card::kPhotoUploadMs + kFrameMs,
+        "the initial busy wait remains bounded by production timing");
+    ReleaseTargetPhoto();
+    CheckFullyReleased();
+
+    Reset();
+    world.previousUploadUntilFrame = std::numeric_limits<unsigned>::max();
+    Check(!PhotographPed(kSubject) && world.captureStarts == 0 && world.previousCleanups == 0,
+        "a prior upload that never completes prevents capture ownership and cleanup");
+    ReleaseTargetPhoto();
+    CheckFullyReleased();
+
+    Reset();
+    world.commitReady = false;
+    Check(PhotographPed(kSubject) && !C.photoCommitBefore && !C.photoCommitReady &&
+        C.photoWriteComplete && world.writes == 1,
+        "CC4 remains diagnostic and cannot reject a completed MP upload and texture");
+    ReleaseTargetPhoto();
     CheckFullyReleased();
 }
 
@@ -361,9 +477,13 @@ static void TestFailureAndCancellationCleanup()
         Check(PhotographPed(kSubject), "establish an accepted portrait before a failed retake");
         if (stage == 0) world.generateSucceeds = false;
         if (stage == 1) world.writeSucceeds = false;
-        if (stage == 2) world.commitReady = false;
+        if (stage == 2) world.uploadNeverCompletes = true;
         Check(!PhotographPed(kSubject) && world.releases == 1 && ActiveDownloads() == 0,
-            "generation, write and commit failures cannot retain the preceding portrait");
+            "generation, write and pending upload failures cannot retain the preceding portrait");
+        if (stage == 2)
+            Check(C.photoWritten && C.photoUploadPending && !C.photoWriteComplete &&
+                C.photoRequestAttempts == 0 && std::strcmp(lastPhotoStage, "upload") == 0,
+                "an upload timeout retains accepted-write diagnostics without requesting an incomplete photo");
         ReleaseTargetPhoto();
         CheckFullyReleased();
     }
@@ -437,6 +557,7 @@ int main()
     Check(Card::kPhotoRequestRetryMs > 0 && Card::kPhotoNameMs > Card::kPhotoRequestRetryMs,
         "production timing permits bounded request recovery");
     TestRepeatedCapture();
+    TestCaptureAvailabilityAndPublication();
     TestPendingAndFailedDownloads();
     TestFailureAndCancellationCleanup();
     TestNameValidationAndRecovery();

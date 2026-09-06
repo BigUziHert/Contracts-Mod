@@ -61,6 +61,9 @@ static struct World
     unsigned outfits = 0;
     unsigned placements = 0;
     unsigned deletes = 0;
+    bool deleteSucceeds = true;
+    unsigned deleteDelayFrames = 0;
+    unsigned deletionFrame = std::numeric_limits<unsigned>::max();
     bool interactionAllowed = true;
     unsigned interactionBlockedFrame = std::numeric_limits<unsigned>::max();
     bool remoteStartSucceeds = true;
@@ -83,6 +86,7 @@ static void WAIT(DWORD delay)
         "a created ped receives mission ownership before any yield");
     ++world.frame;
     world.nowMs += kFrameMs;
+    if (world.frame >= world.deletionFrame) world.spawnedAlive = false;
     if (world.frame >= world.playerChangeFrame) world.playerId = 99;
     if (world.frame >= world.interactionBlockedFrame) world.interactionAllowed = false;
     Check(world.frame < 10000, "polling remains bounded");
@@ -119,6 +123,18 @@ static void SET_MODEL_AS_NO_LONGER_NEEDED(Hash model)
 
 namespace ENTITY
 {
+static Hash GET_ENTITY_MODEL(Ped ped) { return ped == kSpawnedPed ? kModel : 0; }
+static bool DOES_ENTITY_BELONG_TO_THIS_SCRIPT(Ped ped, bool) { return ped == kSpawnedPed; }
+static bool _IS_ENTITY_OWNED_BY_PERSISTENCE_SYSTEM(Ped) { return false; }
+static void SET_ENTITY_LOAD_COLLISION_FLAG(Ped ped, bool flag)
+{
+    Check(ped == kSpawnedPed && world.spawnedAlive && !flag, "cleanup disables collision loading only on its own live ped");
+}
+static void SET_ENTITY_AS_NO_LONGER_NEEDED(Ped* ped)
+{
+    Check(*ped == kSpawnedPed && world.spawnedAlive, "release only touches the tracked ped");
+    *ped = 0;
+}
 static bool DOES_ENTITY_EXIST(int entity)
 {
     if (entity == kSpawnedPed && world.spawnedPending && world.frame >= world.spawnVisibleFrame)
@@ -189,8 +205,12 @@ static void _SET_RANDOM_OUTFIT_VARIATION(Ped ped, bool)
 static void DELETE_PED(Ped* ped)
 {
     Check(*ped == kSpawnedPed && world.spawnedAlive, "interrupted successful creation deletes its ped");
-    world.spawnedAlive = false;
-    world.spawnedPending = false;
+    if (world.deleteSucceeds)
+    {
+        if (world.deleteDelayFrames) world.deletionFrame = world.frame + world.deleteDelayFrames;
+        else world.spawnedAlive = false;
+        world.spawnedPending = false;
+    }
     ++world.deletes;
     *ped = 0;
 }
@@ -203,6 +223,7 @@ static bool CanStartInteraction();
 static bool StartContract();
 static void LogContractStartFailure(Hash model, int attempt);
 static void ReportContractStartFailure();
+static void LogOwnedPedCleanup(const char*) {}
 
 #include "spawn_under_test.h"
 
@@ -237,6 +258,8 @@ static void Reset()
     world = World();
     pedMe = kPlayer;
     C = {};
+    ownedPed = OwnedPedRuntime();
+    ownedPedsCreated = ownedPedsDeleted = ownedPedsReleased = 0;
     lastStartFailure = ContractStartFailure::None;
 }
 
@@ -341,6 +364,32 @@ static void TestPendingHandleAndPoolCapacity()
     CheckReleased();
 }
 
+static void TestPendingCleanupBlocksReplacement()
+{
+    Reset();
+    Check(Spawn() == kSpawnedPed, "cleanup test creates one owned target");
+    world.deleteSucceeds = false;
+    RequestOwnedPedCleanup(kSpawnedPed);
+    const ULONGLONG started = world.nowMs;
+    Check(ownedPed.ped == kSpawnedPed && world.spawnedAlive,
+        "native pointer clearing cannot discard a still-existing target");
+    Check(Spawn() == 0 && lastStartFailure == ContractStartFailure::CleanupPending,
+        "unconfirmed cleanup refuses a replacement contract");
+    Check(world.creates == 1 && world.requests == 1 && ownedPed.ped == kSpawnedPed,
+        "pending cleanup cannot acquire another model or overwrite its tracked handle");
+    Check(world.nowMs - started >= kOwnedPedCleanupWaitMs &&
+        world.nowMs - started <= kOwnedPedCleanupWaitMs + kFrameMs,
+        "waiting for cleanup returns within its bounded deadline");
+
+    world.deleteSucceeds = true;
+    world.deleteDelayFrames = 2;
+    Check(Spawn() == kSpawnedPed && world.creates == 2 && ownedPedsDeleted == 1,
+        "a later confirmed deletion allows exactly one replacement spawn");
+    ReleaseOwnedPed(kSpawnedPed);
+    Check(!ownedPed.ped && world.spawnedAlive && ownedPedsReleased == 1,
+        "completed target release relinquishes tracking without deleting its corpse");
+}
+
 static void TestModelFailures()
 {
     for (int invalid = 0; invalid < 3; ++invalid)
@@ -443,6 +492,7 @@ int main()
     TestDelayedCreation();
     TestStaleHandleAndBoundedFailure();
     TestPendingHandleAndPoolCapacity();
+    TestPendingCleanupBlocksReplacement();
     TestModelFailures();
     TestPlayerInterruption();
     TestRemoteStart();
