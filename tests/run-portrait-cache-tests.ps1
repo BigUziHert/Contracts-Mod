@@ -19,12 +19,12 @@ $bountyGroups = [ordered]@{
     Tune = @('kPedshotHidden', 'kPedshotReadyMs')
     Card = @('kPhotoName', 'kPhotoFemaleName', 'kPhotoType', 'kPhotoSlot', 'kPhotoCacheType',
         'kPhotoUploadMs', 'kPhotoWriteMs', 'kPhotoNameMs', 'kPhotoRequestRetryMs',
-        'kTextureSettleMs', 'kCardCustomTexture', 'kFlipBlackboard')
+        'kTextureSettleMs', 'kTextureBindCount', 'kTextureBindDelaysMs', 'kCardCustomTexture', 'kFlipBlackboard')
 }
 foreach ($bountyGroup in $bountyGroups.Keys) {
     $bountyHeader += 'namespace ' + $bountyGroup + ' {'
     foreach ($bountyConstant in $bountyGroups[$bountyGroup]) {
-        $bountyMatches = [regex]::Matches($bountyData, ('constexpr\s+[^;\r\n]+?\b' + $bountyConstant + '\s*=[^;]+;'))
+        $bountyMatches = [regex]::Matches($bountyData, ('constexpr\s+[^;\r\n]+?\b' + $bountyConstant + '(?:\[[^\]]+\])?\s*=[^;]+;'))
         if ($bountyMatches.Count -ne 1) { throw "Expected exactly one production constant: $bountyConstant" }
         $bountyHeader += $bountyMatches[0].Value
     }
@@ -44,6 +44,7 @@ $bountyPatterns = @(
     '(?ms)^static void ReleaseTargetPhoto\(\)\s*\{.*?^\}',
     '(?m)^static bool TargetPhotoReady\(\)[^\r\n]+',
     '(?ms)^static void ApplyCardCustomTexture\(\)\s*\{.*?^\}',
+    '(?ms)^static void RefreshCardTextureAfterTransition\(\)\s*\{.*?^\}',
     '(?ms)^static void MaintainPortraitAndCard\(\)\s*\{.*?^\}',
     '(?ms)^static bool PhotographPed\(Ped subject\)\s*\{.*?^\}',
     '(?ms)^static bool EnsureTargetPhotoReady\(\)\s*\{.*?^\}'

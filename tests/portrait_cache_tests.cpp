@@ -50,6 +50,7 @@ static struct World
     bool subjectExists = true;
     bool subjectMale = true;
     bool pedReady = true;
+    unsigned pedReadyAtFrame = 0;
     bool generateSucceeds = true;
     bool writeSucceeds = true;
     bool commitReady = true;
@@ -78,6 +79,13 @@ static struct World
     unsigned generates = 0;
     unsigned writeCalls = 0;
     unsigned writes = 0;
+    ULONGLONG previousCleanupCallMs = 0;
+    ULONGLONG generateCallMs = 0;
+    ULONGLONG writeCallMs = 0;
+    ULONGLONG cleanupInitCallMs = 0;
+    ULONGLONG cleanupFinishCallMs = 0;
+    ULONGLONG requestCallMs = 0;
+    ULONGLONG releaseCallMs = 0;
     unsigned requests = 0;
     unsigned releases = 0;
     unsigned unavailableRequests = 0;
@@ -99,7 +107,8 @@ static struct CardState
     Object obj = 0;
     bool ownsObj = true;
     bool customApplied = false;
-    ULONGLONG textureRefreshUntilMs = 0;
+    ULONGLONG textureRefreshStartedMs = 0;
+    unsigned textureBindIndex = 0;
     bool examining = false;
     Ped inspectingPed = kInspector;
 } Cd;
@@ -151,7 +160,11 @@ static void SET_ENTITY_VISIBLE(int entity, bool visible)
 namespace PED
 {
 static bool IS_PED_MALE(Ped ped) { Check(ped == kSubject, "capture uses the supplied subject"); return world.subjectMale; }
-static bool IS_PED_READY_TO_RENDER(Ped ped) { Check(ped == kSubject, "readiness uses the supplied subject"); return world.pedReady; }
+static bool IS_PED_READY_TO_RENDER(Ped ped)
+{
+    Check(ped == kSubject, "readiness uses the supplied subject");
+    return world.pedReady && world.frame >= world.pedReadyAtFrame;
+}
 static void FORCE_PED_MOTION_STATE(Ped ped, Hash, bool, int, bool)
 {
     Check(ped == kSubject, "capture maintenance addresses the supplied subject");
@@ -187,6 +200,7 @@ static void _PEDSHOT_PREVIOUS_PERSONA_PHOTO_DATA_CLEANUP()
 {
     // Model data loss if cleanup is moved after generation; successful pipeline tests reject that order.
     ++world.previousCleanups;
+    world.nowMs += world.previousCleanupCallMs;
     if (world.generatedDataValid) ++world.generatedDataInvalidations;
     world.generatedDataValid = false;
 }
@@ -196,6 +210,7 @@ static bool _PEDSHOT_GENERATE_PERSONA_PHOTO(const char* name, Ped ped, int slot)
     Check(std::strcmp(name, world.subjectMale ? "MINIGAME_PROFILE_PHOTO" : "MINIGAME_PROFILE_PHOTO_F") == 0,
         "male and female captures preserve their respective names");
     ++world.generates;
+    world.nowMs += world.generateCallMs;
     world.generatedFrame = world.frame;
     world.generatedDataValid = world.generateSucceeds;
     return world.generateSucceeds;
@@ -204,12 +219,14 @@ static void _PEDSHOT_INIT_CLEANUP_DATA()
 {
     Check(world.captureActive, "capture cleanup starts only for owned capture resources");
     ++world.cleanupInitializations;
+    world.nowMs += world.cleanupInitCallMs;
 }
 static void _PEDSHOT_FINISH_CLEANUP_DATA()
 {
     Check(world.captureActive && world.cleanupInitializations == world.captureCleanups + 1,
         "capture cleanup start and finish remain paired");
     world.captureActive = false;
+    world.nowMs += world.cleanupFinishCallMs;
     world.generatedDataValid = false;
     world.cleanupFrame = world.frame;
     world.publishAt = world.nowMs + world.publicationDelayMs;
@@ -237,6 +254,7 @@ static bool _NETWORK_PERSONA_PHOTO_WRITE_LOCAL(const char*, int slot, int format
     Check(ActiveDownloads() == 0, "a retained download cannot survive into a same-slot overwrite");
     Check(world.frame > world.generatedFrame, "write starts on a later frame than generation");
     ++world.writeCalls;
+    world.nowMs += world.writeCallMs;
     const bool succeeded = world.writeSucceeds && world.generatedDataValid;
     if (succeeded)
     {
@@ -256,6 +274,7 @@ static int _LOCAL_PLAYER_PEDSHOT_TEXTURE_DOWNLOAD_REQUEST(int slot, int cacheTyp
     Check(ActiveDownloads() == 0, "only one download is owned at a time");
     ++world.requests;
     world.requestTimes.push_back(world.nowMs);
+    world.nowMs += world.requestCallMs;
     if (world.cancelOnRequest) world.playerAvailable = false;
     if (world.nowMs < world.publishAt) return -1;
     if (world.unavailableRequests)
@@ -302,6 +321,7 @@ static void TEXTURE_DOWNLOAD_RELEASE(int id)
     download.active = false;
     ++download.releases;
     ++world.releases;
+    world.nowMs += world.releaseCallMs;
 }
 }
 namespace OBJECT
@@ -316,6 +336,7 @@ static void SET_CUSTOM_TEXTURES_ON_OBJECT(Object obj, Hash texture, int p2, int 
 
 static void MaintainPortraitAndCard();
 static void ApplyCardCustomTexture();
+static void RefreshCardTextureAfterTransition();
 static bool TargetPhotoReady();
 static void ReleaseTargetPhoto();
 #include "portrait_cache_under_test.h"
@@ -443,6 +464,69 @@ static void TestPendingAndFailedDownloads()
     }
 }
 
+static void TestCaptureTiming()
+{
+    Reset();
+    world.pedReadyAtFrame = 4;
+    world.busyUntilFrame = 7;
+    world.uploadFrames = 6;
+    world.downloadDelayMs = 96;
+    world.previousCleanupCallMs = 3;
+    world.generateCallMs = 7;
+    world.writeCallMs = 11;
+    world.cleanupInitCallMs = 5;
+    world.cleanupFinishCallMs = 8;
+    world.requestCallMs = 17;
+    Check(PhotographPed(kSubject), "native and frame delays still complete a single capture");
+    Check(C.photoAssetsMs == 4 * kFrameMs && C.photoIdleMs == 3 * kFrameMs &&
+        C.photoUploadMs == 5 * kFrameMs,
+        "asset, idle and upload timings measure their respective frame waits");
+    Check(C.photoPreviousCleanupMs == 3 && C.photoGenerateMs == 7 && C.photoCleanupMs == 13,
+        "generation and cleanup timings include only their scoped native calls");
+    Check(C.photoWriteMs == 11 && C.photoWriteCallMaxMs == 11 && C.photoRequestCallMaxMs == 17 &&
+        C.photoReadbackMs == 17 + world.downloadDelayMs,
+        "native maximum durations exclude pending frames while readback includes them");
+    const ULONGLONG measuredStages = C.photoReleaseMs + C.photoAssetsMs + C.photoIdleMs +
+        C.photoPreviousCleanupMs + C.photoGenerateMs + C.photoWriteMs + C.photoUploadMs +
+        C.photoCleanupMs + C.photoReadbackMs;
+    Check(C.photoTimingStartedMs == 1000 && C.photoTotalMs == world.nowMs - 1000 &&
+        C.photoTotalMs == measuredStages + 4 * kFrameMs,
+        "total timing also includes the four explicit inter-stage yields");
+    Check(world.generates == 1 && world.writeCalls == 1 && world.requests == 1 &&
+        C.photoRequestAttempts == world.requests,
+        "timing observation does not repeat generation, write or request calls");
+
+    world.previousCleanupCallMs = world.generateCallMs = world.writeCallMs = 0;
+    world.cleanupInitCallMs = world.cleanupFinishCallMs = world.requestCallMs = 0;
+    world.releaseCallMs = 19;
+    world.uploadFrames = 0;
+    world.downloadDelayMs = 0;
+    Check(PhotographPed(kSubject), "the timed capture can be replaced on the same slot");
+    Check(C.photoReleaseMs == 19 && C.photoAssetsMs == 0 && C.photoIdleMs == 0 &&
+        C.photoPreviousCleanupMs == 0 && C.photoGenerateMs == 0 && C.photoWriteMs == 0 &&
+        C.photoWriteCallMaxMs == 0 && C.photoUploadMs == 0 && C.photoCleanupMs == 0 &&
+        C.photoReadbackMs == 0 && C.photoRequestCallMaxMs == 0 &&
+        C.photoTotalMs == 19 + 4 * kFrameMs,
+        "each attempt resets all timings while separately recording the preceding handle release");
+    Check(world.generates == 2 && world.writeCalls == 2 && world.requests == 2 && C.photoRequestAttempts == 1,
+        "per-attempt request diagnostics reset without changing native call counts");
+    ReleaseTargetPhoto();
+    CheckFullyReleased();
+
+    Reset();
+    // WaitUntil cannot preempt a blocking native. This models a slow response,
+    // not an assertion that the game native actually blocks for this duration.
+    world.writeCallMs = 30000;
+    world.downloadDelayMs = 0;
+    Check(PhotographPed(kSubject) && world.writeCalls == 1 && C.photoWritten,
+        "a slow successful write result is consumed once even after the polling deadline");
+    Check(C.photoWriteMs == 30000 && C.photoWriteCallMaxMs == 30000 &&
+        C.photoTotalMs == 30000 + 4 * kFrameMs,
+        "a blocking native is visible in stage and total timing without appearing as frame polling");
+    ReleaseTargetPhoto();
+    CheckFullyReleased();
+}
+
 static void TestFailureAndCancellationCleanup()
 {
     Reset();
@@ -524,21 +608,24 @@ static void TestMaintenanceRebinding()
         "maintenance binds the accepted texture and preserves card visibility and flip");
     world.nowMs += Card::kTextureSettleMs + 1;
     MaintainPortraitAndCard();
-    Check(world.binds == 1 && world.requests == 1, "settled maintenance neither rebinds nor reallocates");
+    Check(world.binds == 2 && world.requests == 1,
+        "late maintenance makes one final scheduled bind without reallocating the download");
+    MaintainPortraitAndCard();
+    Check(world.binds == 2, "completed binding schedules do not repeat on later maintenance calls");
 
     Download& retained = FindDownload(C.photoDownload);
     retained.nameValid = false;
     MaintainPortraitAndCard();
-    Check(world.cardVisible && C.photoTextureValid && !C.photoLookupValid && world.binds == 1,
+    Check(world.cardVisible && C.photoTextureValid && !C.photoLookupValid && world.binds == 2,
         "a false backup-name diagnostic cannot hide a completed explicit download");
     const std::string originalName = retained.name;
     retained.name.clear();
     MaintainPortraitAndCard();
-    Check(!world.cardVisible && !C.photoTextureValid && world.binds == 1,
+    Check(!world.cardVisible && !C.photoTextureValid && world.binds == 2,
         "a temporarily missing completed name hides the owned card without binding an empty texture");
     retained.name = originalName + "_renewed";
     MaintainPortraitAndCard();
-    Check(world.cardVisible && TargetPhotoReady() && world.binds == 2 &&
+    Check(world.cardVisible && TargetPhotoReady() && world.binds == 3 &&
         world.boundTexture == joaat(retained.name.c_str()) && C.photoTexture == retained.name,
         "name recovery updates the accepted name and restarts material binding");
     retained.finalStatus = 2;
@@ -559,6 +646,7 @@ int main()
     TestRepeatedCapture();
     TestCaptureAvailabilityAndPublication();
     TestPendingAndFailedDownloads();
+    TestCaptureTiming();
     TestFailureAndCancellationCleanup();
     TestNameValidationAndRecovery();
     TestMaintenanceRebinding();

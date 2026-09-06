@@ -31,7 +31,8 @@ static struct
     Object obj = 7;
     bool ownsObj = true;
     bool customApplied = false;
-    ULONGLONG textureRefreshUntilMs = 0;
+    ULONGLONG textureRefreshStartedMs = 0;
+    unsigned textureBindIndex = 0;
     bool examining = false;
     bool inHand = false;
     Ped inspectingPed = 88;
@@ -51,6 +52,11 @@ static unsigned visibilityWrites = 0;
 static unsigned waitCalls = 0;
 static unsigned flipWrites = 0;
 static unsigned checks = 0;
+static unsigned photoTestBindAttempts = 0;
+static unsigned photoTestBindingTransitions = 0;
+static const char* publishedName = "test_portrait";
+static Hash expectedTexture = 123;
+static std::vector<ULONGLONG> bindingTimes;
 static const char* lastPhotoStage = "none";
 static bool probeOpenSucceeds = true;
 static bool probeTaskRunning = false;
@@ -89,7 +95,7 @@ static void WAIT(DWORD milliseconds)
     if (probeCancelAtMs && nowMs >= probeCancelAtMs) playerAvailable = false;
 }
 static bool TargetPhotoReady() { return C.photoTexture[0] && C.photoTextureValid; }
-static Hash joaat(const char* text) { return std::strcmp(text, "test_portrait") == 0 ? 123u : 0u; }
+static Hash joaat(const char* text) { return std::strcmp(text, "test_portrait") == 0 ? 123u : 456u; }
 
 namespace ENTITY
 {
@@ -109,8 +115,9 @@ namespace OBJECT
 static void SET_CUSTOM_TEXTURES_ON_OBJECT(Object object, Hash texture, int p2, int p3)
 {
     Check(object == 7 && objectAlive, "only a live tracked card is bound");
-    Check(texture == 123 && p2 == 0 && p3 == 0, "portrait binding arguments are preserved");
+    Check(texture == expectedTexture && p2 == 0 && p3 == 0, "portrait binding arguments are preserved");
     ++binds;
+    bindingTimes.push_back(nowMs);
     objectTextured = true;
 }
 }
@@ -120,7 +127,7 @@ static bool LookupPhotoTexture(int cacheType, char (&out)[64])
 {
     Check(cacheType == C.photoCacheType, "portrait cache ownership is preserved");
     ++cacheRequests;
-    strcpy_s(out, "test_portrait");
+    strcpy_s(out, publishedName);
     return textureAvailable;
 }
 namespace PED
@@ -201,6 +208,10 @@ static void Reset()
     objectVisible = textureAvailable = playerAvailable = true;
     textureAvailableAtMs = 0;
     binds = cacheRequests = flipWrites = visibilityWrites = waitCalls = 0;
+    photoTestBindAttempts = photoTestBindingTransitions = 0;
+    publishedName = "test_portrait";
+    expectedTexture = 123;
+    bindingTimes.clear();
     lastPhotoStage = "none";
     probeOpenSucceeds = true;
     probeTaskRunning = false;
@@ -213,7 +224,7 @@ static void TestHandoffToInspection()
 {
     Reset();
     Cd.inHand = true;
-    ApplyCardCustomTexture();
+    RefreshCardTextureAfterTransition();
     Check(binds == 1 && objectTextured && Cd.customApplied, "handoff card receives its first binding");
 
     Cd.inHand = false;
@@ -226,26 +237,92 @@ static void TestHandoffToInspection()
     ++nowMs;
     objectTextured = false; // A later startup frame resets it again.
     MaintainPortraitAndCard();
+    Check(!objectTextured && binds == 2, "early startup polls wait for the scheduled retry");
+    nowMs += 98;
+    MaintainPortraitAndCard();
+    Check(!objectTextured && binds == 2, "retry is not issued before its scheduled time");
+    ++nowMs;
+    MaintainPortraitAndCard();
     Check(objectTextured && binds == 3,
         "same-handle native reset is repaired during startup maintenance");
-    Check(cacheRequests == 1 && flipWrites == 0,
+    Check(cacheRequests == 3 && flipWrites == 0,
         "startup maintains the portrait without requiring examining or inHand");
 
-    nowMs = Cd.textureRefreshUntilMs - 1;
+    nowMs = Cd.textureRefreshStartedMs + Card::kTextureSettleMs;
     objectTextured = false;
     MaintainPortraitAndCard();
-    Check(objectTextured && binds == 4, "delayed reset is repaired until the settling deadline");
-    nowMs = Cd.textureRefreshUntilMs;
+    Check(objectTextured && binds == 4, "final scheduled retry repairs a reset at the settling deadline");
     MaintainPortraitAndCard();
-    Check(binds == 4, "binding stops exactly at the settling deadline");
+    Check(binds == 4, "repeated callers at the deadline cannot issue duplicate binds");
     nowMs += 10000;
     MaintainPortraitAndCard();
     Check(binds == 4, "settled frames do not repeatedly bind the texture");
 
     objectTextured = false;
     RefreshCardTextureAfterTransition();
-    Check(objectTextured && binds == 5 && Cd.textureRefreshUntilMs > nowMs,
+    Check(objectTextured && binds == 5 && Cd.textureRefreshStartedMs == nowMs,
         "a later transition invalidates the previous successful attempt");
+    Check(photoTestBindingTransitions == 3 && photoTestBindAttempts == binds,
+        "diagnostics count transition restarts separately from actual native binds");
+}
+
+static void TestScheduleAcrossFrameRates()
+{
+    const unsigned frameDurations[] = { 1, 10, 17, 100, 250, 1000 };
+    for (unsigned frameMs : frameDurations)
+    {
+        Reset();
+        const ULONGLONG started = nowMs;
+        RefreshCardTextureAfterTransition();
+        for (unsigned elapsed = 0; elapsed <= 3000; elapsed += frameMs)
+        {
+            nowMs = started + elapsed;
+            const unsigned before = binds;
+            MaintainPortraitAndCard();
+            const unsigned after = binds;
+            ApplyCardCustomTexture();
+            MaintainPortraitAndCard();
+            Check(after - before <= 1 && binds == after,
+                "multiple maintenance and draw callers share one attempt per scheduled frame");
+        }
+        Check(binds <= 5 && photoTestBindingTransitions == 1,
+            "a transition never exceeds five binds regardless of polling frequency");
+        Check(binds == (frameMs == 1000 ? 3u : 5u),
+            "normal frames reach every retry while slow frames skip missed times");
+        if (frameMs == 10)
+        {
+            const std::vector<ULONGLONG> expected = { started, started + 100, started + 300,
+                started + 750, started + 1500 };
+            Check(bindingTimes == expected, "binding follows the requested five retry times exactly");
+        }
+    }
+}
+
+static void TestLateFrameAndFlipTransition()
+{
+    Reset();
+    RefreshCardTextureAfterTransition();
+    nowMs += 900;
+    objectTextured = false;
+    MaintainPortraitAndCard();
+    Check(binds == 2 && objectTextured, "a late frame repairs once instead of replaying three missed retries");
+    for (unsigned i = 0; i < 10; ++i) ApplyCardCustomTexture();
+    Check(binds == 2, "missed retries cannot burst across callers in the same late frame");
+    nowMs += 800; // Jump over the final deadline as well.
+    objectTextured = false;
+    MaintainPortraitAndCard();
+    Check(binds == 3 && objectTextured, "a frame past the deadline still performs the final due retry");
+    nowMs += 5000;
+    MaintainPortraitAndCard();
+    Check(binds == 3, "an exhausted schedule stays silent on later frames");
+
+    Cd.examining = true;
+    objectTextured = false; // The flip animation resets the same material.
+    RefreshCardTextureAfterTransition();
+    Check(binds == 4 && objectTextured && photoTestBindingTransitions == 2,
+        "a flip transition starts a fresh schedule on the already inspected object");
+    ApplyCardCustomTexture();
+    Check(binds == 4, "the draw following a flip shares its immediate transition attempt");
 }
 
 static void TestDelayedReadiness()
@@ -257,16 +334,19 @@ static void TestDelayedReadiness()
     MaintainPortraitAndCard();
     Check(binds == 0 && !Cd.customApplied && cacheRequests == 1 && !objectVisible,
         "unready portrait stays requested while its owned card is hidden");
-    nowMs = Cd.textureRefreshUntilMs + 1;
+    nowMs = Cd.textureRefreshStartedMs + Card::kTextureSettleMs + 1;
     textureAvailable = true;
     MaintainPortraitAndCard();
     Check(binds == 1 && objectTextured && objectVisible && C.photoTextureValid,
         "recovered portrait is bound and shown even after the old settling window expired");
-    Check(Cd.textureRefreshUntilMs == nowMs + Card::kTextureSettleMs,
-        "residency recovery starts a fresh bounded settling window");
-    nowMs = Cd.textureRefreshUntilMs;
+    Check(Cd.textureRefreshStartedMs == nowMs && photoTestBindingTransitions == 2,
+        "residency recovery starts a fresh shared retry schedule");
+    nowMs += Card::kTextureSettleMs;
     MaintainPortraitAndCard();
-    Check(binds == 1, "recovery settling expires without an unbounded retry loop");
+    Check(binds == 2, "recovery performs a final retry when a frame jumps to its deadline");
+    nowMs += 10000;
+    MaintainPortraitAndCard();
+    Check(binds == 2, "recovery settling expires without an unbounded retry loop");
 
     Reset();
     C.photoTexture[0] = '\0';
@@ -280,7 +360,7 @@ static void TestResidencyLossAfterSuccessfulBinding()
 {
     Reset();
     RefreshCardTextureAfterTransition();
-    nowMs = Cd.textureRefreshUntilMs + 1;
+    nowMs = Cd.textureRefreshStartedMs + Card::kTextureSettleMs + 1;
     textureAvailable = objectTextured = false;
     MaintainPortraitAndCard();
     Check(!C.photoTextureValid && !objectVisible && binds == 1 && cacheRequests == 1,
@@ -299,6 +379,29 @@ static void TestResidencyLossAfterSuccessfulBinding()
     MaintainPortraitAndCard();
     Check(visibilityWrites == previousVisibilityWrites && objectVisible,
         "residency loss never hides a foreign game-owned prop");
+}
+
+static void TestChangedAcceptedName()
+{
+    Reset();
+    RefreshCardTextureAfterTransition();
+    nowMs += 2000;
+    MaintainPortraitAndCard(); // Exhaust the previous portrait's schedule.
+    Check(binds == 2, "old accepted portrait has finished its bounded retries");
+    publishedName = "replacement_portrait";
+    expectedTexture = 456;
+    objectTextured = false;
+    MaintainPortraitAndCard();
+    Check(std::strcmp(C.photoTexture, publishedName) == 0 && objectTextured && binds == 3 &&
+        photoTestBindingTransitions == 2,
+        "a changed accepted name replaces the material and restarts the shared schedule");
+    MaintainPortraitAndCard();
+    Check(binds == 3 && photoTestBindingTransitions == 2,
+        "a stable accepted replacement neither restarts nor duplicates the new schedule");
+    nowMs += 100;
+    objectTextured = false;
+    MaintainPortraitAndCard();
+    Check(objectTextured && binds == 4, "the replacement portrait retains delayed-reset recovery");
 }
 
 static void TestReadinessGate()
@@ -344,7 +447,7 @@ static void TestMissingObjectsAndInspector()
     RefreshCardTextureAfterTransition();
     Check(binds == 1, "a new live card transition can bind after a missing object");
     objectAlive = false;
-    ++nowMs;
+    nowMs += 100; // A retry is due, but its original object has disappeared.
     MaintainPortraitAndCard();
     Check(binds == 1, "deletion during settling does not bind a stale handle");
 
@@ -424,10 +527,14 @@ static void TestInspectionProbeStopping()
 
 int main()
 {
-    Check(Card::kTextureSettleMs > 0, "production settling interval is positive");
+    Check(Card::kTextureSettleMs == 1500 && Card::kTextureBindCount == 5,
+        "production binding policy keeps the requested five attempts through 1500 milliseconds");
     TestHandoffToInspection();
+    TestScheduleAcrossFrameRates();
+    TestLateFrameAndFlipTransition();
     TestDelayedReadiness();
     TestResidencyLossAfterSuccessfulBinding();
+    TestChangedAcceptedName();
     TestReadinessGate();
     TestMissingObjectsAndInspector();
     TestInspectionProbeRetirement();

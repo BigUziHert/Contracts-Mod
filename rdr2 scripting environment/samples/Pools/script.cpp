@@ -83,6 +83,13 @@ struct ActiveContract
 	bool        photoBusyBefore = false, photoBusyAfterCleanup = false, photoBusyAtRequest = false;
 	bool        photoCommitBefore = false;
 	unsigned    photoRequestAttempts = 0;
+	ULONGLONG   photoTimingStartedMs = 0, photoTotalMs = 0, photoReleaseMs = 0;
+	ULONGLONG   photoAssetsMs = 0, photoIdleMs = 0, photoPreviousCleanupMs = 0, photoGenerateMs = 0;
+	ULONGLONG   photoWriteMs = 0, photoWriteCallMaxMs = 0, photoUploadMs = 0, photoCleanupMs = 0;
+	ULONGLONG   photoReadbackMs = 0, photoRequestCallMaxMs = 0;
+	int         photoCardRenderId = 0;
+	char        photoCardRenderName[64] = "";
+	unsigned    photoCardFaceDraws = 0, photoCardPanelDraws = 0;
 	bool        cardOpenPending = false;
 
 	// hand-in
@@ -106,7 +113,8 @@ struct CardRuntime
 	const char* ownedRenderTarget = nullptr;
 	Ped         inspectingPed = 0;
 	bool        customApplied = false;
-	ULONGLONG   textureRefreshUntilMs = 0; // retry while the inspection material is being initialized
+	ULONGLONG   textureRefreshStartedMs = 0;
+	unsigned    textureBindIndex = 0; // next bounded retry while the native task initializes its material
 	Hash        textureItemState = 0;
 };
 
@@ -178,6 +186,14 @@ static bool CanStartInteraction()
 
 // Failure-only local diagnostics. Keep gameplay free of the old debug overlay, while preserving
 // the actual failing stage instead of calling every startup error "no contracts available".
+static void WritePhotoTiming(FILE* file, const char* phase)
+{
+	fprintf(file, "photo-timing-v1 phase=%s totalMs=%llu releaseMs=%llu assetsMs=%llu idleMs=%llu previousCleanupMs=%llu generateCallMs=%llu writeWaitMs=%llu writeCallMaxMs=%llu uploadWaitMs=%llu cleanupCallMs=%llu readbackMs=%llu requestCallMaxMs=%llu\n",
+		phase, C.photoTotalMs, C.photoReleaseMs, C.photoAssetsMs, C.photoIdleMs,
+		C.photoPreviousCleanupMs, C.photoGenerateMs, C.photoWriteMs, C.photoWriteCallMaxMs,
+		C.photoUploadMs, C.photoCleanupMs, C.photoReadbackMs, C.photoRequestCallMaxMs);
+}
+
 static void LogContractStartFailure(Hash model, int attempt)
 {
 	HMODULE module = nullptr;
@@ -201,6 +217,7 @@ static void LogContractStartFailure(Hash model, int attempt)
 		C.photoGenOk ? 1 : 0, C.photoWritten ? 1 : 0, C.photoWriteComplete ? 1 : 0,
 		C.photoCommitReady ? 1 : 0, C.photoCommitBefore ? 1 : 0, C.photoBusyBefore ? 1 : 0,
 		C.photoBusyAfterCleanup ? 1 : 0, C.photoBusyAtRequest ? 1 : 0, C.photoRequestAttempts);
+	if (lastStartFailure == ContractStartFailure::PortraitFailed) WritePhotoTiming(file, lastPhotoStage);
 	fclose(file);
 }
 
@@ -469,8 +486,7 @@ static void MaintainPortraitAndCard()
 		if (C.photoTextureValid && (!wasValid || strcmp(C.photoTexture, name) != 0))
 		{
 			strcpy_s(C.photoTexture, name);
-			Cd.customApplied = false;
-			Cd.textureRefreshUntilMs = RuntimeNowMs() + Card::kTextureSettleMs;
+			RefreshCardTextureAfterTransition();
 		}
 	}
 	if (Cd.obj && Cd.ownsObj && ENTITY::DOES_ENTITY_EXIST(Cd.obj))
@@ -497,7 +513,10 @@ static bool LookupPhotoTexture(int cacheType, char (&out)[64])
 		C.photoLookupName[0] = '\0';
 		C.photoBusyAtRequest = GRAPHICS::PEDSHOT_IS_AVAILABLE() != 0;
 		++C.photoRequestAttempts;
+		ULONGLONG requestedAt = GetTickCount64();
 		C.photoDownload = NETWORK::_LOCAL_PLAYER_PEDSHOT_TEXTURE_DOWNLOAD_REQUEST(Card::kPhotoSlot, cacheType);
+		ULONGLONG requestMs = GetTickCount64() - requestedAt;
+		if (requestMs > C.photoRequestCallMaxMs) C.photoRequestCallMaxMs = requestMs;
 		if (C.photoDownload <= 0) return false;
 	}
 	C.photoDownloadStatus = NETWORK::GET_STATUS_OF_TEXTURE_DOWNLOAD(C.photoDownload);
@@ -522,8 +541,10 @@ static bool LookupPhotoTexture(int cacheType, char (&out)[64])
 static void FinishPhotoCapture()
 {
 	if (!C.photoTaken) return;
+	ULONGLONG cleanupAt = GetTickCount64();
 	GRAPHICS::_PEDSHOT_INIT_CLEANUP_DATA();
 	GRAPHICS::_PEDSHOT_FINISH_CLEANUP_DATA();
+	C.photoCleanupMs = GetTickCount64() - cleanupAt;
 	C.photoTaken = false;
 	C.photoBusyAfterCleanup = GRAPHICS::PEDSHOT_IS_AVAILABLE() != 0;
 }
@@ -531,6 +552,7 @@ static void FinishPhotoCapture()
 static bool FinishPhotoAttempt(bool success)
 {
 	FinishPhotoCapture();
+	C.photoTotalMs = GetTickCount64() - C.photoTimingStartedMs;
 	return success;
 }
 
@@ -539,7 +561,14 @@ static bool PhotographPed(Ped subject)
 {
 	// Includes a pending/failed previous attempt, not only a previously accepted portrait.
 	// The type-2 cache consumer must be released before its slot is overwritten.
+	ULONGLONG started = GetTickCount64();
 	ReleaseTargetPhoto();
+	C.photoTimingStartedMs = started;
+	C.photoTotalMs = 0;
+	C.photoReleaseMs = GetTickCount64() - started;
+	C.photoAssetsMs = C.photoIdleMs = C.photoPreviousCleanupMs = C.photoGenerateMs = 0;
+	C.photoWriteMs = C.photoWriteCallMaxMs = C.photoUploadMs = C.photoCleanupMs = 0;
+	C.photoReadbackMs = C.photoRequestCallMaxMs = 0;
 	lastPhotoStage = "subject";
 	const int ct = Card::kPhotoCacheType;
 	C.photoCacheType = ct;
@@ -552,49 +581,65 @@ static bool PhotographPed(Ped subject)
 	C.photoCommitBefore = NETWORK::_0xCC4E72C339461ED1() != 0;
 	C.photoRequestAttempts = 0;
 	C.photoTexture[0] = '\0';
-	Cd.customApplied = false;
+	RefreshCardTextureAfterTransition();
 	if (!ENTITY::DOES_ENTITY_EXIST(subject)) return FinishPhotoAttempt(false);
 
 	ENTITY::SET_ENTITY_VISIBLE(subject, !Tune::kPedshotHidden);
 	const char* photoName = PED::IS_PED_MALE(subject) ? Card::kPhotoName : Card::kPhotoFemaleName;
 	lastPhotoStage = "ped_assets";
+	ULONGLONG stageAt = GetTickCount64();
 	C.photoPedWasReady = WaitUntil(Tune::kPedshotReadyMs, [&]
 	{
 		PED::FORCE_PED_MOTION_STATE(subject, joaat("MotionState_DoNothing"), false, 0, false);
 		return PED::IS_PED_READY_TO_RENDER(subject) != 0;
 	});
+	C.photoAssetsMs = GetTickCount64() - stageAt;
 	if (!C.photoPedWasReady) return FinishPhotoAttempt(false);
 
 	// PEDSHOT_IS_AVAILABLE is counterintuitive: the MP producer defers while it is true.
 	// Check after streaming the subject, before taking ownership or clearing any shared data.
 	lastPhotoStage = "capture_busy";
-	if (!WaitUntil(Card::kPhotoUploadMs, [&]
+	stageAt = GetTickCount64();
+	bool idle = WaitUntil(Card::kPhotoUploadMs, [&]
 	{
 		PED::FORCE_PED_MOTION_STATE(subject, joaat("MotionState_DoNothing"), false, 0, false);
 		bool busy = GRAPHICS::PEDSHOT_IS_AVAILABLE() != 0;
 		C.photoUploadPending = NETWORK::_NETWORK_IS_PREVIOUS_UPLOAD_PENDING() != 0;
 		return !busy && !C.photoUploadPending;
-	})) return FinishPhotoAttempt(false);
+	});
+	C.photoIdleMs = GetTickCount64() - stageAt;
+	if (!idle) return FinishPhotoAttempt(false);
 	C.photoTaken = true;
+	stageAt = GetTickCount64();
 	GRAPHICS::_PEDSHOT_PREVIOUS_PERSONA_PHOTO_DATA_CLEANUP();
+	C.photoPreviousCleanupMs = GetTickCount64() - stageAt;
 	GRAPHICS::_PEDSHOT_SET_PERSONA_PHOTO_TYPE(Card::kPhotoType);
 	lastPhotoStage = "generate";
+	stageAt = GetTickCount64();
 	C.photoGenOk = GRAPHICS::_PEDSHOT_GENERATE_PERSONA_PHOTO(photoName, subject, 0) != 0;
+	C.photoGenerateMs = GetTickCount64() - stageAt;
 	PED::FORCE_PED_MOTION_STATE(subject, joaat("MotionState_DoNothing"), false, 0, false);
 	if (!C.photoGenOk) return FinishPhotoAttempt(false);
 	WAIT(0);
 
 	lastPhotoStage = "write";
+	stageAt = GetTickCount64();
 	C.photoWritten = WaitUntil(Card::kPhotoWriteMs, [&]
 	{
 		PED::FORCE_PED_MOTION_STATE(subject, joaat("MotionState_DoNothing"), false, 0, false);
 		C.photoUploadPending = NETWORK::_NETWORK_IS_PREVIOUS_UPLOAD_PENDING() != 0;
-		return NETWORK::_NETWORK_PERSONA_PHOTO_WRITE_LOCAL(photoName, Card::kPhotoSlot, 1, ct) != 0;
+		ULONGLONG writeAt = GetTickCount64();
+		bool written = NETWORK::_NETWORK_PERSONA_PHOTO_WRITE_LOCAL(photoName, Card::kPhotoSlot, 1, ct) != 0;
+		ULONGLONG writeMs = GetTickCount64() - writeAt;
+		if (writeMs > C.photoWriteCallMaxMs) C.photoWriteCallMaxMs = writeMs;
+		return written;
 	});
+	C.photoWriteMs = GetTickCount64() - stageAt;
 	if (!C.photoWritten) return FinishPhotoAttempt(false);
 
 	WAIT(0);
 	lastPhotoStage = "upload";
+	stageAt = GetTickCount64();
 	C.photoWriteComplete = WaitUntil(Card::kPhotoUploadMs, [&]
 	{
 		PED::FORCE_PED_MOTION_STATE(subject, joaat("MotionState_DoNothing"), false, 0, false);
@@ -602,6 +647,7 @@ static bool PhotographPed(Ped subject)
 		C.photoCommitReady = NETWORK::_0xCC4E72C339461ED1() != 0;
 		return !C.photoUploadPending; // CC4 is diagnostic only for the type-2 MP producer
 	});
+	C.photoUploadMs = GetTickCount64() - stageAt;
 	if (!C.photoWriteComplete) return FinishPhotoAttempt(false);
 	WAIT(0); // MP case 2 -> case 3: cleanup follows completion on another frame
 	FinishPhotoCapture();
@@ -609,10 +655,12 @@ static bool PhotographPed(Ped subject)
 
 	char name[64] = "";
 	lastPhotoStage = "texture_download";
-	if (!WaitUntil(Card::kPhotoNameMs, [&] { return LookupPhotoTexture(ct, name); }))
-		return FinishPhotoAttempt(false);
+	stageAt = GetTickCount64();
+	bool downloaded = WaitUntil(Card::kPhotoNameMs, [&] { return LookupPhotoTexture(ct, name); });
+	C.photoReadbackMs = GetTickCount64() - stageAt;
+	if (!downloaded) return FinishPhotoAttempt(false);
 	strcpy_s(C.photoTexture, name);
-	Cd.customApplied = false;   // re-apply the (new) texture to any card that is out
+	RefreshCardTextureAfterTransition(); // re-apply the new portrait to any card that is out
 	lastPhotoStage = "none";
 	return FinishPhotoAttempt(true);
 }
@@ -642,6 +690,7 @@ static bool EnsureTargetPhotoReady()
 // In particular, probe A never generates or writes: it tests whether a released
 // consumer can reopen the SAME published photo after card use, before another write.
 static unsigned photoTestBindAttempts = 0;
+static unsigned photoTestBindingTransitions = 0;
 static bool ProbePhotoCard(ULONGLONG started, unsigned captures);
 static void LogPhotoCacheTest(const char* phase, bool success, ULONGLONG started,
 	unsigned captures, const char* previousName, const char* observedName,
@@ -662,7 +711,7 @@ static void LogPhotoCacheTest(const char* phase, bool success, ULONGLONG started
 	bool previousValid = previousName[0] && NETWORK::_TEXTURE_DOWNLOAD_TEXTURE_NAME_IS_VALID(previousName);
 	bool itemRunning = LivingPed(pedMe) && TASK::IS_PED_RUNNING_TASK_ITEM_INTERACTION(pedMe);
 	Hash itemState = itemRunning ? TASK::GET_ITEM_INTERACTION_STATE(pedMe) : 0;
-	fprintf(file, "%04u-%02u-%02uT%02u:%02u:%02uZ photo-test-v2 phase=%s ok=%d elapsedMs=%llu captures=%u slot=%d cache=%d stage=%s download=%d status=%d requests=%u name=\"%s\" previous=\"%s\" previousValid=%d nameValid=%d ready=%d generated=%d written=%d writeComplete=%d busyBefore=%d busyAfter=%d busyRequest=%d freePeds=%d card=%d cardOwned=%d cardExists=%d binds=%u itemRunning=%d itemState=%08X\n",
+	fprintf(file, "%04u-%02u-%02uT%02u:%02u:%02uZ photo-test-v3 phase=%s ok=%d elapsedMs=%llu captures=%u slot=%d cache=%d stage=%s download=%d status=%d requests=%u name=\"%s\" previous=\"%s\" previousValid=%d nameValid=%d ready=%d generated=%d written=%d writeComplete=%d busyBefore=%d busyAfter=%d busyRequest=%d freePeds=%d card=%d cardOwned=%d cardExists=%d binds=%u bindingResets=%u itemRunning=%d itemState=%08X renderId=%d renderName=\"%s\" faceDraws=%u panelDraws=%u\n",
 		time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond,
 		phase, success ? 1 : 0, GetTickCount64() - started, captures, Card::kPhotoSlot, Card::kPhotoCacheType,
 		lastPhotoStage, C.photoDownload, C.photoDownloadStatus, C.photoRequestAttempts, observedName,
@@ -670,7 +719,9 @@ static void LogPhotoCacheTest(const char* phase, bool success, ULONGLONG started
 		C.photoWritten ? 1 : 0, C.photoWriteComplete ? 1 : 0, C.photoBusyBefore ? 1 : 0,
 		C.photoBusyAfterCleanup ? 1 : 0, C.photoBusyAtRequest ? 1 : 0, PED::_GET_NUM_FREE_SLOTS_IN_PED_POOL(),
 		observedCard, cardOwned ? 1 : 0, observedCard && ENTITY::DOES_ENTITY_EXIST(observedCard) ? 1 : 0,
-		photoTestBindAttempts, itemRunning ? 1 : 0, itemState);
+		photoTestBindAttempts, photoTestBindingTransitions, itemRunning ? 1 : 0, itemState,
+		C.photoCardRenderId, C.photoCardRenderName, C.photoCardFaceDraws, C.photoCardPanelDraws);
+	if (strcmp(phase, "initial") == 0 || strcmp(phase, "B_second_capture") == 0) WritePhotoTiming(file, phase);
 	fclose(file);
 }
 
@@ -708,6 +759,7 @@ static bool RunPhotoCacheSelfTest(Ped subject)
 	ULONGLONG started = GetTickCount64();
 	unsigned captures = 0;
 	photoTestBindAttempts = 0;
+	photoTestBindingTransitions = 0;
 	char previousName[64] = "";
 	char name[64] = "";
 	LogPhotoCacheTest("begin", true, started, captures, previousName, name);
@@ -1002,6 +1054,11 @@ static bool AttachCardToHand(Ped holder)
 static void DrawCardFace(bool corpse)
 {
 	if (!Cd.renderId || !TargetPhotoReady()) return;
+#ifdef BOUNTY_PHOTO_SELF_TEST
+	C.photoCardRenderId = Cd.renderId;
+	strcpy_s(C.photoCardRenderName, Cd.ownedRenderTarget ? Cd.ownedRenderTarget : "");
+	++C.photoCardFaceDraws;
+#endif
 	HUD::SET_TEXT_RENDER_ID(Cd.renderId);
 	HUD::_0x9D37EB5003E0F2CF(Cd.renderId, 1);
 	GRAPHICS::DRAW_RECT(0.5f, 0.5f, 2.0f, 2.0f, 0, 0, 0, 255, false, true);
@@ -1011,23 +1068,38 @@ static void DrawCardFace(bool corpse)
 }
 
 // Object-level custom texture used by R* for documents. A new item task may initialize the material
-// again on the same object. Retry for a bounded settling interval;
+// again on the same object. Retry on a short schedule shared by every caller;
 // this native returns void, so customApplied records an attempt, not an engine acknowledgment.
 static void ApplyCardCustomTexture()
 {
 	if (!Card::kCardCustomTexture || !Cd.obj || !ENTITY::DOES_ENTITY_EXIST(Cd.obj) || !TargetPhotoReady()) return;
-	if (Cd.customApplied && RuntimeNowMs() >= Cd.textureRefreshUntilMs) return;
+	ULONGLONG now = RuntimeNowMs();
+	if (!Cd.customApplied)
+	{
+		Cd.textureRefreshStartedMs = now;
+		Cd.textureBindIndex = 0;
+	}
+	ULONGLONG elapsed = now - Cd.textureRefreshStartedMs;
+	if (Cd.textureBindIndex >= Card::kTextureBindCount || elapsed < Card::kTextureBindDelaysMs[Cd.textureBindIndex]) return;
 	OBJECT::SET_CUSTOM_TEXTURES_ON_OBJECT(Cd.obj, joaat(C.photoTexture), 0, 0);
 #ifdef BOUNTY_PHOTO_SELF_TEST
 	++photoTestBindAttempts;
 #endif
 	Cd.customApplied = true;
+	// A slow frame makes one attempt and consumes missed retry times, rather than
+	// replaying them on this frame. The last attempt remains due at/after 1500 ms.
+	do { ++Cd.textureBindIndex; }
+	while (Cd.textureBindIndex < Card::kTextureBindCount && Card::kTextureBindDelaysMs[Cd.textureBindIndex] <= elapsed);
 }
 
 static void RefreshCardTextureAfterTransition()
 {
 	Cd.customApplied = false;
-	Cd.textureRefreshUntilMs = RuntimeNowMs() + Card::kTextureSettleMs;
+	Cd.textureRefreshStartedMs = RuntimeNowMs();
+	Cd.textureBindIndex = 0;
+#ifdef BOUNTY_PHOTO_SELF_TEST
+	++photoTestBindingTransitions;
+#endif
 	ApplyCardCustomTexture();
 }
 
@@ -1037,7 +1109,12 @@ static void DrawCardBackPanel()
 	if (!C.def) return;
 	GRAPHICS::DRAW_RECT(0.50f, 0.50f, 0.40f, 0.34f, 18, 14, 11, 225, false, false);
 	if (TargetPhotoReady())
+	{
+#ifdef BOUNTY_PHOTO_SELF_TEST
+		++C.photoCardPanelDraws;
+#endif
 		GRAPHICS::DRAW_SPRITE(C.photoTexture, C.photoTexture, 0.395f, 0.50f, 0.15f, 0.27f, 0.0f, 255, 255, 255, 255, false);
+	}
 
 	char lo[16], hi[16], reward[48];
 	FormatMoney(lo, sizeof lo, Tune::kPayoutMinCents);

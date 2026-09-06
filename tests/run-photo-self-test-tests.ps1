@@ -33,7 +33,8 @@ foreach ($bountyPattern in @(
     '(?m)^enum class ContractStartFailure[^\r\n]+;',
     '(?m)^static ContractStartFailure lastStartFailure[^\r\n]+;',
     '(?m)^static const char\* lastPhotoStage[^\r\n]+;',
-    '(?m)^static unsigned photoTestBindAttempts[^\r\n]+;'
+    '(?m)^static unsigned photoTestBindAttempts[^\r\n]+;',
+    '(?m)^static unsigned photoTestBindingTransitions[^\r\n]+;'
 )) {
     $bountyMatches = [regex]::Matches($bountySource, $bountyPattern)
     if ($bountyMatches.Count -ne 1) { throw "Expected exactly one production declaration: $bountyPattern" }

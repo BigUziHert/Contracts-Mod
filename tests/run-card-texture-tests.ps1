@@ -15,8 +15,8 @@ New-Item -ItemType Directory -Path $bountyOutput -Force | Out-Null
 $bountySource = [IO.File]::ReadAllText($bountySourcePath)
 $bountyData = [IO.File]::ReadAllText($bountyDataPath)
 $bountyHeader = @('#pragma once', '// Generated from production source; do not edit.', 'namespace Card {')
-foreach ($bountyConstant in @('kCardCustomTexture', 'kTextureSettleMs', 'kPhotoNameMs')) {
-    $bountyMatches = [regex]::Matches($bountyData, ('constexpr\s+\w+\s+' + $bountyConstant + '\s*=[^;]+;'))
+foreach ($bountyConstant in @('kCardCustomTexture', 'kTextureSettleMs', 'kTextureBindCount', 'kTextureBindDelaysMs', 'kPhotoNameMs')) {
+    $bountyMatches = [regex]::Matches($bountyData, ('constexpr\s+\w+\s+' + $bountyConstant + '(?:\s*\[[^\]]*\])?\s*=[^;]+;'))
     if ($bountyMatches.Count -ne 1) { throw "Expected exactly one production constant: $bountyConstant" }
     $bountyHeader += $bountyMatches[0].Value
 }
@@ -45,19 +45,19 @@ foreach ($bountyPattern in @(
 $bountyExactHeader = $bountyHeader -join "`r`n"
 [IO.File]::WriteAllText((Join-Path $bountyOutput 'card_texture_under_test.h'), $bountyExactHeader)
 
-# A regression control changes only the settling guard back to one-shot behavior.
-# The same test must reject it at the simulated delayed native material reset.
-$bountySettlingGuard = 'if (Cd.customApplied && RuntimeNowMs() >= Cd.textureRefreshUntilMs) return;'
-if (-not $bountyExactHeader.Contains($bountySettlingGuard)) {
-    throw 'Production settling guard changed; update the one-shot regression control explicitly.'
+# Mutate behavior, not a particular timing expression: suppress every attempt after
+# the first bind in each transition. A later simulated native reset must expose it.
+$bountyApplyPattern = 'static void ApplyCardCustomTexture\(\)\s*\{'
+if ([regex]::Matches($bountyExactHeader, $bountyApplyPattern).Count -ne 1) {
+    throw 'Expected exactly one binding entry point for the one-shot regression control.'
 }
-$bountyOldHeader = $bountyExactHeader.Replace($bountySettlingGuard, 'if (Cd.customApplied) return;')
+$bountyOldHeader = [regex]::Replace($bountyExactHeader, $bountyApplyPattern, ('$0' + "`r`n    if (Cd.customApplied) return;"))
 [IO.File]::WriteAllText((Join-Path $bountyOutput 'card_texture_old_under_test.h'), $bountyOldHeader)
 
 $bountyCommands = @('@echo off', ('call "{0}" >nul' -f $bountyVcVars), 'if errorlevel 1 exit /b 1')
 foreach ($bountyVariant in @('card_texture_tests', 'card_texture_old_control')) {
     $bountyExtra = if ($bountyVariant -eq 'card_texture_old_control') { '/DCARD_TEXTURE_OLD_ONESHOT' } else { '' }
-    $bountyCommands += 'cl /nologo /std:c++20 /EHsc /W4 /WX /MT /Od {0} /I"{1}" /Fo"{2}" /Fe"{3}" "{4}"' -f `
+    $bountyCommands += 'cl /nologo /std:c++20 /EHsc /W4 /WX /MT /Od /DBOUNTY_PHOTO_SELF_TEST {0} /I"{1}" /Fo"{2}" /Fe"{3}" "{4}"' -f `
         $bountyExtra, $bountyOutput, (Join-Path $bountyOutput ($bountyVariant + '.obj')), `
         (Join-Path $bountyOutput ($bountyVariant + '.exe')), (Join-Path $PSScriptRoot 'card_texture_tests.cpp')
     $bountyCommands += 'if errorlevel 1 exit /b 1'
