@@ -35,3 +35,4 @@ if ($LASTEXITCODE -ne 0) { throw 'Regression tests failed.' }
 & (Join-Path $PSScriptRoot 'run-portrait-cache-tests.ps1') -VisualStudio $VisualStudio
 & (Join-Path $PSScriptRoot 'run-owned-ped-cleanup-tests.ps1') -VisualStudio $VisualStudio
 & (Join-Path $PSScriptRoot 'run-photo-self-test-tests.ps1') -VisualStudio $VisualStudio
+& (Join-Path $PSScriptRoot 'run-target-ai-bridge-tests.ps1') -VisualStudio $VisualStudio

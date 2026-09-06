@@ -1335,8 +1335,13 @@ static void SetupHumanTarget(Ped ped, const ContractDef& def)
 	PED::SET_PED_FLEE_ATTRIBUTES(ped, 1024, true);
 	PED::SET_PED_FLEE_ATTRIBUTES(ped, 512, true);
 	PED::SET_PED_FLEE_ATTRIBUTES(ped, 16384, true);
-	PED::SET_PED_FLEE_ATTRIBUTES(ped, 32768, false); // on = lets him cower / flee; off so he fights (rdr2mods forum)
+	// Flaco's armed men set this with AlwaysFight, then clear it before scripted fleeing
+	// (rcm_gunslinger2_1.c:28310-28312 and 33206-33211).
+	PED::SET_PED_FLEE_ATTRIBUTES(ped, 32768, true);
 
+	// Spawned archetypes can bring their own guns. Replace that inventory once so
+	// native combat cannot select an inherited weapon outside this target's loadout.
+	WEAPON::REMOVE_ALL_PED_WEAPONS(ped, true, true);
 	C.weapon = (rand() % 100) >= Tune::kArmedChancePct ? joaat("WEAPON_UNARMED")
 		: (rand() % 100) < Tune::kGunVsKnifePct ? WEAPON_REVOLVER_CATTLEMAN : WEAPON_MELEE_KNIFE;
 	bool melee = C.weapon != WEAPON_REVOLVER_CATTLEMAN;
@@ -1391,7 +1396,8 @@ static void UpdateHumanTarget(Ped ped, const ContractDef& def)
 	observation.nativeInCombat = PED::IS_PED_IN_COMBAT(ped, pedMe) != 0;
 	int taskStatus = TASK::GET_SCRIPT_TASK_STATUS(ped, joaat("SCRIPT_TASK_COMBAT"), true);
 	observation.combatTaskActive = observation.nativeInCombat || taskStatus == 0 || taskStatus == 1;
-	observation.canAct = !PED::IS_PED_RAGDOLL(ped) && !TASK::IS_PED_GETTING_UP(ped) && !PED::IS_PED_HOGTIED(ped) && !PED::IS_PED_LASSOED(ped);
+	observation.canAct = !PED::IS_PED_RAGDOLL(ped) && !TASK::IS_PED_GETTING_UP(ped) &&
+		!PED::IS_PED_HOGTIED(ped) && !PED::IS_PED_BEING_HOGTIED(ped) && !PED::IS_PED_LASSOED(ped);
 	TargetAI::Decision decision = TargetAI::Step(C.ai, config, observation);
 	if (decision.updateLastKnownPosition) C.lastKnownPlayerPos = playerPos;
 	switch (decision.action)
