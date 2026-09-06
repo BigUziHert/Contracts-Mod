@@ -95,18 +95,14 @@ static void SET_CUSTOM_TEXTURES_ON_OBJECT(Object object, Hash texture, int p2, i
     objectTextured = true;
 }
 }
-namespace NETWORK
+// Download ownership itself is exercised by portrait_cache_tests; this suite controls
+// readiness while exercising the actual production card-maintenance functions.
+static bool LookupPhotoTexture(int cacheType, char (&out)[64])
 {
-static void _REQUEST_PEDSHOT_TEXTURE_LOCAL_BACKUP_DOWNLOAD(int slot, int cacheType)
-{
-    Check(slot == Card::kPhotoSlot && cacheType == C.photoCacheType, "portrait cache ownership is preserved");
+    Check(cacheType == C.photoCacheType, "portrait cache ownership is preserved");
     ++cacheRequests;
-}
-static bool _TEXTURE_DOWNLOAD_TEXTURE_NAME_IS_VALID(const char* name)
-{
-    Check(std::strcmp(name, "test_portrait") == 0, "residency checks use the accepted portrait name");
+    strcpy_s(out, "test_portrait");
     return textureAvailable;
-}
 }
 namespace PED
 {

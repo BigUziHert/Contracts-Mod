@@ -48,6 +48,12 @@ static struct World
     unsigned maintenance = 0;
     unsigned failCreateAttempts = 0;
     bool failedCreateReturnsStaleHandle = false;
+    unsigned createVisibilityDelayFrames = 0;
+    unsigned spawnVisibleFrame = 0;
+    bool spawnedPending = false;
+    int freePedSlots = 10;
+    unsigned poolAvailableFrame = 0;
+    bool creationFillsPool = false;
     unsigned creates = 0;
     bool spawnedAlive = false;
     bool missionOwned = false;
@@ -115,6 +121,11 @@ namespace ENTITY
 {
 static bool DOES_ENTITY_EXIST(int entity)
 {
+    if (entity == kSpawnedPed && world.spawnedPending && world.frame >= world.spawnVisibleFrame)
+    {
+        world.spawnedPending = false;
+        world.spawnedAlive = true;
+    }
     return ((entity == kPlayer || entity == world.playerId) && world.playerAlive) ||
         (entity == kSpawnedPed && world.spawnedAlive);
 }
@@ -123,7 +134,7 @@ static void SET_ENTITY_AS_MISSION_ENTITY(Ped ped, bool scriptHostObject, bool gr
     Check(ped == kSpawnedPed && world.spawnedAlive && world.modelHeld,
         "only a live created ped is claimed with its model held");
     Check(scriptHostObject && grabFromOtherScript, "mission ownership flags are preserved");
-    Check(world.createFrames.back() == world.frame, "mission ownership is acquired in the creation frame");
+    Check(world.spawnVisibleFrame == world.frame, "mission ownership is acquired when the created ped first becomes observable");
     world.missionOwned = true;
     ++world.missionClaims;
 }
@@ -137,6 +148,10 @@ static void PLACE_ENTITY_ON_GROUND_PROPERLY(Ped ped, int flags)
 
 namespace PED
 {
+static int _GET_NUM_FREE_SLOTS_IN_PED_POOL()
+{
+    return world.frame < world.poolAvailableFrame ? 0 : world.freePedSlots;
+}
 static bool IS_PED_DEAD_OR_DYING(Ped ped, bool)
 {
     return ped == kPlayer && world.playerDying;
@@ -149,6 +164,8 @@ static Ped CREATE_PED(Hash model, const Vector3& pos, float heading, bool networ
     Check(pos.x == 1.0f && pos.y == 2.0f && pos.z == 3.0f && heading == 0.0f,
         "retries preserve the requested spawn transform");
     Check(!network && scriptHost && p7 && p8, "single-player creation flags remain unchanged");
+    Check(_GET_NUM_FREE_SLOTS_IN_PED_POOL() > 0, "creation never runs while the ped pool is full");
+    Check(!world.spawnedPending && !world.spawnedAlive, "a new creation never replaces an unresolved owned handle");
     Check(world.createFrames.empty() || world.createFrames.back() < world.frame,
         "failed creation attempts are separated by game frames");
     world.createFrames.push_back(world.frame);
@@ -156,7 +173,10 @@ static Ped CREATE_PED(Hash model, const Vector3& pos, float heading, bool networ
     ++world.creates;
     if (world.creates <= world.failCreateAttempts)
         return world.failedCreateReturnsStaleHandle ? 88 : 0;
-    world.spawnedAlive = true;
+    world.spawnVisibleFrame = world.frame + world.createVisibilityDelayFrames;
+    world.spawnedPending = world.createVisibilityDelayFrames != 0;
+    world.spawnedAlive = !world.spawnedPending;
+    if (world.creationFillsPool) world.freePedSlots = 0;
     if (world.changePlayerOnCreate) world.playerId = 99;
     return kSpawnedPed;
 }
@@ -170,6 +190,7 @@ static void DELETE_PED(Ped* ped)
 {
     Check(*ped == kSpawnedPed && world.spawnedAlive, "interrupted successful creation deletes its ped");
     world.spawnedAlive = false;
+    world.spawnedPending = false;
     ++world.deletes;
     *ped = 0;
 }
@@ -259,8 +280,11 @@ static void TestStaleHandleAndBoundedFailure()
     Reset();
     world.failCreateAttempts = 1;
     world.failedCreateReturnsStaleHandle = true;
-    Check(Spawn() == kSpawnedPed && world.creates == 2,
-        "a nonzero nonexistent handle is retried without outfit or placement calls");
+    const ULONGLONG pendingStarted = world.nowMs;
+    Check(Spawn() == 0 && world.creates == 1 && lastStartFailure == ContractStartFailure::PedCreationFailed,
+        "an unresolved nonzero handle is never overwritten by another creation");
+    Check(world.nowMs - pendingStarted >= Tune::kPedSpawnRetryMs && world.outfits == 0 && world.placements == 0,
+        "unresolved handle observation stays bounded without initializing an invalid entity");
     CheckReleased();
 
     Reset();
@@ -273,6 +297,47 @@ static void TestStaleHandleAndBoundedFailure()
         "creation retries stop within one frame of the configured deadline");
     Check(world.creates > 1 && world.outfits == 0 && world.placements == 0 && world.missionClaims == 0,
         "failed creation never initializes invalid handles");
+    CheckReleased();
+}
+
+static void TestPendingHandleAndPoolCapacity()
+{
+    Reset();
+    world.createVisibilityDelayFrames = 1;
+    world.creationFillsPool = true;
+    Check(Spawn() == kSpawnedPed && world.creates == 1 && world.frame == 1,
+        "a pending handle is accepted on the next frame without creating a second ped");
+    Check(world.missionClaims == 1 && world.freePedSlots == 0,
+        "a pending owned ped can finish initialization even when it consumed the last slot");
+    CheckReleased();
+
+    Reset();
+    world.poolAvailableFrame = 4;
+    Check(Spawn() == kSpawnedPed && world.creates == 1 && world.createFrames.front() >= 4,
+        "temporary pool exhaustion waits for capacity before its first creation");
+    Check(world.maintenance > 4 && lastStartFailure == ContractStartFailure::None,
+        "waiting for capacity maintains portrait work and preserves eventual success");
+    CheckReleased();
+
+    Reset();
+    world.freePedSlots = 0;
+    const ULONGLONG started = world.nowMs;
+    Check(Spawn() == 0 && lastStartFailure == ContractStartFailure::PedPoolFull && world.creates == 0,
+        "persistent pool exhaustion reports a distinct failure without creating peds");
+    Check(world.nowMs - started >= Tune::kPedSpawnRetryMs &&
+        world.nowMs - started <= Tune::kPedSpawnRetryMs + kFrameMs,
+        "pool capacity waiting uses the existing bounded retry deadline");
+    Check(world.deletes == 0 && world.missionClaims == 0,
+        "pool exhaustion never deletes or claims another script's peds");
+    CheckReleased();
+
+    Reset();
+    world.createVisibilityDelayFrames = 1;
+    world.playerChangeFrame = 1;
+    Check(Spawn() == 0 && lastStartFailure == ContractStartFailure::Interrupted && world.creates == 1,
+        "player cancellation preserves interruption after a pending creation");
+    Check(world.deletes == 1 && !world.spawnedAlive && world.missionClaims == 0,
+        "a pending handle that becomes live during cancellation is deleted before release");
     CheckReleased();
 }
 
@@ -371,9 +436,13 @@ int main()
 {
     Check(Tune::kPedSpawnRetryMs > Tune::kPedSpawnRetryDelayMs && Tune::kPedSpawnRetryDelayMs > 0,
         "production retry timing allows multiple delayed attempts");
+    Check(static_cast<int>(ContractStartFailure::PortraitFailed) == 5 &&
+        static_cast<int>(ContractStartFailure::PedPoolFull) == 6,
+        "pool exhaustion is appended without changing existing diagnostic codes");
     TestWaitPredicate();
     TestDelayedCreation();
     TestStaleHandleAndBoundedFailure();
+    TestPendingHandleAndPoolCapacity();
     TestModelFailures();
     TestPlayerInterruption();
     TestRemoteStart();

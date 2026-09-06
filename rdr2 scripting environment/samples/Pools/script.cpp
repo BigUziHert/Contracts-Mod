@@ -25,7 +25,7 @@
 
 // ===== [ STATE ] =====
 enum ContractState { CONTRACT_NONE, CONTRACT_UNKNOWN, CONTRACT_FOUND, CONTRACT_DEAD, CONTRACT_PAID };
-enum class ContractStartFailure { None, Interrupted, InvalidModel, ModelLoadTimeout, PedCreationFailed, PortraitFailed };
+enum class ContractStartFailure { None, Interrupted, InvalidModel, ModelLoadTimeout, PedCreationFailed, PortraitFailed, PedPoolFull };
 static ContractStartFailure lastStartFailure = ContractStartFailure::None;
 static const char* lastPhotoStage = "none";
 
@@ -56,6 +56,11 @@ struct ActiveContract
 	int         photoCacheType = -1;    // cache type used for both writing and requesting the portrait
 	bool        photoGenOk = false;
 	char        photoTexture[64] = "";  // texture name to draw ("" = none)
+	int         photoDownload = -1;     // owned local-cache download; positive handles require release
+	int         photoDownloadStatus = -1;
+	char        photoLookupName[64] = ""; // last returned name, including an invalid result for diagnostics
+	bool        photoLookupValid = false; // backup-loader validity probe; diagnostic, not handle readiness
+	ULONGLONG   photoNextRequestMs = 0;
 	bool        photoWritten = false;
 	bool        photoUploadPending = false, photoCommitReady = false, photoTextureValid = false;
 	bool        cardOpenPending = false;
@@ -168,10 +173,12 @@ static void LogContractStartFailure(Hash model, int attempt)
 	if (_wfopen_s(&file, path, L"a") != 0 || !file) return;
 	SYSTEMTIME time;
 	GetSystemTime(&time);
-	fprintf(file, "%04u-%02u-%02uT%02u:%02u:%02uZ start-v2 failure=%d photo=%s attempt=%d model=%08X player=%d current=%d alive=%d freePeds=%d\n",
+	fprintf(file, "%04u-%02u-%02uT%02u:%02u:%02uZ start-v3 failure=%d photo=%s attempt=%d model=%08X player=%d current=%d alive=%d freePeds=%d download=%d status=%d name=\"%s\" nameValid=%d ready=%d generated=%d written=%d committed=%d\n",
 		time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond,
 		static_cast<int>(lastStartFailure), lastPhotoStage, attempt, model, pedMe, PLAYER::PLAYER_PED_ID(),
-		LivingPed(pedMe) ? 1 : 0, PED::_GET_NUM_FREE_SLOTS_IN_PED_POOL());
+		LivingPed(pedMe) ? 1 : 0, PED::_GET_NUM_FREE_SLOTS_IN_PED_POOL(), C.photoDownload,
+		C.photoDownloadStatus, C.photoLookupName, C.photoLookupValid ? 1 : 0, C.photoTextureValid ? 1 : 0,
+		C.photoGenOk ? 1 : 0, C.photoWritten ? 1 : 0, C.photoCommitReady ? 1 : 0);
 	fclose(file);
 }
 
@@ -188,6 +195,7 @@ static void ReportContractStartFailure()
 	case ContractStartFailure::ModelLoadTimeout: DisplaySubtitle("TARGET MODEL COULD NOT LOAD. TRY AGAIN."); break;
 	case ContractStartFailure::PedCreationFailed: DisplaySubtitle("TARGET COULD NOT SPAWN. TRY AGAIN."); break;
 	case ContractStartFailure::PortraitFailed: DisplaySubtitle("TARGET PHOTO COULD NOT BE PREPARED. TRY AGAIN."); break;
+	case ContractStartFailure::PedPoolFull: DisplaySubtitle("NO ROOM FOR ANOTHER TARGET. TRY AGAIN AFTER LEAVING THE AREA."); break;
 	case ContractStartFailure::None: DisplaySubtitle("CONTRACT REQUEST FAILED. TRY AGAIN."); break;
 	}
 }
@@ -260,15 +268,21 @@ static Ped SpawnPed(Hash model, const Vector3& pos)
 	// A loaded model does not guarantee that the engine can create its ped this frame.
 	// Keep the model requested and let the game advance between failed creation attempts.
 	bool created = WaitUntil(Tune::kPedSpawnRetryMs, [&] {
+		// A nonzero handle may become observable on a later frame. Never overwrite it
+		// with another creation while this attempt still owns the pending handle.
+		if (ped) return ENTITY::DOES_ENTITY_EXIST(ped) != 0;
 		ULONGLONG now = GetTickCount64();
 		if (now < nextAttemptMs) return false;
 		nextAttemptMs = now + Tune::kPedSpawnRetryDelayMs;
+		if (PED::_GET_NUM_FREE_SLOTS_IN_PED_POOL() <= 0) return false;
 		ped = PED::CREATE_PED(model, pos, 0.0f, false, true, true, true);
 		return ped && ENTITY::DOES_ENTITY_EXIST(ped);
 	});
 	if (!created || !PlayerAvailable())
 	{
-		lastStartFailure = PlayerAvailable() ? ContractStartFailure::PedCreationFailed : ContractStartFailure::Interrupted;
+		lastStartFailure = !PlayerAvailable() ? ContractStartFailure::Interrupted
+			: PED::_GET_NUM_FREE_SLOTS_IN_PED_POOL() <= 0 ? ContractStartFailure::PedPoolFull
+			: ContractStartFailure::PedCreationFailed;
 		if (ped && ENTITY::DOES_ENTITY_EXIST(ped)) PED::DELETE_PED(&ped);
 		STREAMING::SET_MODEL_AS_NO_LONGER_NEEDED(model);
 		return 0;
@@ -311,21 +325,27 @@ static void AddCorpseBlip()
 // ===== [ TARGET PORTRAIT ] =====
 // SP reference: Halen84/RDR3-Decompiled-Scripts, 1491.50/short_update.c, func_490.
 // Type(1), A1(0), ready -> previous cleanup / generate / previous cleanup -> successful write ->
-// !uploadPending && CC4 -> capture cleanup -> valid backup texture. A1's meaning is undocumented;
+// !uploadPending && CC4 -> capture cleanup. A1's meaning is undocumented;
 // its fixed argument is deliberately independent of the network cache type. The hidden subject,
 // portrait texture, card face, and flipped information panel were verified together in-game.
 
-// short_update refreshes retained slots each frame, even without a card on screen. Also maintain the
-// card material and flip flag during yielding waits, which do not run UpdateCard().
+// Cache type 2 uses an owned download handle (R* persona_photos / map_app_event_handler),
+// released before rewriting the same slot. Do not mix that ownership with the SP backup loader.
+static bool LookupPhotoTexture(int cacheType, char (&out)[64]);
+static void ReleaseTargetPhoto();
+
+// Maintain the retained download, card material and flip flag during yielding waits,
+// which do not run UpdateCard().
 static void MaintainPortraitAndCard()
 {
 	if (C.photoTexture[0])
 	{
 		bool wasValid = C.photoTextureValid;
-		NETWORK::_REQUEST_PEDSHOT_TEXTURE_LOCAL_BACKUP_DOWNLOAD(Card::kPhotoSlot, C.photoCacheType);
-		C.photoTextureValid = NETWORK::_TEXTURE_DOWNLOAD_TEXTURE_NAME_IS_VALID(C.photoTexture) != 0;
-		if (C.photoTextureValid && !wasValid)
+		char name[64] = "";
+		C.photoTextureValid = LookupPhotoTexture(C.photoCacheType, name);
+		if (C.photoTextureValid && (!wasValid || strcmp(C.photoTexture, name) != 0))
 		{
+			strcpy_s(C.photoTexture, name);
 			Cd.customApplied = false;
 			Cd.textureRefreshUntilMs = RuntimeNowMs() + Card::kTextureSettleMs;
 		}
@@ -337,13 +357,40 @@ static void MaintainPortraitAndCard()
 		PED::_SET_PED_BLACKBOARD_BOOL(Cd.inspectingPed, Card::kFlipBlackboard, true, -1);
 }
 
-// Copy the borrowed name before invoking another native; a nonempty name alone is not ready.
+// Request once and retain the positive handle until cleanup. A failed download can be
+// released and requested again, but never allocate a new handle on every pending frame.
+// Readiness follows map_app_event_handler: status 0 and a nonempty name. The backup-loader
+// validity native is only a diagnostic here; its semantics for explicit handles are undocumented.
+// Copy the borrowed name before invoking another native.
 static bool LookupPhotoTexture(int cacheType, char (&out)[64])
 {
-	const char* n = NETWORK::_REQUEST_PEDSHOT_TEXTURE_LOCAL_BACKUP_DOWNLOAD(Card::kPhotoSlot, cacheType);
+	C.photoTextureValid = false;
+	C.photoLookupValid = false;
+	if (C.photoDownload <= 0)
+	{
+		if (GetTickCount64() < C.photoNextRequestMs) return false;
+		C.photoNextRequestMs = GetTickCount64() + Card::kPhotoRequestRetryMs;
+		C.photoDownloadStatus = -1;
+		C.photoLookupName[0] = '\0';
+		C.photoDownload = NETWORK::_LOCAL_PLAYER_PEDSHOT_TEXTURE_DOWNLOAD_REQUEST(Card::kPhotoSlot, cacheType);
+		if (C.photoDownload <= 0) return false;
+	}
+	C.photoDownloadStatus = NETWORK::GET_STATUS_OF_TEXTURE_DOWNLOAD(C.photoDownload);
+	if (C.photoDownloadStatus == 2)
+	{
+		NETWORK::TEXTURE_DOWNLOAD_RELEASE(C.photoDownload);
+		C.photoDownload = -1;
+		C.photoNextRequestMs = GetTickCount64() + Card::kPhotoRequestRetryMs;
+		return false;
+	}
+	if (C.photoDownloadStatus != 0) return false;
+	C.photoLookupName[0] = '\0';
+	const char* n = NETWORK::TEXTURE_DOWNLOAD_GET_NAME(C.photoDownload);
 	if (!n || !*n || strnlen_s(n, sizeof out) >= sizeof out) return false;
 	strcpy_s(out, n);
-	C.photoTextureValid = NETWORK::_TEXTURE_DOWNLOAD_TEXTURE_NAME_IS_VALID(out) != 0;
+	strcpy_s(C.photoLookupName, out);
+	C.photoLookupValid = NETWORK::_TEXTURE_DOWNLOAD_TEXTURE_NAME_IS_VALID(out) != 0;
+	C.photoTextureValid = true;
 	return C.photoTextureValid;
 }
 
@@ -364,6 +411,9 @@ static bool FinishPhotoAttempt(bool success)
 // Photographs `subject` (parked, frozen, in front of the player) into the local persona-photo cache.
 static bool PhotographPed(Ped subject)
 {
+	// Includes a pending/failed previous attempt, not only a previously accepted portrait.
+	// The type-2 cache consumer must be released before its slot is overwritten.
+	ReleaseTargetPhoto();
 	lastPhotoStage = "subject";
 	const int ct = Card::kPhotoCacheType;
 	C.photoCacheType = ct;
@@ -424,7 +474,7 @@ static bool PhotographPed(Ped subject)
 	FinishPhotoCapture();
 
 	char name[64] = "";
-	lastPhotoStage = "texture_name";
+	lastPhotoStage = "texture_download";
 	if (!WaitUntil(Card::kPhotoNameMs, [&] { return LookupPhotoTexture(ct, name); }))
 		return FinishPhotoAttempt(false);
 	strcpy_s(C.photoTexture, name);
@@ -435,8 +485,12 @@ static bool PhotographPed(Ped subject)
 
 static void ReleaseTargetPhoto()
 {
-	// short_update releases its retained slots by stopping requests. Do not run global capture cleanup
-	// for a completed photo, or apply the separate MP downloaded-mugshot release API to this cache.
+	if (C.photoDownload > 0) NETWORK::TEXTURE_DOWNLOAD_RELEASE(C.photoDownload);
+	C.photoDownload = -1;
+	C.photoDownloadStatus = -1;
+	C.photoNextRequestMs = 0;
+	C.photoLookupName[0] = '\0';
+	C.photoLookupValid = false;
 	C.photoTexture[0] = '\0';
 	C.photoTextureValid = false;
 	FinishPhotoCapture();
@@ -446,7 +500,7 @@ static bool TargetPhotoReady() { return C.photoTexture[0] && C.photoTextureValid
 static bool EnsureTargetPhotoReady()
 {
 	if (!C.photoTexture[0]) return false;
-	return WaitUntil(Card::kPhotoNameMs, TargetPhotoReady); // maintenance requests/revalidates the accepted slot
+	return WaitUntil(Card::kPhotoNameMs, TargetPhotoReady); // maintenance polls the owned download
 }
 
 // Spawns the target in front of the player first — hidden, frozen, no collision, exactly how the persona-
@@ -956,9 +1010,11 @@ static bool StartContract()
 		Ped ped = SpawnTargetWithPhoto(model, def);
 		if (!ped)
 		{
-			LogContractStartFailure(model, attempt + 1);
+			// Capture attempts log their own texture state before releasing it.
+			if (lastStartFailure != ContractStartFailure::PortraitFailed) LogContractStartFailure(model, attempt + 1);
 			// Capture already retried this subject. Do not multiply capture timeouts by rerolling models.
-			if (lastStartFailure == ContractStartFailure::Interrupted || lastStartFailure == ContractStartFailure::PortraitFailed) break;
+			if (lastStartFailure == ContractStartFailure::Interrupted || lastStartFailure == ContractStartFailure::PortraitFailed ||
+				lastStartFailure == ContractStartFailure::PedPoolFull) break;
 			if (attempt + 1 < Tune::kSpawnAttempts) WAIT(0);
 			continue;
 		}

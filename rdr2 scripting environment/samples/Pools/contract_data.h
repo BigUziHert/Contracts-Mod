@@ -323,7 +323,8 @@ namespace Card
 	constexpr float kPhotoPedOffsetY  = 2.0f;                       // the ped is parked this far IN FRONT of the player (in view, hidden) while the portrait is taken
 	constexpr DWORD kPhotoUploadMs    = 5000;                       // wait for a previous / current upload to finish
 	constexpr DWORD kPhotoWriteMs     = 8000;                       // poll _NETWORK_PERSONA_PHOTO_WRITE_LOCAL with fixed arguments
-	constexpr DWORD kPhotoNameMs      = 3000;                       // poll _REQUEST_PEDSHOT_TEXTURE_LOCAL_BACKUP_DOWNLOAD this long
+	constexpr DWORD kPhotoNameMs      = 3000;                       // wait for the owned local texture download
+	constexpr DWORD kPhotoRequestRetryMs = 250;                     // back off after an unavailable or failed download request
 	constexpr int kPhotoAttempts = 2;                              // retry one failed capture before declining to issue a broken card
 }
 // Hashes verified against femga's documented values.
