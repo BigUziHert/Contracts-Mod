@@ -34,7 +34,9 @@ foreach ($bountyPattern in @(
     '(?m)^static ContractStartFailure lastStartFailure[^\r\n]+;',
     '(?m)^static const char\* lastPhotoStage[^\r\n]+;',
     '(?m)^static unsigned photoTestBindAttempts[^\r\n]+;',
-    '(?m)^static unsigned photoTestBindingTransitions[^\r\n]+;'
+    '(?m)^static unsigned photoTestBindingTransitions[^\r\n]+;',
+    '(?m)^static bool photoTestPlainCard[^\r\n]+;',
+    '(?m)^static const char\* photoTestControl[^\r\n]+;'
 )) {
     $bountyMatches = [regex]::Matches($bountySource, $bountyPattern)
     if ($bountyMatches.Count -ne 1) { throw "Expected exactly one production declaration: $bountyPattern" }
@@ -44,7 +46,6 @@ $bountyHeader = @('#pragma once', '// Generated from production source; do not e
 foreach ($bountyPattern in @(
     '(?ms)^template<typename Pred> static bool WaitUntil\([^\r\n]+\)\s*\{.*?^\}',
     '(?ms)^static bool ProbeExistingPhoto\(char \(&name\)\[64\]\)\s*\{.*?^\}',
-    '(?ms)^static bool ProbeBackupPhoto\(char \(&name\)\[64\]\)\s*\{.*?^\}',
     '(?ms)^static bool RunPhotoCacheSelfTest\(Ped subject\)\s*\{.*?^\}'
 )) {
     $bountyMatches = [regex]::Matches($bountySource, $bountyPattern)

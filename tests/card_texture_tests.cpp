@@ -1,5 +1,6 @@
 // run-card-texture-tests.ps1 extracts the actual production functions into tmp/tests.
 #include <cstdint>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -11,6 +12,7 @@ using ULONGLONG = std::uint64_t;
 using Hash = std::uint32_t;
 using Object = int;
 using Ped = int;
+struct Vector3 { float x, y, z; };
 
 namespace Card
 {
@@ -54,19 +56,42 @@ static unsigned flipWrites = 0;
 static unsigned checks = 0;
 static unsigned photoTestBindAttempts = 0;
 static unsigned photoTestBindingTransitions = 0;
+static bool photoTestPlainCard = false;
 static const char* publishedName = "test_portrait";
 static Hash expectedTexture = 123;
 static std::vector<ULONGLONG> bindingTimes;
 static const char* lastPhotoStage = "none";
 static bool probeOpenSucceeds = true;
+static bool probeCanStart = true;
+static bool probeCreateSucceeds = true;
 static bool probeTaskRunning = false;
+static Ped pedMe = 88;
 static ULONGLONG probePutAwayAtMs = 0;
 static ULONGLONG probeObjectGoneAtMs = 0;
+static ULONGLONG probeTaskStartsAtMs = 0;
 static ULONGLONG probeTaskEndsAtMs = 0;
 static ULONGLONG probePauseUntilMs = 0;
+static ULONGLONG probePauseStartsAtMs = 0;
+static ULONGLONG probeFadeStartsAtMs = 0;
+static bool probeOnScreen = true;
+static ULONGLONG probeOnScreenAtMs = 0;
+static ULONGLONG probeOffScreenAtMs = 0;
 static ULONGLONG probeCancelAtMs = 0;
 static unsigned probeUpdates = 0;
 static unsigned probeDestroys = 0;
+static unsigned probeCreates = 0;
+static unsigned probeFreezes = 0;
+static bool probeDeleteSucceeds = true;
+static unsigned probeDeleteSucceedsOnCall = 1;
+static ULONGLONG probeDeleteDelayMs = 0;
+static std::vector<ULONGLONG> probeDeleteTimes;
+static Vector3 probeCamera = { 10.0f, 20.0f, 30.0f };
+static Vector3 probeCameraRotation = {};
+static Vector3 probePlacedAt = {};
+static Vector3 probePlacedRotation = {};
+static unsigned probePositions = 0;
+static unsigned probeRotations = 0;
+static std::vector<bool> probeCancellationRequests;
 struct ProbeLog { std::string phase; bool success; Object original; bool owned; };
 static std::vector<ProbeLog> probeLogs;
 
@@ -83,6 +108,7 @@ static void Check(bool condition, const char* description)
 static ULONGLONG RuntimeNowMs() { return nowMs; }
 static ULONGLONG GetTickCount64() { return nowMs; }
 static bool PlayerAvailable() { return playerAvailable; }
+static bool CanStartInteraction() { return probeCanStart && PlayerAvailable() && !probeTaskRunning; }
 static void MaintainOwnedPedCleanup() {}
 static void WAIT(DWORD milliseconds)
 {
@@ -91,6 +117,7 @@ static void WAIT(DWORD milliseconds)
     nowMs += 10;
     if (textureAvailableAtMs && nowMs >= textureAvailableAtMs) textureAvailable = true;
     if (probeObjectGoneAtMs && nowMs >= probeObjectGoneAtMs) objectAlive = false;
+    if (probeTaskStartsAtMs && nowMs >= probeTaskStartsAtMs) probeTaskRunning = true;
     if (probeTaskEndsAtMs && nowMs >= probeTaskEndsAtMs) probeTaskRunning = false;
     if (probeCancelAtMs && nowMs >= probeCancelAtMs) playerAvailable = false;
 }
@@ -109,9 +136,48 @@ static void SET_ENTITY_VISIBLE(Object object, bool visible)
     ++visibilityWrites;
     objectVisible = visible;
 }
+static void FREEZE_ENTITY_POSITION(Object object, bool frozen)
+{
+    Check(object == 7 && objectAlive && frozen, "object probe freezes its original live card");
+    ++probeFreezes;
+}
+static bool IS_ENTITY_ON_SCREEN(Object object)
+{
+    Check(object == 7, "screen visibility checks the original card");
+    return objectAlive && objectVisible && probeOnScreen && nowMs >= probeOnScreenAtMs &&
+        (!probeOffScreenAtMs || nowMs < probeOffScreenAtMs);
+}
+static void SET_ENTITY_COORDS(Object object, float x, float y, float z, bool p4, bool p5, bool p6, bool p7)
+{
+    Check(object == 7 && objectAlive && !p4 && !p5 && !p6 && !p7,
+        "camera placement changes only the original card with the requested coordinate flags");
+    probePlacedAt = { x, y, z };
+    ++probePositions;
+}
+static void SET_ENTITY_ROTATION(Object object, float x, float y, float z, int order, bool p5)
+{
+    Check(object == 7 && objectAlive && order == 2 && p5,
+        "object orientation preserves the camera rotation order and native flag");
+    probePlacedRotation = { x, y, z };
+    ++probeRotations;
+}
 }
 namespace OBJECT
 {
+static void DELETE_OBJECT(Object* object)
+{
+    Check(object && object != &Cd.obj && *object == 7 && Cd.obj == 7 && Cd.ownsObj,
+        "deletion uses a temporary original handle while Cd retains ownership");
+    probeDeleteTimes.push_back(nowMs);
+    *object = 0; // Model the native clearing its argument before existence confirms deletion.
+    Check(Cd.obj == 7 && Cd.ownsObj, "native argument clearing cannot lose the tracked card");
+    if (objectAlive && probeDeleteSucceeds && probeDeleteTimes.size() >= probeDeleteSucceedsOnCall &&
+        !probeObjectGoneAtMs)
+    {
+        if (probeDeleteDelayMs) probeObjectGoneAtMs = nowMs + probeDeleteDelayMs;
+        else objectAlive = false;
+    }
+}
 static void SET_CUSTOM_TEXTURES_ON_OBJECT(Object object, Hash texture, int p2, int p3)
 {
     Check(object == 7 && objectAlive, "only a live tracked card is bound");
@@ -141,7 +207,20 @@ static void _SET_PED_BLACKBOARD_BOOL(Ped ped, const char* key, bool value, int d
 }
 namespace HUD
 {
-static bool IS_PAUSE_MENU_ACTIVE() { return nowMs < probePauseUntilMs; }
+static bool IS_PAUSE_MENU_ACTIVE()
+{
+    return nowMs < probePauseUntilMs || (probePauseStartsAtMs && nowMs >= probePauseStartsAtMs);
+}
+}
+namespace CAMERA
+{
+static Vector3 GET_GAMEPLAY_CAM_COORD() { return probeCamera; }
+static Vector3 GET_GAMEPLAY_CAM_ROT(int order)
+{
+    Check(order == 2, "object probe reads camera rotation using the placement rotation order");
+    return probeCameraRotation;
+}
+static bool IS_SCREEN_FADED_IN() { return !probeFadeStartsAtMs || nowMs < probeFadeStartsAtMs; }
 }
 namespace TASK
 {
@@ -153,6 +232,17 @@ static bool IS_PED_RUNNING_TASK_ITEM_INTERACTION(Ped ped)
 }
 // This suite exercises the real probe's polling and retirement conditions. OpenCard/UpdateCard
 // are boundary stubs so material maintenance remains covered without reproducing native tasks.
+static void RefreshCardTextureAfterTransition();
+static bool CreateCardObject()
+{
+    ++probeCreates;
+    if (!probeCreateSucceeds) return false;
+    Cd.obj = 7;
+    Cd.ownsObj = true;
+    objectAlive = true;
+    RefreshCardTextureAfterTransition();
+    return true;
+}
 static bool OpenCard()
 {
     if (!probeOpenSucceeds || !PlayerAvailable()) return false;
@@ -174,9 +264,9 @@ static void UpdateCard()
         Cd.ownsObj = false;
     }
 }
-static void DestroyCardObject(bool cancelInspection)
+static void DestroyCardObject(bool cancelInspection = false)
 {
-    Check(cancelInspection, "probe exits request cancellation of their own inspection");
+    probeCancellationRequests.push_back(cancelInspection);
     ++probeDestroys;
     Cd.obj = 0;
     Cd.examining = false;
@@ -194,6 +284,8 @@ static void LogPhotoCacheTest(const char* phase, bool success, ULONGLONG started
 
 #ifdef CARD_TEXTURE_OLD_ONESHOT
 #include "card_texture_old_under_test.h"
+#elif defined(CARD_TEXTURE_NO_PLAIN_GUARD)
+#include "card_texture_no_plain_guard_under_test.h"
 #else
 #include "card_texture_under_test.h"
 #endif
@@ -209,14 +301,26 @@ static void Reset()
     textureAvailableAtMs = 0;
     binds = cacheRequests = flipWrites = visibilityWrites = waitCalls = 0;
     photoTestBindAttempts = photoTestBindingTransitions = 0;
+    photoTestPlainCard = false;
     publishedName = "test_portrait";
     expectedTexture = 123;
     bindingTimes.clear();
     lastPhotoStage = "none";
     probeOpenSucceeds = true;
+    probeCanStart = probeCreateSucceeds = true;
     probeTaskRunning = false;
-    probePutAwayAtMs = probeObjectGoneAtMs = probeTaskEndsAtMs = probePauseUntilMs = probeCancelAtMs = 0;
-    probeUpdates = probeDestroys = 0;
+    probePutAwayAtMs = probeObjectGoneAtMs = probeTaskStartsAtMs = probeTaskEndsAtMs = probePauseUntilMs = probeCancelAtMs = 0;
+    probeUpdates = probeDestroys = probeCreates = probeFreezes = 0;
+    probeDeleteSucceeds = true;
+    probeDeleteSucceedsOnCall = 1;
+    probeDeleteDelayMs = 0;
+    probeDeleteTimes.clear();
+    probePauseStartsAtMs = probeFadeStartsAtMs = probeOnScreenAtMs = probeOffScreenAtMs = 0;
+    probeOnScreen = true;
+    probeCamera = { 10.0f, 20.0f, 30.0f };
+    probeCameraRotation = probePlacedAt = probePlacedRotation = {};
+    probePositions = probeRotations = 0;
+    probeCancellationRequests.clear();
     probeLogs.clear();
 }
 
@@ -431,6 +535,64 @@ static void TestReadinessGate()
         "player cancellation stops readiness polling immediately");
 }
 
+static void TestPlainCardDiagnostic()
+{
+    Reset();
+    photoTestPlainCard = true;
+    Cd.examining = true;
+    RefreshCardTextureAfterTransition();
+    Check(binds == 0 && photoTestBindAttempts == 0 && !Cd.customApplied && !objectTextured,
+        "plain-card transition suppresses material binding");
+
+    for (unsigned elapsed : { 0u, 100u, 300u, 750u, 1500u, 10000u })
+    {
+        nowMs = 1000 + elapsed;
+        ApplyCardCustomTexture();
+        MaintainPortraitAndCard();
+    }
+    Check(binds == 0 && photoTestBindAttempts == 0 && !Cd.customApplied,
+        "plain-card direct and scheduled maintenance paths never bind the material");
+    Check(cacheRequests == 6 && visibilityWrites == 6 && flipWrites == 6 &&
+        TargetPhotoReady() && objectVisible && std::strcmp(C.photoTexture, "test_portrait") == 0,
+        "plain-card maintenance preserves accepted portrait polling, visibility and inspection");
+
+    textureAvailable = false;
+    MaintainPortraitAndCard();
+    Check(cacheRequests == 7 && !TargetPhotoReady() && !objectVisible &&
+        std::strcmp(C.photoTexture, "test_portrait") == 0 && binds == 0,
+        "plain-card residency loss hides the card while retaining its accepted portrait name");
+
+    publishedName = "replacement_portrait";
+    expectedTexture = 456;
+    textureAvailable = true;
+    MaintainPortraitAndCard();
+    Check(cacheRequests == 8 && TargetPhotoReady() && objectVisible &&
+        std::strcmp(C.photoTexture, publishedName) == 0 && photoTestBindingTransitions == 2 && binds == 0,
+        "plain-card residency recovery adopts the accepted replacement without material binding");
+    Check(EnsureTargetPhotoReady() && cacheRequests == 9 && binds == 0,
+        "plain-card readiness waits still poll the accepted cache without binding");
+
+    photoTestPlainCard = false;
+    RefreshCardTextureAfterTransition();
+    Check(binds == 1 && photoTestBindAttempts == 1 && objectTextured && Cd.customApplied &&
+        photoTestBindingTransitions == 3,
+        "restoring textured mode and refreshing resumes binding the accepted replacement");
+    MaintainPortraitAndCard();
+    Check(binds == 1, "restored texture binding retains the shared immediate-attempt guard");
+    nowMs += 100;
+    objectTextured = false;
+    MaintainPortraitAndCard();
+    Check(binds == 2 && objectTextured,
+        "restored textured mode resumes scheduled material-reset recovery");
+
+    photoTestPlainCard = true;
+    nowMs += 200;
+    objectTextured = false;
+    MaintainPortraitAndCard();
+    Check(binds == 2 && !objectTextured && TargetPhotoReady() && objectVisible,
+        "plain-card mode also suppresses a due retry from an existing textured schedule");
+}
+
 static void TestMissingObjectsAndInspector()
 {
     Reset();
@@ -472,6 +634,8 @@ static void TestInspectionProbeRetirement()
     Check(probeLogs.size() == 3 && probeLogs[0].phase == "card_opened" &&
         probeLogs[1].phase == "card_put_away" && probeLogs[2].phase == "card_removed",
         "inspection logs opening, put-away and confirmed retirement in order");
+    Check(probeCancellationRequests == std::vector<bool>{ true },
+        "inspection retirement still requests cancellation of its own task");
     for (const ProbeLog& entry : probeLogs)
         Check(entry.success && entry.original == 7 && entry.owned,
             "logs preserve original card identity and ownership across Cd reset");
@@ -525,6 +689,157 @@ static void TestInspectionProbeStopping()
         "inspection polling resumes after pause before detecting put-away");
 }
 
+static void PrepareObjectProbe()
+{
+    Reset();
+    Cd.obj = 0;
+    Cd.ownsObj = false;
+    probeDeleteDelayMs = 50;
+}
+
+static void TestObjectProbeLifetime()
+{
+    for (bool plain : { false, true })
+    {
+        PrepareObjectProbe();
+        photoTestPlainCard = plain;
+        const ULONGLONG started = nowMs;
+        Check(ProbePhotoObject(started, 1) && nowMs == started + 2060,
+            "object probe holds for two seconds then waits for actual deletion and one final frame");
+        Check(probeCreates == 1 && probeFreezes == 1 && probeDestroys == 1 && !Cd.obj && !objectAlive &&
+            probeDeleteTimes == std::vector<ULONGLONG>{ started + 2000 },
+            "object probe retains ownership through temporary-handle deletion until retirement is confirmed");
+        Check(probeCancellationRequests == std::vector<bool>{ false } && !probeTaskRunning && probeUpdates == 0,
+            "object-only control never starts, updates or cancels an inspection task");
+        Check(probeLogs.size() == 4 && probeLogs[0].phase == "object_created" &&
+            probeLogs[1].phase == "object_on_screen" && probeLogs[2].phase == "object_held" &&
+            probeLogs[3].phase == "object_removed",
+            "object probe logs creation, screen visibility, completed hold and confirmed removal");
+        for (const ProbeLog& entry : probeLogs)
+            Check(entry.success && entry.original == 7 && entry.owned,
+                "object logs preserve original identity and ownership after Cd reset");
+        Check(cacheRequests >= 200 && visibilityWrites >= 200 && TargetPhotoReady(),
+            "object hold keeps accepted portrait polling and owned-card visibility active");
+        Check(binds == (plain ? 0u : Card::kTextureBindCount),
+            "object-only controls distinguish an unbound card from the complete textured binding schedule");
+        Check(probePositions == 1 && probeRotations == 1 && std::fabs(probePlacedAt.x - 10.0f) < 0.0001f &&
+            std::fabs(probePlacedAt.y - 20.75f) < 0.0001f && std::fabs(probePlacedAt.z - 30.0f) < 0.0001f,
+            "a level north-facing camera places the card three quarters of a metre directly ahead");
+    }
+}
+
+static void TestObjectProbeGuards()
+{
+    PrepareObjectProbe();
+    probeCanStart = false;
+    Check(!ProbePhotoObject(nowMs, 1) && !probeCreates && !probeDestroys && probeLogs.empty(),
+        "unavailable interactions reject object creation without mutating card state");
+
+    PrepareObjectProbe();
+    Cd.obj = 7;
+    Check(!ProbePhotoObject(nowMs, 1) && Cd.obj == 7 && !probeCreates && !probeDestroys,
+        "an existing card prevents the object probe from replacing or deleting it");
+
+    PrepareObjectProbe();
+    probeTaskRunning = true;
+    Check(!ProbePhotoObject(nowMs, 1) && probeTaskRunning && !probeCreates && probeCancellationRequests.empty(),
+        "an already-running foreign item task is left untouched");
+
+    PrepareObjectProbe();
+    probeCreateSucceeds = false;
+    Check(!ProbePhotoObject(nowMs, 1) && probeCreates == 1 && probeDestroys == 1 &&
+        !probeFreezes && !waitCalls && probeLogs.size() == 1 && !probeLogs[0].success,
+        "failed object creation requests cleanup without freezing or entering the hold");
+    Check(probeCancellationRequests == std::vector<bool>{ false },
+        "failed object creation cannot cancel an unrelated inspection");
+}
+
+static void TestObjectProbeStopping()
+{
+    PrepareObjectProbe();
+    probeTaskStartsAtMs = nowMs + 40;
+    const ULONGLONG taskStarted = nowMs;
+    Check(!ProbePhotoObject(taskStarted, 1) && nowMs == taskStarted + 100 && probeTaskRunning,
+        "a foreign item task arriving during the hold stops the object control promptly");
+    Check(probeCancellationRequests == std::vector<bool>{ false } && !probeLogs[2].success &&
+        probeLogs[3].success && !objectAlive,
+        "foreign-task interruption retires only the owned object without cancelling that task");
+
+    PrepareObjectProbe();
+    probeDeleteSucceeds = false;
+    const ULONGLONG timeoutStarted = nowMs;
+    Check(!ProbePhotoObject(timeoutStarted, 1) && nowMs == timeoutStarted + 3510 &&
+        Cd.obj == 7 && Cd.ownsObj && objectAlive && probeLogs[2].success && !probeLogs[3].success,
+        "retirement timeout preserves the original tracked ownership despite cleared native arguments");
+    Check(probeDestroys == 0 && probeCancellationRequests.empty() && probeDeleteTimes.size() == 7,
+        "object retirement retries are bounded and timeout never resets ownership or cancels tasks");
+    for (std::size_t i = 0; i < probeDeleteTimes.size(); ++i)
+        Check(probeDeleteTimes[i] == timeoutStarted + 2000 + i * 250,
+            "pending deletion retries use the original object once per 250 milliseconds");
+
+    PrepareObjectProbe();
+    probeCancelAtMs = nowMs + 40;
+    const ULONGLONG cancelledStarted = nowMs;
+    Check(!ProbePhotoObject(cancelledStarted, 1) && nowMs == cancelledStarted + 50 && !playerAvailable &&
+        probeDestroys == 0 && probeDeleteTimes.size() == 1 && Cd.obj == 7 && Cd.ownsObj &&
+        !probeLogs[2].success && !probeLogs[3].success,
+        "player interruption requests deletion and retains unconfirmed ownership without continuing the hold");
+
+    PrepareObjectProbe();
+    probeObjectGoneAtMs = nowMs + 30;
+    const ULONGLONG vanishedStarted = nowMs;
+    Check(!ProbePhotoObject(vanishedStarted, 1) && nowMs == vanishedStarted + 40 &&
+        !probeLogs[2].success && probeLogs[3].success && probeDestroys == 1,
+        "early object disappearance fails the hold even though retirement is already confirmed");
+}
+
+static void TestObjectProbePlacementAndVisibility()
+{
+    PrepareObjectProbe();
+    probeCameraRotation = { 30.0f, 5.0f, 90.0f };
+    probeOnScreenAtMs = nowMs + 100;
+    probeOffScreenAtMs = nowMs + 200;
+    Check(ProbePhotoObject(nowMs, 1) && probeLogs[1].success,
+        "an object observed on screen for part of the hold satisfies the visibility requirement");
+    Check(std::fabs(probePlacedAt.x - (10.0f - 0.649519f)) < 0.0001f &&
+        std::fabs(probePlacedAt.y - 20.0f) < 0.0001f && std::fabs(probePlacedAt.z - 30.375f) < 0.0001f &&
+        probePlacedRotation.x == 30.0f && probePlacedRotation.y == 5.0f && probePlacedRotation.z == 90.0f,
+        "pitched east-facing camera placement preserves distance, height and the full camera orientation");
+
+    PrepareObjectProbe();
+    probeOnScreen = false;
+    Check(!ProbePhotoObject(nowMs, 1) && !probeLogs[1].success && !probeLogs[2].success &&
+        probeLogs[3].success && !Cd.obj,
+        "an object never observed on screen fails the control but is still retired");
+
+    for (bool paused : { false, true })
+    {
+        PrepareObjectProbe();
+        if (paused) probePauseStartsAtMs = nowMs + 40;
+        else probeFadeStartsAtMs = nowMs + 40;
+        const ULONGLONG started = nowMs;
+        Check(!ProbePhotoObject(started, 1) && nowMs == started + 100 &&
+            !probeLogs[2].success && probeLogs[3].success && !objectAlive,
+            "pause or screen fade stops the visual control and still confirms object retirement");
+        Check(probeCancellationRequests == std::vector<bool>{ false },
+            "pause and fade cleanup do not cancel item-interaction tasks");
+    }
+}
+
+static void TestObjectProbeDeletionRetry()
+{
+    PrepareObjectProbe();
+    probeDeleteSucceedsOnCall = 3;
+    probeDeleteDelayMs = 20;
+    const ULONGLONG started = nowMs;
+    Check(ProbePhotoObject(started, 1) && nowMs == started + 2530 && !objectAlive && !Cd.obj &&
+        probeDestroys == 1 && probeLogs[3].success,
+        "a later successful deletion retry confirms retirement before tracked ownership resets");
+    const std::vector<ULONGLONG> expected = { started + 2000, started + 2250, started + 2500 };
+    Check(probeDeleteTimes == expected,
+        "cleared deletion arguments never replace the original handle used by retries");
+}
+
 int main()
 {
     Check(Card::kTextureSettleMs == 1500 && Card::kTextureBindCount == 5,
@@ -536,8 +851,14 @@ int main()
     TestResidencyLossAfterSuccessfulBinding();
     TestChangedAcceptedName();
     TestReadinessGate();
+    TestPlainCardDiagnostic();
     TestMissingObjectsAndInspector();
     TestInspectionProbeRetirement();
     TestInspectionProbeStopping();
+    TestObjectProbeLifetime();
+    TestObjectProbeGuards();
+    TestObjectProbeStopping();
+    TestObjectProbePlacementAndVisibility();
+    TestObjectProbeDeletionRetry();
     std::printf("All %u card texture checks passed (actual production functions).\n", checks);
 }

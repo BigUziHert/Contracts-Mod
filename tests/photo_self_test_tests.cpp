@@ -1,17 +1,16 @@
-// Exercises the production diagnostic driver and probe order with deterministic phase outcomes.
-// Capture/rendering and handle allocation internals are covered separately by portrait_cache_tests.
+// Exercises the actual v4 diagnostic driver, read-only reopen helper, and caller cleanup.
+// Native object/inspection internals and rendering are covered by their separate suites.
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <initializer_list>
 #include <string>
 #include <vector>
 
 using DWORD = std::uint32_t;
 using ULONGLONG = std::uint64_t;
 using Ped = int;
-struct ContractDef {}; // Only the diagnostic caller's metadata pointer is exercised here.
+struct ContractDef {};
 constexpr Ped kSubject = 77;
 static unsigned checks = 0;
 static void Check(bool value, const char* description)
@@ -20,21 +19,18 @@ static void Check(bool value, const char* description)
     if (!value) { std::fprintf(stderr, "FAILED: %s\n", description); std::exit(EXIT_FAILURE); }
 }
 
-struct CaptureOutcome
-{
-    bool success = true;
-    bool written = true;
-    bool complete = true;
-    bool pendingHandle = false;
-};
+struct CaptureOutcome { bool success = true; bool pendingHandle = false; };
 enum class LookupOutcome { Success, Unavailable, Pending };
 struct LogEntry
 {
-    std::string phase;
+    std::string control, phase;
     bool success;
     unsigned captures;
-    std::string previous;
-    std::string observed;
+    std::string previous, observed;
+    bool plain;
+};
+static const char* kControls[] = {
+    "baseline", "unbound_object", "plain_inspection", "bound_object", "portrait_inspection"
 };
 static struct TestWorld
 {
@@ -42,36 +38,29 @@ static struct TestWorld
     bool playerAvailable = true;
     unsigned frames = 0;
     unsigned captures = 0;
-    unsigned cardInspections = 0;
-    bool cardInspectionSucceeds = true;
-    std::string cardAcceptedName;
+    unsigned consumers = 0;
+    unsigned objects = 0;
+    unsigned inspections = 0;
     unsigned explicitProbes = 0;
     unsigned lookupCalls = 0;
-    unsigned backupCalls = 0;
-    unsigned nameReleases = 0;
     unsigned handlesCreated = 0;
     unsigned handlesReleased = 0;
     unsigned cleanupRequests = 0;
     unsigned visibilityChanges = 0;
     bool newExplicitProbe = true;
     LookupOutcome currentLookup = LookupOutcome::Unavailable;
-    bool oldNameValid = true;
-    bool invalidationSucceeds = true;
-    ULONGLONG invalidAt = 0;
-    bool backupSucceeds = true;
-    std::string backupName = "backup_photo";
-    char borrowedName[128] = "";
     std::string interruptAfterLog;
-    std::vector<CaptureOutcome> captureOutcomes = { {}, {} };
-    std::vector<LookupOutcome> lookupOutcomes = { LookupOutcome::Success };
-    std::vector<std::string> lookupNames;
-    std::string expectedReleasedName = "portrait_1";
+    unsigned interruptInConsumer = 0;
+    bool interruptInLookup = false;
+    std::vector<CaptureOutcome> captureOutcomes = std::vector<CaptureOutcome>(6);
+    std::vector<LookupOutcome> lookupOutcomes = std::vector<LookupOutcome>(5, LookupOutcome::Success);
+    std::vector<bool> consumerOutcomes = std::vector<bool>(4, true);
+    std::vector<std::string> acceptedNames = std::vector<std::string>(4);
     std::vector<int> activeHandles;
     std::vector<LogEntry> logs;
     std::vector<std::string> operations;
 } world;
 
-// Generated declarations come first so the stubs use production fields/constants/enumeration.
 #include "photo_self_test_state.h"
 
 static ULONGLONG GetTickCount64() { return world.nowMs; }
@@ -79,18 +68,18 @@ static bool PlayerAvailable() { return world.playerAvailable; }
 static void MaintainOwnedPedCleanup() {}
 static void MaintainPortraitAndCard()
 {
-    Check(!C.photoTexture[0], "probe waits never expose an accepted name to normal handle maintenance");
+    Check(!C.photoTexture[0], "reopen waits do not expose an accepted name to normal handle maintenance");
 }
 static void WAIT(DWORD delay)
 {
     Check(delay == 0, "diagnostic waits yield game frames");
     world.nowMs += 16;
     ++world.frames;
-    Check(world.frames < 2000, "all diagnostic waits remain bounded");
+    Check(world.frames < 2000, "failed diagnostic waits remain bounded");
 }
 static int AcquireHandle()
 {
-    Check(world.activeHandles.empty(), "a new phase cannot allocate over an owned handle");
+    Check(world.activeHandles.empty(), "a phase cannot allocate over an owned handle");
     const int handle = 101 + static_cast<int>(world.handlesCreated++);
     world.activeHandles.push_back(handle);
     return handle;
@@ -100,28 +89,28 @@ static void ReleaseTargetPhoto()
     if (C.photoDownload > 0)
     {
         Check(world.activeHandles.size() == 1 && world.activeHandles[0] == C.photoDownload,
-            "cleanup releases exactly the handle retained by the preceding phase");
+            "cleanup releases precisely the handle retained by the preceding phase");
         world.activeHandles.clear();
         ++world.handlesReleased;
     }
-    C.photoDownload = -1;
-    C.photoDownloadStatus = -1;
-    C.photoLookupName[0] = '\0';
-    C.photoTexture[0] = '\0';
-    C.photoTextureValid = false;
-    C.photoLookupValid = false;
+    C.photoDownload = C.photoDownloadStatus = -1;
+    C.photoLookupName[0] = C.photoTexture[0] = '\0';
+    C.photoTextureValid = C.photoLookupValid = false;
     world.newExplicitProbe = true;
 }
 static bool PhotographPed(Ped subject)
 {
-    Check(subject == kSubject, "every capture uses the same provisional subject");
-    Check(world.captures < world.captureOutcomes.size(), "the driver performs only configured captures");
+    Check(subject == kSubject && PlayerAvailable(), "every capture uses the same available provisional subject");
+    Check(world.captures < world.captureOutcomes.size(), "the driver never performs an extra capture");
+    Check(std::strcmp(photoTestControl, kControls[world.captures ? world.captures - 1 : 0]) == 0,
+        "captures retain their baseline or consumer control label");
+    Check(photoTestPlainCard == (world.captures < 4),
+        "baseline and plain consumers keep portrait binding disabled through their capture checkpoints");
     ReleaseTargetPhoto();
     const CaptureOutcome outcome = world.captureOutcomes[world.captures++];
-    world.operations.push_back("capture");
+    world.operations.push_back(std::string(photoTestControl) + "/capture");
     C.photoRequestAttempts = 0;
-    C.photoWritten = outcome.written;
-    C.photoWriteComplete = outcome.complete;
+    C.photoWritten = C.photoWriteComplete = outcome.success;
     if (outcome.success || outcome.pendingHandle)
     {
         C.photoDownload = AcquireHandle();
@@ -139,92 +128,79 @@ static bool PhotographPed(Ped subject)
 static bool LookupPhotoTexture(int cacheType, char (&name)[64])
 {
     Check(cacheType == Card::kPhotoCacheType && !C.photoTexture[0],
-        "explicit probes use the configured cache without normal accepted-name polling");
+        "reopen uses the configured cache with normal accepted-name polling disabled");
     ++world.lookupCalls;
     ++C.photoRequestAttempts;
     if (world.newExplicitProbe)
     {
-        Check(world.explicitProbes < world.lookupOutcomes.size(), "only configured explicit probes execute");
+        Check(world.explicitProbes < world.lookupOutcomes.size(), "only configured reopen checkpoints execute");
         world.currentLookup = world.lookupOutcomes[world.explicitProbes++];
-        world.operations.push_back("explicit");
+        world.operations.push_back(std::string(photoTestControl) + "/reopen");
         world.newExplicitProbe = false;
         if (world.currentLookup != LookupOutcome::Unavailable) C.photoDownload = AcquireHandle();
     }
     C.photoDownloadStatus = world.currentLookup == LookupOutcome::Success ? 0
         : world.currentLookup == LookupOutcome::Pending ? 1 : -1;
+    if (world.interruptInLookup) world.playerAvailable = false;
     if (world.currentLookup != LookupOutcome::Success) return false;
-    const std::string observed = world.explicitProbes <= world.lookupNames.size()
-        ? world.lookupNames[world.explicitProbes - 1] : "portrait_" + std::to_string(world.captures);
+    const std::string observed = "reopened_" + std::to_string(world.explicitProbes);
     strcpy_s(name, observed.c_str());
     strcpy_s(C.photoLookupName, name);
     C.photoTextureValid = true;
     return true;
 }
-static bool ProbePhotoCard(ULONGLONG started, unsigned captures)
+static bool ProbeConsumer(bool object, ULONGLONG started, unsigned captures)
 {
-    Check(started <= world.nowMs && captures == 1 && world.captures == 1 && C.def &&
-        C.photoTexture[0] && C.photoDownload > 0 &&
-        world.activeHandles.size() == 1,
-        "card inspection uses the initial accepted portrait while its handle remains owned");
-    ++world.cardInspections;
-    world.operations.push_back("card");
-    if (!world.cardAcceptedName.empty())
+    Check(world.consumers < 4 && PlayerAvailable(), "no consumer runs past a failure or player interruption");
+    const unsigned index = world.consumers++;
+    Check(started <= world.nowMs && captures == world.captures && captures == index + 2 && C.def &&
+        C.photoTexture[0] && C.photoDownload > 0 && world.activeHandles.size() == 1,
+        "consumer uses the preceding checkpoint's accepted capture and retained handle");
+    Check(object == (index % 2 == 0) && std::strcmp(photoTestControl, kControls[index + 1]) == 0,
+        "unbound object, plain inspection, bound object, and portrait inspection run in order");
+    Check(photoTestPlainCard == (index < 2), "plain controls disable portrait binding only in the first two stages");
+    Check(photoTestBindAttempts == 0 && photoTestBindingTransitions == 0 &&
+        C.photoCardFaceDraws == 0 && C.photoCardPanelDraws == 0 &&
+        C.photoCardRenderId == 0 && !C.photoCardRenderName[0],
+        "each consumer begins with independent binding and rendering counters");
+    if (object) ++world.objects; else ++world.inspections;
+    world.operations.push_back(std::string(photoTestControl) + (object ? "/object" : "/inspection"));
+    photoTestBindAttempts = photoTestBindingTransitions = 7;
+    C.photoCardFaceDraws = C.photoCardPanelDraws = 9;
+    C.photoCardRenderId = 55;
+    strcpy_s(C.photoCardRenderName, "preceding_consumer_render_target");
+    if (!world.acceptedNames[index].empty())
     {
-        strcpy_s(C.photoTexture, world.cardAcceptedName.c_str());
+        strcpy_s(C.photoTexture, world.acceptedNames[index].c_str());
         strcpy_s(C.photoLookupName, C.photoTexture);
     }
-    return world.cardInspectionSucceeds;
+    if (world.interruptInConsumer == index + 1) world.playerAvailable = false;
+    return world.consumerOutcomes[index];
 }
+static bool ProbePhotoObject(ULONGLONG started, unsigned captures) { return ProbeConsumer(true, started, captures); }
+static bool ProbePhotoCard(ULONGLONG started, unsigned captures) { return ProbeConsumer(false, started, captures); }
 static void LogPhotoCacheTest(const char* phase, bool success, ULONGLONG started,
     unsigned captures, const char* previousName, const char* observedName)
 {
-    Check(started <= world.nowMs && captures == world.captures, "phase logs retain the actual capture count");
-    world.logs.push_back({ phase, success, captures, previousName, observedName });
-    if (world.interruptAfterLog == phase) world.playerAvailable = false;
+    Check(started <= world.nowMs && captures == world.captures, "logs retain the actual capture count");
+    if (std::strcmp(phase, "begin") == 0)
+        Check(photoTestBindAttempts == 0 && photoTestBindingTransitions == 0 && photoTestPlainCard,
+            "baseline starts with fresh counters and no portrait material binding");
+    world.logs.push_back({ photoTestControl, phase, success, captures, previousName, observedName, photoTestPlainCard });
+    if (world.interruptAfterLog == std::string(photoTestControl) + "/" + phase) world.playerAvailable = false;
 }
 static void RequestOwnedPedCleanup(Ped subject)
 {
     Check(subject == kSubject && world.activeHandles.empty(),
-        "the caller releases the last handle before requesting provisional ped cleanup");
+        "caller releases the final handle before requesting cleanup of its own provisional ped");
     ++world.cleanupRequests;
 }
 namespace ENTITY
 {
 static void SET_ENTITY_VISIBLE(Ped subject, bool visible)
 {
-    Check(subject == kSubject && !visible, "the diagnostic caller hides only its provisional subject");
+    Check(subject == kSubject && !visible, "caller hides only its provisional subject");
     ++world.visibilityChanges;
-}
-}
-namespace NETWORK
-{
-static void _TEXTURE_DOWNLOAD_RELEASE_BY_NAME(const char* name)
-{
-    Check(name == world.expectedReleasedName && world.activeHandles.empty(),
-        "name invalidation uses only the latest accepted name after releasing explicit ownership");
-    ++world.nameReleases;
-    world.operations.push_back("invalidate");
-    world.invalidAt = world.nowMs + 32;
-}
-static bool _TEXTURE_DOWNLOAD_TEXTURE_NAME_IS_VALID(const char* name)
-{
-    Check(name != world.borrowedName, "the backup helper copies its borrowed name before another native");
-    const std::string copied(name);
-    strcpy_s(world.borrowedName, "native scratch changed");
-    if (copied == world.backupName) return world.backupSucceeds;
-    if (world.nameReleases && world.invalidationSucceeds && world.nowMs >= world.invalidAt)
-        world.oldNameValid = false;
-    return world.oldNameValid;
-}
-static const char* _REQUEST_PEDSHOT_TEXTURE_LOCAL_BACKUP_DOWNLOAD(int slot, int cacheType)
-{
-    Check(slot == Card::kPhotoSlot && cacheType == Card::kPhotoCacheType,
-        "backup readback preserves the configured slot and cache type");
-    Check(world.activeHandles.empty() && !C.photoTexture[0],
-        "backup reading starts without an explicit handle or accepted name");
-    if (world.backupCalls++ == 0) world.operations.push_back("backup");
-    strcpy_s(world.borrowedName, world.backupName.c_str());
-    return world.borrowedName;
 }
 }
 
@@ -236,170 +212,162 @@ static void Reset()
     C = PortraitState();
     lastPhotoStage = "none";
     lastStartFailure = ContractStartFailure::None;
-}
-static void CheckPhases(std::initializer_list<const char*> expected)
-{
-    Check(world.logs.size() == expected.size(), "the driver logs exactly the expected phases");
-    unsigned index = 0;
-    for (const char* phase : expected)
-        Check(world.logs[index++].phase == phase, "diagnostic phases execute in their intended order");
+    photoTestPlainCard = false;
+    photoTestControl = "none";
+    photoTestBindAttempts = photoTestBindingTransitions = 99;
 }
 static void RunCallerAndCheck(bool interrupted = false)
 {
     Check(RunPhotoTestAsCaller(kSubject) == 0, "diagnostics never issue a bounty target");
     Check(world.activeHandles.empty() && world.handlesCreated == world.handlesReleased,
-        "the real diagnostic caller releases all positive handles on every exit");
-    Check(world.cleanupRequests == 1 && world.visibilityChanges == 1,
-        "the caller hides and requests checked cleanup of its one provisional ped");
-    Check(!C.def, "the diagnostic caller clears temporary back-panel metadata on every exit");
-    Check(lastStartFailure == (interrupted ? ContractStartFailure::Interrupted
-        : ContractStartFailure::PhotoDiagnosticComplete),
-        "completed diagnostics use the dedicated no-retry outcome while interruption stays distinct");
+        "real caller releases every positive or pending handle on all exits");
+    Check(world.cleanupRequests == 1 && world.visibilityChanges == 1 && !C.def,
+        "caller clears temporary metadata and queues cleanup of its one provisional subject");
+    Check(!photoTestPlainCard && std::strcmp(photoTestControl, "none") == 0,
+        "scoped diagnostic controls reset after successful, failed, or interrupted runs");
+    Check(lastStartFailure == (interrupted ? ContractStartFailure::Interrupted : ContractStartFailure::PhotoDiagnosticComplete),
+        "interruption stays distinct from a completed diagnostic failure without rerolling");
 }
-static void TestInitialFailure()
+static std::vector<std::string> PhaseKeys()
+{
+    std::vector<std::string> result;
+    for (const LogEntry& entry : world.logs) result.push_back(entry.control + "/" + entry.phase);
+    return result;
+}
+static std::vector<std::string> ExpectedPhases()
+{
+    std::vector<std::string> result = { "baseline/begin", "baseline/initial", "baseline/reopen_without_write", "baseline/capture" };
+    for (unsigned i = 1; i < 5; ++i)
+        for (const char* phase : { "consumer", "reopen_without_write", "capture" })
+            result.push_back(std::string(kControls[i]) + "/" + phase);
+    result.push_back("portrait_inspection/complete");
+    return result;
+}
+static void CheckStoppedAt(const std::string& key)
+{
+    auto expected = ExpectedPhases();
+    while (!expected.empty() && expected.back() != key) expected.pop_back();
+    Check(!expected.empty() && PhaseKeys() == expected, "failure or interruption prevents every later diagnostic phase");
+}
+static void TestSuccessfulSequence()
 {
     Reset();
-    world.captureOutcomes = { { false, true, true, true } };
     RunCallerAndCheck();
-    CheckPhases({ "begin", "initial" });
-    Check(world.captures == 1 && world.explicitProbes == 0 && world.nameReleases == 0 &&
-        world.backupCalls == 0 && world.handlesReleased == 1,
-        "initial failure stops all later probes while releasing a pending initial handle");
-}
-static void TestReopenAndRewrite()
-{
-    Reset();
-    RunCallerAndCheck();
-    CheckPhases({ "begin", "initial", "card_inspection", "A_reopen_without_write", "B_second_capture" });
-    Check(world.captures == 2 && world.explicitProbes == 1 && world.handlesReleased == 3,
-        "successful A performs exactly one same-subject rewrite and caller cleanup retains no handle");
-    Check(world.operations == std::vector<std::string>({ "capture", "card", "explicit", "capture" }),
-        "the initial card is inspected before A runs between captures without writing a photo");
-}
-static void TestCardInspectionFailure()
-{
-    Reset();
-    world.cardInspectionSucceeds = false;
-    RunCallerAndCheck();
-    CheckPhases({ "begin", "initial", "card_inspection" });
-    Check(world.captures == 1 && world.cardInspections == 1 && world.explicitProbes == 0 &&
-        world.nameReleases == 0 && world.backupCalls == 0 && world.handlesReleased == 1,
-        "failed or timed-out card inspection stops all cache probes and releases the initial handle");
-}
-static void TestNameRecoveryWithoutRewrite()
-{
-    for (LookupOutcome failure : { LookupOutcome::Unavailable, LookupOutcome::Pending })
+    Check(PhaseKeys() == ExpectedPhases(), "baseline and all four controls log their checkpoints in order");
+    Check(world.captures == 6 && world.explicitProbes == 5 && world.consumers == 4 &&
+        world.objects == 2 && world.inspections == 2 && world.handlesReleased == 11,
+        "a successful run uses six captures, five reopened handles, and four isolated consumers");
+    std::vector<std::string> expected = { "baseline/capture", "baseline/reopen", "baseline/capture" };
+    for (unsigned i = 1; i < 5; ++i)
     {
-        Reset();
-        world.lookupOutcomes = { failure, LookupOutcome::Success };
-        RunCallerAndCheck();
-        CheckPhases({ "begin", "initial", "card_inspection", "A_reopen_without_write", "C_before_name_release", "C_name_invalidation",
-            "C_reopen_without_write" });
-        Check(world.captures == 1 && world.explicitProbes == 2 && world.nameReleases == 1 &&
-            world.backupCalls == 0,
-            "A failure and C recovery cannot generate or write another capture");
-        Check(world.operations == std::vector<std::string>({ "capture", "card", "explicit", "invalidate", "explicit" }),
-            "name recovery changes cache invalidation only, after ownership is released");
+        expected.push_back(std::string(kControls[i]) + (i % 2 ? "/object" : "/inspection"));
+        expected.push_back(std::string(kControls[i]) + "/reopen");
+        expected.push_back(std::string(kControls[i]) + "/capture");
+    }
+    Check(world.operations == expected, "each no-write reopen precedes its next capture after consumer retirement");
+    unsigned checkpoint = 0;
+    for (const LogEntry& log : world.logs)
+    {
+        if (log.phase == "capture")
+        {
+            ++checkpoint;
+            Check(log.previous == "reopened_" + std::to_string(checkpoint),
+                "capture log keeps a copy of the last observed name after PhotographPed clears scratch state");
+        }
     }
 }
-static void TestInspectionNameRefresh()
+static void TestEveryCaptureFailure()
 {
-    Reset();
-    world.cardAcceptedName = "card_refreshed_portrait";
-    world.expectedReleasedName = world.cardAcceptedName;
-    world.lookupOutcomes = { LookupOutcome::Unavailable, LookupOutcome::Success };
-    world.lookupNames = { "", world.cardAcceptedName };
-    RunCallerAndCheck();
-    CheckPhases({ "begin", "initial", "card_inspection", "A_reopen_without_write",
-        "C_before_name_release", "C_name_invalidation", "C_reopen_without_write" });
-    Check(world.captures == 1 && world.logs[2].previous == world.cardAcceptedName &&
-        world.logs.back().previous == world.cardAcceptedName && world.nameReleases == 1,
-        "name invalidation uses the latest texture accepted during card inspection after A fails");
-}
-static void TestRewriteFailureRecovery()
-{
-    Reset();
-    world.captureOutcomes = { {}, { false, true, true, true } };
-    world.lookupOutcomes = { LookupOutcome::Success, LookupOutcome::Success };
-    world.lookupNames = { "reopened_portrait", "recovered_portrait" };
-    world.expectedReleasedName = "reopened_portrait";
-    RunCallerAndCheck();
-    CheckPhases({ "begin", "initial", "card_inspection", "A_reopen_without_write", "B_second_capture",
-        "C_before_name_release", "C_name_invalidation", "C_reopen_without_write" });
-    Check(world.captures == 2 && world.explicitProbes == 2 && world.backupCalls == 0,
-        "failed rewritten download can recover through C without a third capture");
-    Check(world.logs.back().previous == "reopened_portrait",
-        "the name accepted by A replaces the initial name before invalidation after B");
-
-    for (bool failedWrite : { false, true })
+    for (unsigned i = 0; i < 6; ++i)
     {
-        Reset();
-        world.captureOutcomes = { {}, { false, !failedWrite, false, false } };
-        RunCallerAndCheck();
-        CheckPhases({ "begin", "initial", "card_inspection", "A_reopen_without_write", "B_second_capture" });
-        Check(world.nameReleases == 0 && world.backupCalls == 0,
-            "an incomplete second write cannot enter readback recovery probes");
+        for (bool pending : { false, true })
+        {
+            Reset();
+            world.captureOutcomes[i] = { false, pending };
+            RunCallerAndCheck();
+            const std::string key = i == 0 ? "baseline/initial" : std::string(kControls[i - 1]) + "/capture";
+            CheckStoppedAt(key);
+            Check(world.captures == i + 1 && !world.logs.back().success,
+                "each failed capture stops before another consumer or rewrite regardless of pending ownership");
+        }
     }
 }
-static void TestBackupIsLastAndIsolated()
+static void TestEveryReopenFailure()
 {
-    for (bool invalidates : { false, true })
+    for (unsigned i = 0; i < 5; ++i)
     {
-        Reset();
-        world.invalidationSucceeds = invalidates;
-        world.lookupOutcomes = { LookupOutcome::Pending, LookupOutcome::Pending };
-        RunCallerAndCheck();
-        if (invalidates)
-            CheckPhases({ "begin", "initial", "card_inspection", "A_reopen_without_write", "C_before_name_release", "C_name_invalidation",
-                "C_reopen_without_write", "D_backup_without_write" });
-        else
-            CheckPhases({ "begin", "initial", "card_inspection", "A_reopen_without_write", "C_before_name_release", "C_name_invalidation",
-                "D_backup_without_write" });
-        Check(world.captures == 1 && world.operations.back() == "backup" && world.backupCalls == 1,
-            "backup is the final isolated readback phase and performs no capture");
-        Check(!C.photoTexture[0] && C.photoDownload == -1 &&
-            world.logs.back().observed == world.backupName,
-            "backup results survive borrowed-buffer mutation without entering normal accepted state");
+        for (LookupOutcome outcome : { LookupOutcome::Unavailable, LookupOutcome::Pending })
+        {
+            Reset();
+            world.lookupOutcomes[i] = outcome;
+            RunCallerAndCheck();
+            CheckStoppedAt(std::string(kControls[i]) + "/reopen_without_write");
+            Check(world.explicitProbes == i + 1 && world.captures == i + 1 && !world.logs.back().success,
+                "each failed reopen stops without another write or an unrelated fallback");
+            Check(world.nowMs - 1000 >= Card::kPhotoNameMs && world.nowMs - 1000 < Card::kPhotoNameMs + 16,
+                "unavailable and pending reopen phases stop at the production timeout");
+        }
     }
 }
-static void TestAlreadyInvalidName()
+static void TestEveryConsumerFailure()
 {
-    Reset();
-    world.oldNameValid = false;
-    world.lookupOutcomes = { LookupOutcome::Unavailable, LookupOutcome::Success };
-    RunCallerAndCheck();
-    CheckPhases({ "begin", "initial", "card_inspection", "A_reopen_without_write", "C_before_name_release",
-        "C_name_already_invalid", "C_reopen_without_write" });
-    Check(!world.logs[4].success && world.logs[5].success && world.captures == 1,
-        "an already-invalid name is logged distinctly and its reopen still performs no write");
-}
-static void TestInterruption()
-{
-    for (const char* phase : { "begin", "initial", "card_inspection", "A_reopen_without_write",
-        "C_before_name_release", "C_name_invalidation", "C_reopen_without_write", "D_backup_without_write" })
+    for (unsigned i = 0; i < 4; ++i)
     {
         Reset();
-        world.interruptAfterLog = phase;
-        world.lookupOutcomes = { LookupOutcome::Pending, LookupOutcome::Pending };
+        world.consumerOutcomes[i] = false;
+        RunCallerAndCheck();
+        CheckStoppedAt(std::string(kControls[i + 1]) + "/consumer");
+        Check(world.captures == i + 2 && world.explicitProbes == i + 1 && world.consumers == i + 1 &&
+            !world.logs.back().success, "failed consumer retirement prevents both reopen and another capture");
+    }
+}
+static void TestLatestConsumerName()
+{
+    for (unsigned i = 0; i < 4; ++i)
+    {
+        Reset();
+        world.acceptedNames[i] = "changed_during_consumer";
+        world.lookupOutcomes[i + 1] = LookupOutcome::Unavailable;
+        RunCallerAndCheck();
+        Check(world.logs.back().previous == world.acceptedNames[i],
+            "reopen logs preserve the latest accepted name after a consumer changes it");
+    }
+}
+static void TestEveryInterruption()
+{
+    for (const std::string& key : ExpectedPhases())
+    {
+        Reset();
+        world.interruptAfterLog = key;
         RunCallerAndCheck(true);
-        Check(world.logs.back().phase == phase, "interruption prevents every phase after the interruption log");
+        CheckStoppedAt(key);
+    }
+    for (unsigned i = 1; i <= 4; ++i)
+    {
+        Reset();
+        world.interruptInConsumer = i;
+        RunCallerAndCheck(true);
+        CheckStoppedAt(std::string(kControls[i]) + "/consumer");
     }
     Reset();
-    world.interruptAfterLog = "A_reopen_without_write";
+    world.interruptInLookup = true;
+    world.lookupOutcomes[0] = LookupOutcome::Pending;
     RunCallerAndCheck(true);
-    Check(world.captures == 1 && world.handlesReleased == 2 && world.nameReleases == 0,
-        "interruption immediately after successful A releases its handle and prevents the second capture");
+    CheckStoppedAt("baseline/reopen_without_write");
+    Check(world.frames == 1 && world.captures == 1, "player interruption ends pending reopen polling on its next frame");
+    Reset();
+    world.playerAvailable = false;
+    RunCallerAndCheck(true);
+    CheckStoppedAt("baseline/begin");
+    Check(world.captures == 0 && world.handlesCreated == 0, "unavailable player prevents all native capture work");
 }
 int main()
 {
-    TestInitialFailure();
-    TestReopenAndRewrite();
-    TestCardInspectionFailure();
-    TestNameRecoveryWithoutRewrite();
-    TestInspectionNameRefresh();
-    TestRewriteFailureRecovery();
-    TestBackupIsLastAndIsolated();
-    TestAlreadyInvalidName();
-    TestInterruption();
-    std::printf("All %u photo self-test driver checks passed (actual production driver/helpers/caller).\n", checks);
+    TestSuccessfulSequence();
+    TestEveryCaptureFailure();
+    TestEveryReopenFailure();
+    TestEveryConsumerFailure();
+    TestLatestConsumerName();
+    TestEveryInterruption();
+    std::printf("All %u photo self-test driver checks passed (actual production driver/helper/caller).\n", checks);
 }

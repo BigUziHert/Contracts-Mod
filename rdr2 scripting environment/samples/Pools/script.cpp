@@ -686,12 +686,14 @@ static bool EnsureTargetPhotoReady()
 }
 
 #ifdef BOUNTY_PHOTO_SELF_TEST
-// Opt-in diagnostic build: one provisional subject, a real inspected card, no bounty.
-// In particular, probe A never generates or writes: it tests whether a released
-// consumer can reopen the SAME published photo after card use, before another write.
+// Opt-in diagnostic build: isolate object lifetime, inspection, and dynamic material use.
+// Keep normal cache polling in every control; only the card's portrait consumers differ.
 static unsigned photoTestBindAttempts = 0;
 static unsigned photoTestBindingTransitions = 0;
+static bool photoTestPlainCard = false;
+static const char* photoTestControl = "none";
 static bool ProbePhotoCard(ULONGLONG started, unsigned captures);
+static bool ProbePhotoObject(ULONGLONG started, unsigned captures);
 static void LogPhotoCacheTest(const char* phase, bool success, ULONGLONG started,
 	unsigned captures, const char* previousName, const char* observedName,
 	Object observedCard = 0, bool cardOwned = false)
@@ -711,7 +713,7 @@ static void LogPhotoCacheTest(const char* phase, bool success, ULONGLONG started
 	bool previousValid = previousName[0] && NETWORK::_TEXTURE_DOWNLOAD_TEXTURE_NAME_IS_VALID(previousName);
 	bool itemRunning = LivingPed(pedMe) && TASK::IS_PED_RUNNING_TASK_ITEM_INTERACTION(pedMe);
 	Hash itemState = itemRunning ? TASK::GET_ITEM_INTERACTION_STATE(pedMe) : 0;
-	fprintf(file, "%04u-%02u-%02uT%02u:%02u:%02uZ photo-test-v3 phase=%s ok=%d elapsedMs=%llu captures=%u slot=%d cache=%d stage=%s download=%d status=%d requests=%u name=\"%s\" previous=\"%s\" previousValid=%d nameValid=%d ready=%d generated=%d written=%d writeComplete=%d busyBefore=%d busyAfter=%d busyRequest=%d freePeds=%d card=%d cardOwned=%d cardExists=%d binds=%u bindingResets=%u itemRunning=%d itemState=%08X renderId=%d renderName=\"%s\" faceDraws=%u panelDraws=%u\n",
+	fprintf(file, "%04u-%02u-%02uT%02u:%02u:%02uZ photo-test-v4 phase=%s ok=%d elapsedMs=%llu captures=%u slot=%d cache=%d stage=%s download=%d status=%d requests=%u name=\"%s\" previous=\"%s\" previousValid=%d nameValid=%d ready=%d generated=%d written=%d writeComplete=%d busyBefore=%d busyAfter=%d busyRequest=%d freePeds=%d card=%d cardOwned=%d cardExists=%d binds=%u bindingResets=%u itemRunning=%d itemState=%08X renderId=%d renderName=\"%s\" faceDraws=%u panelDraws=%u control=%s plainCard=%d\n",
 		time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond,
 		phase, success ? 1 : 0, GetTickCount64() - started, captures, Card::kPhotoSlot, Card::kPhotoCacheType,
 		lastPhotoStage, C.photoDownload, C.photoDownloadStatus, C.photoRequestAttempts, observedName,
@@ -720,8 +722,9 @@ static void LogPhotoCacheTest(const char* phase, bool success, ULONGLONG started
 		C.photoBusyAfterCleanup ? 1 : 0, C.photoBusyAtRequest ? 1 : 0, PED::_GET_NUM_FREE_SLOTS_IN_PED_POOL(),
 		observedCard, cardOwned ? 1 : 0, observedCard && ENTITY::DOES_ENTITY_EXIST(observedCard) ? 1 : 0,
 		photoTestBindAttempts, photoTestBindingTransitions, itemRunning ? 1 : 0, itemState,
-		C.photoCardRenderId, C.photoCardRenderName, C.photoCardFaceDraws, C.photoCardPanelDraws);
-	if (strcmp(phase, "initial") == 0 || strcmp(phase, "B_second_capture") == 0) WritePhotoTiming(file, phase);
+		C.photoCardRenderId, C.photoCardRenderName, C.photoCardFaceDraws, C.photoCardPanelDraws,
+		photoTestControl, photoTestPlainCard ? 1 : 0);
+	if (strcmp(phase, "initial") == 0 || strcmp(phase, "capture") == 0) WritePhotoTiming(file, phase);
 	fclose(file);
 }
 
@@ -736,93 +739,59 @@ static bool ProbeExistingPhoto(char (&name)[64])
 	return WaitUntil(Card::kPhotoNameMs, [&] { return LookupPhotoTexture(Card::kPhotoCacheType, name); });
 }
 
-static bool ProbeBackupPhoto(char (&name)[64])
-{
-	ReleaseTargetPhoto();
-	C.photoRequestAttempts = 0;
-	name[0] = '\0';
-	lastPhotoStage = "probe_backup";
-	return WaitUntil(Card::kPhotoNameMs, [&]
-	{
-		++C.photoRequestAttempts;
-		const char* borrowed = NETWORK::_REQUEST_PEDSHOT_TEXTURE_LOCAL_BACKUP_DOWNLOAD(Card::kPhotoSlot, Card::kPhotoCacheType);
-		if (!borrowed || !*borrowed || strnlen_s(borrowed, sizeof name) >= sizeof name) return false;
-		strcpy_s(name, borrowed); // copy before another native invalidates its return buffer
-		strcpy_s(C.photoLookupName, name);
-		C.photoLookupValid = NETWORK::_TEXTURE_DOWNLOAD_TEXTURE_NAME_IS_VALID(name) != 0;
-		return C.photoLookupValid;
-	});
-}
-
 static bool RunPhotoCacheSelfTest(Ped subject)
 {
+	// A cancelled or failed test must never leave the plain-card switch enabled.
+	struct RestoreControls {
+		~RestoreControls() { photoTestPlainCard = false; photoTestControl = "none"; }
+	} restoreControls;
 	ULONGLONG started = GetTickCount64();
 	unsigned captures = 0;
 	photoTestBindAttempts = 0;
 	photoTestBindingTransitions = 0;
+	photoTestPlainCard = true;
+	photoTestControl = "baseline";
 	char previousName[64] = "";
 	char name[64] = "";
 	LogPhotoCacheTest("begin", true, started, captures, previousName, name);
-	// Caller releases any remaining handle and removes this one provisional ped,
-	// including when a wait is interrupted. A failed probe is a completed test.
+	// Caller releases the final download and removes the single provisional ped.
+	// Probe failure completes the test; player interruption cancels it.
 	if (!PlayerAvailable()) return false;
 	bool initial = PhotographPed(subject);
 	++captures;
 	LogPhotoCacheTest("initial", initial, started, captures, previousName, C.photoLookupName);
 	if (!initial || !PlayerAvailable()) return PlayerAvailable();
-	strcpy_s(previousName, C.photoTexture);
 
-	bool inspected = ProbePhotoCard(started, captures);
-	if (inspected && C.photoTexture[0]) strcpy_s(previousName, C.photoTexture);
-	LogPhotoCacheTest("card_inspection", inspected, started, captures, previousName, C.photoLookupName);
-	if (!inspected || !PlayerAvailable()) return PlayerAvailable();
-
-	bool reopened = ProbeExistingPhoto(name);
-	LogPhotoCacheTest("A_reopen_without_write", reopened, started, captures, previousName, name);
-	if (!PlayerAvailable()) return false;
-	if (reopened)
-	{
-		strcpy_s(previousName, name); // invalidate the latest accepted consumer name if B fails
-		// PhotographPed releases A's owned handle before writing again. Keep the
-		// same subject so later recovery cannot accidentally accept an older target.
-		bool rewritten = PhotographPed(subject);
+	auto checkpoint = [&] {
+		strcpy_s(previousName, C.photoTexture);
+		bool reopened = ProbeExistingPhoto(name); // no generation/write in this step
+		LogPhotoCacheTest("reopen_without_write", reopened, started, captures, previousName, name);
+		if (!reopened || !PlayerAvailable()) return false;
+		strcpy_s(previousName, name);
+		bool rewritten = PhotographPed(subject); // same subject and producer, after releasing the reader
 		++captures;
-		LogPhotoCacheTest("B_second_capture", rewritten, started, captures, previousName, C.photoLookupName);
-		if (rewritten || !PlayerAvailable()) return PlayerAvailable();
-		// A producer failure cannot tell us whether a readback workaround works.
-		if (!C.photoWritten || !C.photoWriteComplete) return true;
-	}
+		LogPhotoCacheTest("capture", rewritten, started, captures, previousName, C.photoLookupName);
+		return rewritten && PlayerAvailable();
+	};
+	if (!checkpoint()) return PlayerAvailable();
 
-	ReleaseTargetPhoto();
-	if (previousName[0])
+	const char* controls[] = { "unbound_object", "plain_inspection", "bound_object", "portrait_inspection" };
+	for (unsigned i = 0; i < 4; ++i)
 	{
-		// Experimental control based on pause_menu's mugshot invalidation. Only
-		// the exact name returned by our own successful download may be released.
-		lastPhotoStage = "probe_name_invalidation";
-		bool validBefore = NETWORK::_TEXTURE_DOWNLOAD_TEXTURE_NAME_IS_VALID(previousName) != 0;
-		LogPhotoCacheTest("C_before_name_release", validBefore, started, captures, previousName, "");
 		if (!PlayerAvailable()) return false;
-		NETWORK::_TEXTURE_DOWNLOAD_RELEASE_BY_NAME(previousName);
-		bool invalidated = WaitUntil(Card::kPhotoNameMs, [&]
-		{
-			return !NETWORK::_TEXTURE_DOWNLOAD_TEXTURE_NAME_IS_VALID(previousName);
-		});
-		LogPhotoCacheTest(validBefore ? "C_name_invalidation" : "C_name_already_invalid",
-			invalidated, started, captures, previousName, "");
-		if (!PlayerAvailable()) return false;
-		if (invalidated)
-		{
-			bool recovered = ProbeExistingPhoto(name); // deliberately no generate/write
-			LogPhotoCacheTest("C_reopen_without_write", recovered, started, captures, previousName, name);
-			if (recovered || !PlayerAvailable()) return PlayerAvailable();
-		}
+		photoTestControl = controls[i];
+		photoTestPlainCard = i < 2;
+		photoTestBindAttempts = 0;
+		photoTestBindingTransitions = 0;
+		C.photoCardRenderId = 0;
+		C.photoCardRenderName[0] = '\0';
+		C.photoCardFaceDraws = C.photoCardPanelDraws = 0;
+		bool consumed = (i % 2 == 0) ? ProbePhotoObject(started, captures) : ProbePhotoCard(started, captures);
+		LogPhotoCacheTest("consumer", consumed, started, captures, "", C.photoLookupName);
+		if (!consumed || !PlayerAvailable()) return PlayerAvailable();
+		if (!checkpoint()) return PlayerAvailable(); // never test another consumer against a failed cache
 	}
-
-	// Last, after C: this probes backup recovery after name invalidation, not an
-	// independent untouched-cache control. It provides no explicit owned handle.
-	// Never put its name in C.photoTexture, which would start normal handle polling.
-	bool backup = ProbeBackupPhoto(name);
-	LogPhotoCacheTest("D_backup_without_write", backup, started, captures, previousName, name);
+	LogPhotoCacheTest("complete", true, started, captures, "", C.photoLookupName);
 	return PlayerAvailable();
 }
 #endif
@@ -884,6 +853,9 @@ static Ped SpawnTargetWithPhoto(Hash model, const ContractDef& def)
 // confirms the model took it; otherwise release it and try the next candidate.
 static void LinkCardRenderTarget(Hash cardModel)
 {
+#ifdef BOUNTY_PHOTO_SELF_TEST
+	if (photoTestPlainCard) return;
+#endif
 	if (!Tune::kCardFaceRenderTarget) return;
 	for (const char* name : Card::kRenderTargetNames)
 	{
@@ -1053,6 +1025,9 @@ static bool AttachCardToHand(Ped holder)
 // so this must be the LAST thing drawn in the frame. Corpse photo = the same portrait in a dead, faded tint.
 static void DrawCardFace(bool corpse)
 {
+#ifdef BOUNTY_PHOTO_SELF_TEST
+	if (photoTestPlainCard) return;
+#endif
 	if (!Cd.renderId || !TargetPhotoReady()) return;
 #ifdef BOUNTY_PHOTO_SELF_TEST
 	C.photoCardRenderId = Cd.renderId;
@@ -1072,6 +1047,9 @@ static void DrawCardFace(bool corpse)
 // this native returns void, so customApplied records an attempt, not an engine acknowledgment.
 static void ApplyCardCustomTexture()
 {
+#ifdef BOUNTY_PHOTO_SELF_TEST
+	if (photoTestPlainCard) return;
+#endif
 	if (!Card::kCardCustomTexture || !Cd.obj || !ENTITY::DOES_ENTITY_EXIST(Cd.obj) || !TargetPhotoReady()) return;
 	ULONGLONG now = RuntimeNowMs();
 	if (!Cd.customApplied)
@@ -1106,6 +1084,9 @@ static void RefreshCardTextureAfterTransition()
 // The "back" of the card: a screen-space panel with the portrait, who the target is, where he is, and the pay.
 static void DrawCardBackPanel()
 {
+#ifdef BOUNTY_PHOTO_SELF_TEST
+	if (photoTestPlainCard) return;
+#endif
 	if (!C.def) return;
 	GRAPHICS::DRAW_RECT(0.50f, 0.50f, 0.40f, 0.34f, 18, 14, 11, 225, false, false);
 	if (TargetPhotoReady())
@@ -1182,7 +1163,8 @@ static bool ProbePhotoCard(ULONGLONG started, unsigned captures)
 		DestroyCardObject(true);
 		return false;
 	}
-	DisplaySubtitle("PHOTO TEST: FLIP THE CARD, THEN PUT IT AWAY.");
+	DisplaySubtitle(photoTestPlainCard ? "PHOTO TEST: STOCK CARD EXPECTED. PUT IT AWAY WITHOUT FLIPPING."
+		: "PHOTO TEST: CHECK THE PORTRAIT, THEN PUT IT AWAY WITHOUT FLIPPING.");
 	bool putAway = WaitUntil(60000, []
 	{
 		if (HUD::IS_PAUSE_MENU_ACTIVE()) return false;
@@ -1201,6 +1183,59 @@ static bool ProbePhotoCard(ULONGLONG started, unsigned captures)
 	});
 	LogPhotoCacheTest("card_removed", retired, started, captures, "", C.photoLookupName, originalCard, owned);
 	return putAway && retired && PlayerAvailable();
+}
+
+// Match the unbound/bound object lifetime without starting an item-interaction task.
+// Keep it visible for the full binding schedule; an invisible prop would not test material use.
+static bool ProbePhotoObject(ULONGLONG started, unsigned captures)
+{
+	lastPhotoStage = "probe_object";
+	if (!CanStartInteraction() || Cd.obj) return false;
+	bool created = CreateCardObject();
+	Object originalCard = Cd.obj;
+	bool owned = Cd.ownsObj;
+	LogPhotoCacheTest("object_created", created, started, captures, "", C.photoLookupName, originalCard, owned);
+	if (!created) { DestroyCardObject(); return false; }
+	ENTITY::FREEZE_ENTITY_POSITION(originalCard, true);
+	Vector3 camera = CAMERA::GET_GAMEPLAY_CAM_COORD();
+	Vector3 rotation = CAMERA::GET_GAMEPLAY_CAM_ROT(2);
+	float pitch = rotation.x * 0.01745329252f, yaw = rotation.z * 0.01745329252f;
+	ENTITY::SET_ENTITY_COORDS(originalCard,
+		camera.x - std::sin(yaw) * std::cos(pitch) * 0.75f,
+		camera.y + std::cos(yaw) * std::cos(pitch) * 0.75f,
+		camera.z + std::sin(pitch) * 0.75f, false, false, false, false);
+	ENTITY::SET_ENTITY_ROTATION(originalCard, rotation.x, rotation.y, rotation.z, 2, true);
+	DisplaySubtitle("PHOTO TEST: AUTOMATIC CARD CHECK. PLEASE WAIT.");
+	ULONGLONG until = GetTickCount64() + 2000;
+	bool interrupted = false, seenOnScreen = false;
+	bool held = WaitUntil(2200, [&] {
+		interrupted = interrupted || TASK::IS_PED_RUNNING_TASK_ITEM_INTERACTION(pedMe) ||
+			HUD::IS_PAUSE_MENU_ACTIVE() || !CAMERA::IS_SCREEN_FADED_IN();
+		seenOnScreen = seenOnScreen || ENTITY::IS_ENTITY_ON_SCREEN(originalCard);
+		return interrupted || !ENTITY::DOES_ENTITY_EXIST(originalCard) || GetTickCount64() >= until;
+	});
+	held = held && !interrupted && seenOnScreen && ENTITY::DOES_ENTITY_EXIST(originalCard);
+	LogPhotoCacheTest("object_on_screen", seenOnScreen, started, captures, "", C.photoLookupName, originalCard, owned);
+	LogPhotoCacheTest("object_held", held, started, captures, "", C.photoLookupName, originalCard, owned);
+	// Delete through a temporary handle. Keep Cd's ownership until existence confirms
+	// retirement, even when the native clears its argument before deletion completes.
+	Object attempt = originalCard;
+	OBJECT::DELETE_OBJECT(&attempt);
+	ULONGLONG nextDelete = GetTickCount64() + 250;
+	bool retired = WaitUntil(1500, [&] {
+		if (!ENTITY::DOES_ENTITY_EXIST(originalCard)) return true;
+		if (GetTickCount64() >= nextDelete)
+		{
+			nextDelete = GetTickCount64() + 250;
+			Object retry = originalCard;
+			OBJECT::DELETE_OBJECT(&retry);
+		}
+		return !ENTITY::DOES_ENTITY_EXIST(originalCard);
+	});
+	if (retired) DestroyCardObject(); // release any named target and reset the confirmed-gone prop
+	LogPhotoCacheTest("object_removed", retired, started, captures, "", C.photoLookupName, originalCard, owned);
+	WAIT(0); // let rendering advance after confirmed retirement, before another capture
+	return held && retired && PlayerAvailable();
 }
 #endif
 

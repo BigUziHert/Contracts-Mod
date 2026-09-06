@@ -34,7 +34,8 @@ foreach ($bountyFunction in @('ApplyCardCustomTexture', 'RefreshCardTextureAfter
 foreach ($bountyPattern in @(
     '(?ms)^template<typename Pred> static bool WaitUntil\(DWORD timeoutMs, Pred pred\)\s*\{.*?^\}',
     '(?ms)^static bool EnsureTargetPhotoReady\(\)\s*\{.*?^\}',
-    '(?ms)^static bool ProbePhotoCard\(ULONGLONG started, unsigned captures\)\s*\{.*?^\}'
+    '(?ms)^static bool ProbePhotoCard\(ULONGLONG started, unsigned captures\)\s*\{.*?^\}',
+    '(?ms)^static bool ProbePhotoObject\(ULONGLONG started, unsigned captures\)\s*\{.*?^\}'
 )) {
     $bountyMatches = [regex]::Matches($bountySource, $bountyPattern)
     if ($bountyMatches.Count -ne 1) { throw 'Expected exactly one production readiness gate or wait function.' }
@@ -54,9 +55,21 @@ if ([regex]::Matches($bountyExactHeader, $bountyApplyPattern).Count -ne 1) {
 $bountyOldHeader = [regex]::Replace($bountyExactHeader, $bountyApplyPattern, ('$0' + "`r`n    if (Cd.customApplied) return;"))
 [IO.File]::WriteAllText((Join-Path $bountyOutput 'card_texture_old_under_test.h'), $bountyOldHeader)
 
+# Removing only the diagnostic material guard must fail the plain-card isolation test.
+$bountyPlainGuardPattern = '(?m)^[ \t]*if \(photoTestPlainCard\) return;[ \t]*\r?$'
+if ([regex]::Matches($bountyExactHeader, $bountyPlainGuardPattern).Count -ne 1) {
+    throw 'Expected exactly one diagnostic plain-card material guard.'
+}
+$bountyNoPlainGuardHeader = [regex]::Replace($bountyExactHeader, $bountyPlainGuardPattern, '')
+[IO.File]::WriteAllText((Join-Path $bountyOutput 'card_texture_no_plain_guard_under_test.h'), $bountyNoPlainGuardHeader)
+
 $bountyCommands = @('@echo off', ('call "{0}" >nul' -f $bountyVcVars), 'if errorlevel 1 exit /b 1')
-foreach ($bountyVariant in @('card_texture_tests', 'card_texture_old_control')) {
-    $bountyExtra = if ($bountyVariant -eq 'card_texture_old_control') { '/DCARD_TEXTURE_OLD_ONESHOT' } else { '' }
+foreach ($bountyVariant in @('card_texture_tests', 'card_texture_old_control', 'card_texture_plain_guard_control')) {
+    $bountyExtra = switch ($bountyVariant) {
+        'card_texture_old_control' { '/DCARD_TEXTURE_OLD_ONESHOT' }
+        'card_texture_plain_guard_control' { '/DCARD_TEXTURE_NO_PLAIN_GUARD' }
+        default { '' }
+    }
     $bountyCommands += 'cl /nologo /std:c++20 /EHsc /W4 /WX /MT /Od /DBOUNTY_PHOTO_SELF_TEST {0} /I"{1}" /Fo"{2}" /Fe"{3}" "{4}"' -f `
         $bountyExtra, $bountyOutput, (Join-Path $bountyOutput ($bountyVariant + '.obj')), `
         (Join-Path $bountyOutput ($bountyVariant + '.exe')), (Join-Path $PSScriptRoot 'card_texture_tests.cpp')
@@ -66,6 +79,9 @@ $bountyCommands += '"' + (Join-Path $bountyOutput 'card_texture_tests.exe') + '"
 $bountyCommands += 'if errorlevel 1 exit /b 1'
 $bountyControlLog = Join-Path $bountyOutput 'card_texture_old_control.log'
 $bountyCommands += '"{0}" >"{1}" 2>&1' -f (Join-Path $bountyOutput 'card_texture_old_control.exe'), $bountyControlLog
+$bountyCommands += 'if not errorlevel 1 exit /b 1'
+$bountyPlainControlLog = Join-Path $bountyOutput 'card_texture_plain_guard_control.log'
+$bountyCommands += '"{0}" >"{1}" 2>&1' -f (Join-Path $bountyOutput 'card_texture_plain_guard_control.exe'), $bountyPlainControlLog
 $bountyCommands += 'if not errorlevel 1 exit /b 1'
 $bountyCommands += 'exit /b 0'
 $bountyCommandFile = Join-Path $bountyOutput 'run-card-texture-tests.cmd'
@@ -77,3 +93,8 @@ if ([IO.File]::ReadAllText($bountyControlLog).Trim() -ne $bountyExpectedFailure)
     throw 'One-shot control did not fail at the expected material-reset regression.'
 }
 Write-Host 'One-shot regression control rejected at the expected native material reset.'
+$bountyPlainExpectedFailure = 'FAILED: plain-card transition suppresses material binding'
+if ([IO.File]::ReadAllText($bountyPlainControlLog).Trim() -ne $bountyPlainExpectedFailure) {
+    throw 'Plain-card guard removal did not fail at the expected material-isolation regression.'
+}
+Write-Host 'Plain-card guard removal rejected at the expected material-isolation regression.'
