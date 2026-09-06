@@ -19,6 +19,8 @@
     <ClInclude Include="..\..\inc\types.h" />
     <ClInclude Include="common.hpp" />
     <ClInclude Include="contract_data.h" />
+    <ClInclude Include="target_ai_logic.h" />
+    <ClInclude Include="handoff_logic.h" />
     <ClInclude Include="keyboard.h" />
     <ClInclude Include="script.h" />
     <ClInclude Include="global.h" />

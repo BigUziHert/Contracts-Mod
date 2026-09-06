@@ -16,12 +16,14 @@
 #include "global.h"
 #include "keyboard.h"
 #include "contract_data.h"
+#include "target_ai_logic.h"
+#include "handoff_logic.h"
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 
 // ===== [ STATE ] =====
 enum ContractState { CONTRACT_NONE, CONTRACT_UNKNOWN, CONTRACT_FOUND, CONTRACT_DEAD, CONTRACT_PAID };
-enum TargetTask    { TARGET_WANDER, TARGET_AGGRO };
 
 struct ActiveContract
 {
@@ -32,9 +34,10 @@ struct ActiveContract
 	Blip       targetBlip = 0;          // entity blip once found, corpse blip once dead
 	bool       corpseBlipPlaced = false;
 	bool       trailsActive = false;
-	TargetTask task = TARGET_WANDER;
-	bool       remembersPlayer = false; // once aggroed, re-aggros on sight alone
-	ULONGLONG  lastContactMs = 0;       // last time the target saw / was near the player
+	TargetAI::Memory ai;
+	Vector3    lastKnownPlayerPos;
+	Hash       weapon = 0;             // one loadout per target, retained across encounters
+	bool       damagedByPlayer = false; // current tick's consumed damage event
 
 	// timeline + law, for the payout
 	ULONGLONG  startMs = 0;             // Get Contract
@@ -51,14 +54,15 @@ struct ActiveContract
 	char        photoTexture[64] = "";  // texture name to draw ("" = none)
 	bool        photoWritten = false;
 	bool        photoUploadPending = false, photoCommitReady = false, photoTextureValid = false;
-	ULONGLONG   cardOpenAtMs = 0;       // deferred card examine (after the handoff anim)
+	bool        cardOpenPending = false;
 
 	// hand-in
 	int        payoutCents = 0;
 	Ped        payingGiver = 0;
 	ULONGLONG  handInStartMs = 0;
 	bool       cashSpawned = false;
-	Object     cashObj = 0;
+	Object     cashObj = 0;            // decorative cash; only SettlePayment credits the reward
+	bool       paymentCredited = false;
 };
 
 // The card prop while it is out (being examined, or in hand during the hand-in).
@@ -70,6 +74,8 @@ struct CardRuntime
 	bool        inHand = false;
 	ULONGLONG   openedMs = 0;
 	int         renderId = 0;
+	const char* ownedRenderTarget = nullptr;
+	Ped         inspectingPed = 0;
 	bool        customApplied = false; // SET_CUSTOM_TEXTURES_ON_OBJECT tried on this object
 };
 
@@ -84,6 +90,38 @@ static Vector3 playerPos;
 static Prompt giverPrompt = 0;
 static Prompt camPrompt = 0;
 static Hash   camGroup = 0;
+static ULONGLONG giverCooldownUntilMs = 0;
+
+struct HandoffRuntime
+{
+	bool active = false;
+	bool payout = false;
+	Ped giver = 0;
+	Ped player = 0;
+	Handoff::Memory progress;
+	Handoff::Config config;
+};
+static HandoffRuntime handoff;
+static void StopHandoff();
+
+// Gameplay deadlines freeze while menus/loading suspend the loop. Streaming waits below
+// deliberately use wall time so they still have a bounded failure path.
+static ULONGLONG pausedDurationMs = 0;
+static ULONGLONG pauseStartedMs = 0;
+static void SetRuntimePaused(bool paused)
+{
+	ULONGLONG now = GetTickCount64();
+	if (paused && !pauseStartedMs) pauseStartedMs = now;
+	else if (!paused && pauseStartedMs)
+	{
+		pausedDurationMs += now - pauseStartedMs;
+		pauseStartedMs = 0;
+	}
+}
+static ULONGLONG RuntimeNowMs()
+{
+	return (pauseStartedMs ? pauseStartedMs : GetTickCount64()) - pausedDurationMs;
+}
 
 // ===== [ SMALL HELPERS ] =====
 static float DistSq(const Vector3& a, const Vector3& b)
@@ -95,6 +133,17 @@ static bool Within(const Vector3& a, const Vector3& b, float dist) { return Dist
 
 static bool TargetExists() { return C.target && ENTITY::DOES_ENTITY_EXIST(C.target); }
 static bool ContractActive() { return g_state == CONTRACT_UNKNOWN || g_state == CONTRACT_FOUND || g_state == CONTRACT_DEAD; }
+static bool LivingPed(Ped ped) { return ped && ENTITY::DOES_ENTITY_EXIST(ped) && !PED::IS_PED_DEAD_OR_DYING(ped, true); }
+static bool PlayerAvailable() { return LivingPed(pedMe) && PLAYER::PLAYER_PED_ID() == pedMe; }
+static bool CanStartInteraction()
+{
+	return PlayerAvailable() && !HUD::IS_PAUSE_MENU_ACTIVE() && !CAMERA::IS_SCREEN_FADED_OUT() &&
+		PLAYER::IS_PLAYER_CONTROL_ON(me) && PED::IS_PED_ON_FOOT(pedMe) &&
+		!PED::IS_PED_IN_COMBAT(pedMe, 0) &&
+		!PED::IS_PED_RAGDOLL(pedMe) && !TASK::IS_PED_GETTING_UP(pedMe) &&
+		!PED::IS_PED_HOGTIED(pedMe) && !PED::IS_PED_LASSOED(pedMe) &&
+		!TASK::IS_PED_RUNNING_TASK_ITEM_INTERACTION(pedMe);
+}
 
 static const char* Literal(const char* text) { return MISC::VAR_STRING(10, "LITERAL_STRING", text); }
 
@@ -110,6 +159,7 @@ static void RemoveBlip(Blip& blip)
 
 static void ShowPrompt(Prompt prompt, bool show)
 {
+	if (!prompt || !HUD::_UI_PROMPT_IS_VALID(prompt)) return;
 	HUD::_UI_PROMPT_SET_ENABLED(prompt, show);
 	HUD::_UI_PROMPT_SET_VISIBLE(prompt, show);
 }
@@ -129,21 +179,12 @@ template<typename Pred> static bool WaitUntil(DWORD timeoutMs, Pred pred)
 	ULONGLONG deadline = GetTickCount64() + timeoutMs;
 	for (;;)
 	{
+		if (!PlayerAvailable()) return false;
 		MaintainPortraitAndCard();
 		if (pred()) return true;
 		if (GetTickCount64() >= deadline) return false;
 		WAIT(0);
 	}
-}
-
-static void PlayAnimOnPed(Ped ped, const char* dict, const char* name, float blendIn, float blendOut, int duration, int flags)
-{
-	STREAMING::REQUEST_ANIM_DICT(dict);
-	if (!WaitUntil(Tune::kStreamTimeoutMs, [&] { return STREAMING::HAS_ANIM_DICT_LOADED(dict) != 0; })) return;
-	TASK::CLEAR_PED_SECONDARY_TASK(ped);
-	TASK::TASK_PLAY_ANIM(ped, dict, name, blendIn, blendOut, duration, flags, 0.0f, 0,
-		AIK_DISABLE_ARM_IK | AIK_DISABLE_TORSO_REACT_IK | AIK_DISABLE_TORSO_IK | AIK_DISABLE_HEAD_IK | AIK_DISABLE_LEG_IK, 0, 0, 0);
-	STREAMING::REMOVE_ANIM_DICT(dict);
 }
 
 static bool LoadModel(Hash model)
@@ -158,8 +199,11 @@ static Ped SpawnPed(Hash model, const Vector3& pos)
 {
 	if (!LoadModel(model)) return 0;
 	Ped ped = PED::CREATE_PED(model, pos, 0.0f, 0, 1, 1, 1);
-	PED::_SET_RANDOM_OUTFIT_VARIATION(ped, true);
-	ENTITY::PLACE_ENTITY_ON_GROUND_PROPERLY(ped, 1);
+	if (ped && ENTITY::DOES_ENTITY_EXIST(ped))
+	{
+		PED::_SET_RANDOM_OUTFIT_VARIATION(ped, true);
+		ENTITY::PLACE_ENTITY_ON_GROUND_PROPERLY(ped, 1);
+	}
 	STREAMING::SET_MODEL_AS_NO_LONGER_NEEDED(model);
 	return ENTITY::DOES_ENTITY_EXIST(ped) ? ped : 0;
 }
@@ -204,8 +248,8 @@ static void MaintainPortraitAndCard()
 {
 	if (C.photoTexture[0] && C.photoTextureValid)
 		NETWORK::_REQUEST_PEDSHOT_TEXTURE_LOCAL_BACKUP_DOWNLOAD(Card::kPhotoSlot, C.photoCacheType);
-	if (Cd.examining && pedMe)
-		PED::_SET_PED_BLACKBOARD_BOOL(pedMe, Card::kFlipBlackboard, true, -1);
+	if (Cd.examining && Cd.inspectingPed && ENTITY::DOES_ENTITY_EXIST(Cd.inspectingPed))
+		PED::_SET_PED_BLACKBOARD_BOOL(Cd.inspectingPed, Card::kFlipBlackboard, true, -1);
 }
 
 // Copy the borrowed name before invoking another native; a nonempty name alone is not ready.
@@ -338,11 +382,14 @@ static void LinkCardRenderTarget(Hash cardModel)
 	if (!Tune::kCardFaceRenderTarget) return;
 	for (const char* name : Card::kRenderTargetNames)
 	{
-		if (!HUD::IS_NAMED_RENDERTARGET_REGISTERED(name)) HUD::REGISTER_NAMED_RENDERTARGET(name, false);
+		// Never take over or release another script's registration.
+		if (HUD::IS_NAMED_RENDERTARGET_REGISTERED(name)) continue;
+		if (!HUD::REGISTER_NAMED_RENDERTARGET(name, false)) continue;
 		HUD::LINK_NAMED_RENDERTARGET(cardModel);
 		if (HUD::IS_NAMED_RENDERTARGET_LINKED(cardModel))
 		{
 			Cd.renderId = HUD::GET_NAMED_RENDERTARGET_RENDER_ID(name);
+			Cd.ownedRenderTarget = name;
 			return;
 		}
 		if (HUD::IS_NAMED_RENDERTARGET_REGISTERED(name)) HUD::RELEASE_NAMED_RENDERTARGET(name);
@@ -362,7 +409,7 @@ static void SetCardTitle(Object obj)
 
 static bool CreateCardObject()
 {
-	if (Cd.obj) return true;
+	if (Cd.obj) return ENTITY::DOES_ENTITY_EXIST(Cd.obj) != 0;
 	if (!LoadModel(Card::kPropModel)) return false;
 	Cd.obj = OBJECT::CREATE_OBJECT(Card::kPropModel, ENTITY::GET_OFFSET_FROM_ENTITY_IN_WORLD_COORDS(pedMe, 0.0f, 0.5f, 0.0f), true, true, true, false, false);
 	STREAMING::SET_MODEL_AS_NO_LONGER_NEEDED(Card::kPropModel);
@@ -373,26 +420,43 @@ static bool CreateCardObject()
 	return true;
 }
 
-static void DestroyCardObject()
+static bool OwnCardTaskRunning()
 {
+	return Cd.inspectingPed && ENTITY::DOES_ENTITY_EXIST(Cd.inspectingPed) && Cd.obj &&
+		TASK::IS_PED_RUNNING_TASK_ITEM_INTERACTION(Cd.inspectingPed) &&
+		TASK::_GET_ITEM_INTERACTION_ENTITY_FROM_PED(Cd.inspectingPed, Card::kPrimaryItem) == Cd.obj;
+}
+
+static void DestroyCardObject(bool cancelInspection = false)
+{
+	if (cancelInspection && OwnCardTaskRunning())
+	{
+		TASK::_SET_ITEM_INTERACTION_STATE(Cd.inspectingPed, Card::kStateOutro, 0.25f);
+		if (!WaitUntil(1200, [] { return !OwnCardTaskRunning(); }) && OwnCardTaskRunning())
+			TASK::CLEAR_PED_TASKS(Cd.inspectingPed, true, false);
+	}
+	if (Cd.inspectingPed && ENTITY::DOES_ENTITY_EXIST(Cd.inspectingPed))
+		PED::_SET_PED_BLACKBOARD_BOOL(Cd.inspectingPed, Card::kFlipBlackboard, false, -1);
 	if (Cd.obj && Cd.ownsObj && ENTITY::DOES_ENTITY_EXIST(Cd.obj))
 	{
 		if (ENTITY::IS_ENTITY_ATTACHED(Cd.obj)) ENTITY::DETACH_ENTITY(Cd.obj, true, false);
 		OBJECT::DELETE_OBJECT(&Cd.obj);
 	}
+	if (Cd.ownedRenderTarget) HUD::RELEASE_NAMED_RENDERTARGET(Cd.ownedRenderTarget);
 	Cd = CardRuntime();
 }
-
-static bool CardTaskRunning() { return TASK::IS_PED_RUNNING_TASK_ITEM_INTERACTION(pedMe) != 0; }
 
 // Player takes the card out and examines it (Zoom / Flip / Put Away are the game's own prompts).
 // Uses generic_photograph, prop p_cs_photonudie05x_4x6, slot primaryItem and paper-inspect states;
 // Flip comes from the GENERIC_DOCUMENT_FLIP_AVAILABLE blackboard flag.
 //  Path 1 holds our own card through _TASK_ITEM_INTERACTION_2; if that task refuses to start, path 2 lets the
 //  game spawn the item's own prop (how R* document scripts do it) and takes that prop over.
-static bool OpenCard()
+static bool OpenCard(bool reuseHandoffCard = false)
 {
-	if (Cd.obj || Cd.examining) return false;
+	if (!CanStartInteraction() || Cd.examining || (Cd.obj && !reuseHandoffCard)) return false;
+	if (Cd.obj && ENTITY::IS_ENTITY_ATTACHED(Cd.obj)) ENTITY::DETACH_ENTITY(Cd.obj, true, false);
+	Cd.inHand = false;
+	Cd.inspectingPed = pedMe;
 	Hash item  = Card::kItem;
 	Hash state = Card::kStartState;
 	PED::_SET_PED_BLACKBOARD_BOOL(pedMe, Card::kFlipBlackboard, true, -1);
@@ -405,42 +469,63 @@ static bool OpenCard()
 		bool haveLabel = HUD::DOES_TEXT_LABEL_EXIST(Card::kTitleLabel) != 0;
 		Hash firstParam = haveLabel ? joaat(Card::kTitleLabel) : item;
 		TASK::_TASK_ITEM_INTERACTION_2(pedMe, firstParam, Cd.obj, Card::kPrimaryItem, state, 1, 0, -1.0f);
-		if (WaitUntil(Card::kTaskStartWaitMs * 2, CardTaskRunning))
+		if (WaitUntil(Card::kTaskStartWaitMs * 2, OwnCardTaskRunning))
 		{
 			Cd.examining = true;
-			Cd.openedMs = GetTickCount64();
+			Cd.openedMs = RuntimeNowMs();
 			return true;
 		}
-		DestroyCardObject();
+		DestroyCardObject(true);
 	}
 
+	if (!CanStartInteraction()) return false;
+	Cd.inspectingPed = pedMe;
+	auto abandonFallback = [&] {
+		if (PlayerAvailable())
+		{
+			bool running = TASK::IS_PED_RUNNING_TASK_ITEM_INTERACTION(pedMe) != 0;
+			bool ours = running && TASK::GET_ITEM_INTERACTION_ITEM_ID(pedMe) == item;
+			if (ours) TASK::_SET_ITEM_INTERACTION_STATE(pedMe, Card::kStateOutro, 0.25f);
+			if (!running || ours) PED::_SET_PED_BLACKBOARD_BOOL(pedMe, Card::kFlipBlackboard, false, -1);
+		}
+		Cd.inspectingPed = 0;
+		DestroyCardObject();
+	};
 	TASK::START_TASK_ITEM_INTERACTION(pedMe, item, state, 1, 0, -1.0f);
-	if (!WaitUntil(Card::kTaskStartWaitMs, CardTaskRunning))
+	if (!WaitUntil(Card::kTaskStartWaitMs, [&] {
+		return TASK::IS_PED_RUNNING_TASK_ITEM_INTERACTION(pedMe) && TASK::GET_ITEM_INTERACTION_ITEM_ID(pedMe) == item;
+	}))
 	{
+		abandonFallback();
 		return false;
 	}
 	Entity held = 0;
 	WaitUntil(500, [&] { held = TASK::_GET_ITEM_INTERACTION_ENTITY_FROM_PED(pedMe, Card::kPrimaryItem); return ENTITY::DOES_ENTITY_EXIST(held) != 0; });
-	if (ENTITY::DOES_ENTITY_EXIST(held))
+	if (PlayerAvailable() && TASK::GET_ITEM_INTERACTION_ITEM_ID(pedMe) == item &&
+		ENTITY::DOES_ENTITY_EXIST(held) && ENTITY::GET_ENTITY_MODEL(held) == Card::kPropModel)
 	{
 		Cd.obj = (Object)held;   // the game's prop — it deletes it when the task ends
 		Cd.ownsObj = false;
 		SetCardTitle(Cd.obj);
 		LinkCardRenderTarget(ENTITY::GET_ENTITY_MODEL(Cd.obj));
 	}
+	else { abandonFallback(); return false; }
 	Cd.examining = true;
-	Cd.openedMs = GetTickCount64();
+	Cd.openedMs = RuntimeNowMs();
 	return true;
 }
 
 // Card in the player's hand for the hand-in animation (no examine UI).
-static void AttachCardToHand()
+static bool AttachCardToHand(Ped holder)
 {
-	if (!CreateCardObject()) return;
-	int bone = ENTITY::GET_ENTITY_BONE_INDEX_BY_NAME(pedMe, Card::kHandBone);
-	if (bone < 0) { DestroyCardObject(); return; }
-	ENTITY::ATTACH_ENTITY_TO_ENTITY(Cd.obj, pedMe, bone, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, false, false, false, true, 0, true, false, false);
+	if (!LivingPed(holder) || !CreateCardObject() || !PlayerAvailable() || !LivingPed(holder)) return false;
+	int bone = ENTITY::GET_ENTITY_BONE_INDEX_BY_NAME(holder, Card::kHandBone);
+	if (bone < 0) return false;
+	if (ENTITY::IS_ENTITY_ATTACHED(Cd.obj)) ENTITY::DETACH_ENTITY(Cd.obj, true, false);
+	ENTITY::SET_ENTITY_COLLISION(Cd.obj, false, false);
+	ENTITY::ATTACH_ENTITY_TO_ENTITY(Cd.obj, holder, bone, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, false, false, false, true, 0, true, false, false);
 	Cd.inHand = true;
+	return true;
 }
 
 // The target's portrait, drawn onto the card prop through its render target, the way R*'s photo studio
@@ -490,15 +575,16 @@ static bool CardIsFlipped(Hash state)
 
 static void UpdateCard()
 {
-	ULONGLONG now = GetTickCount64();
-	if (C.cardOpenAtMs && now >= C.cardOpenAtMs)
+	ULONGLONG now = RuntimeNowMs();
+	if (C.cardOpenPending && !handoff.active && CanStartInteraction())
 	{
-		C.cardOpenAtMs = 0;
-		OpenCard();
+		C.cardOpenPending = false;
+		if (!OpenCard(Cd.inHand)) DestroyCardObject();
 	}
+	if (Cd.obj && !ENTITY::DOES_ENTITY_EXIST(Cd.obj)) { DestroyCardObject(); return; }
 	if (Cd.examining)
 	{
-		if (!CardTaskRunning() && now > Cd.openedMs + 1500) { DestroyCardObject(); return; } // put away (or the task ended)
+		if (!OwnCardTaskRunning() && now > Cd.openedMs + 1500) { DestroyCardObject(); return; }
 		PED::_SET_PED_BLACKBOARD_BOOL(pedMe, Card::kFlipBlackboard, true, -1); // the inspect task reads this while it runs
 		if (Cd.obj) SetCardTitle(Cd.obj);                                     // the task resets the prop's name on start
 		ApplyCardCustomTexture();
@@ -508,18 +594,19 @@ static void UpdateCard()
 	else if (Cd.inHand)
 	{
 		ApplyCardCustomTexture();
-		DrawCardFace(true);
+		DrawCardFace(g_state == CONTRACT_DEAD || g_state == CONTRACT_PAID);
 	}
 }
 
 // ===== [ HUMAN TARGET: SETUP ] =====
 static void StartWander(Ped ped, const ContractDef& def)
 {
-	TASK::CLEAR_PED_TASKS(ped, true, true);
+	PED::SET_PED_CONFIG_FLAG(ped, 233, false);
+	PED::SET_PED_COMBAT_ATTRIBUTES(ped, 5, false);
 	TASK::SET_PED_PATH_PREFER_TO_AVOID_WATER(ped, true, def.searchRadius);
 	TASK::SET_PED_PATH_MAY_ENTER_WATER(ped, false);
 	TASK::TASK_WANDER_IN_AREA(ped, def.spawn, def.searchRadius, 0.0f, 0.0f, 1);
-	C.task = TARGET_WANDER;
+	PED::SET_PED_KEEP_TASK(ped, true);
 }
 
 static void SetupHumanTarget(Ped ped, const ContractDef& def)
@@ -538,30 +625,23 @@ static void SetupHumanTarget(Ped ped, const ContractDef& def)
 		{ 467, true  }, // DisableHonorModifiers
 		{ 0,   true  }, // AllowMedicsToAttend
 		{ 289, true  }, // TreatDislikeAsHateWhenInCombat
-		{ 225, false }, // ??
 		{ 437, false }, // DisableWeatherConditionPerceptionChecks
-		{ 442, true  },
-		{ 233, true  }, // PedIsEnemyToPlayer — ON on purpose: off makes him a robbable civilian that cowers when
-		                //   aimed at. De-aggro clears it; re-aggro / the combat bridge set it again.
 		{ 351, true  }, // DisableIntimidationBackingAway
 		{ 356, true  }, // BlockRobberyInteractionEscape
 	};
 	for (const auto& f : kConfig) PED::SET_PED_CONFIG_FLAG(ped, f.flag, f.on);
 
-	PED::SET_PED_COMBAT_RANGE(ped, CR_VERY_FAR);
+	PED::SET_PED_COMBAT_RANGE(ped, CR_MEDIUM);
 	PED::SET_PED_COMBAT_MOVEMENT(ped, 1);
 
 	static const struct { int attr; bool on; } kCombat[] = {
 		{ 114, true  }, // CA_CAN_EXECUTE_TARGET
 		{ 41,  true  }, // CA_CAN_COMMANDEER_VEHICLES
-		{ 125, true  }, // CA_QUIT_WHEN_TARGET_FLEES_INTERACTION_FIGHT
-		{ 21,  false }, // CA_CAN_CHASE_TARGET_ON_FOOT
-		{ 93,  false }, // CA_PREFER_MELEE
-		{ 54,  true  }, // CA_ALWAYS_EQUIP_BEST_WEAPON
+		{ 125, false }, // continue pursuit after an interaction fight
+		{ 21,  true  }, // CA_CAN_CHASE_TARGET_ON_FOOT
 		{ 12,  true  }, // CA_BLIND_FIRE_IN_COVER
-		{ 5,   true  }, // CA_ALWAYS_FIGHT
 		{ 17,  false }, // CA_ALWAYS_FLEE
-		{ 14,  false }, // CA_CAN_INVESTIGATE
+		{ 14,  true  }, // CA_CAN_INVESTIGATE
 		{ 58,  true  }, // CA_DISABLE_FLEE_FROM_COMBAT
 		{ 46,  true  }, // CA_CAN_FIGHT_ARMED_PEDS_WHEN_NOT_ARMED
 		{ 28,  true  }, // CA_CAN_USE_FRUSTRATED_ADVANCE — push in instead of giving up
@@ -574,46 +654,31 @@ static void SetupHumanTarget(Ped ped, const ContractDef& def)
 	PED::SET_PED_FLEE_ATTRIBUTES(ped, 16384, true);
 	PED::SET_PED_FLEE_ATTRIBUTES(ped, 32768, false); // on = lets him cower / flee; off so he fights (rdr2mods forum)
 
-	WEAPON::GIVE_WEAPON_TO_PED(ped, WEAPON_REVOLVER_CATTLEMAN, 60, false, true, 0, true, 0.0f, 0.0f, ADD_REASON_DEFAULT, false, 0.0f, false);
-	WEAPON::GIVE_WEAPON_TO_PED(ped, WEAPON_MELEE_KNIFE, 0, false, true, 0, true, 0.0f, 0.0f, ADD_REASON_DEFAULT, false, 0.0f, false);
+	C.weapon = (rand() % 100) >= Tune::kArmedChancePct ? joaat("WEAPON_UNARMED")
+		: (rand() % 100) < Tune::kGunVsKnifePct ? WEAPON_REVOLVER_CATTLEMAN : WEAPON_MELEE_KNIFE;
+	bool melee = C.weapon != WEAPON_REVOLVER_CATTLEMAN;
+	PED::SET_PED_COMBAT_ATTRIBUTES(ped, 93, melee);
+	PED::SET_PED_COMBAT_ATTRIBUTES(ped, 54, !melee);
+	if (C.weapon != joaat("WEAPON_UNARMED"))
+		WEAPON::GIVE_WEAPON_TO_PED(ped, C.weapon, melee ? 0 : 60, false, true, 0, true, 0.0f, 0.0f, ADD_REASON_DEFAULT, false, 0.0f, false);
+	C.lastKnownPlayerPos = def.spawn;
 
 	StartWander(ped, def);
 }
 
 // ===== [ HUMAN TARGET: COMBAT ] =====
-// Picks a weapon (or fists) per the tunables and commits the target to fighting the player.
-static void EnterCombat(Ped ped)
+// Preserve native combat when it has already started. Recovery only reissues the task;
+// it never forces another weapon draw or clears an animation while the ped is getting up.
+static void EnterCombat(Ped ped, bool adoptNativeCombat, bool taskRecovery)
 {
-	TASK::CLEAR_PED_SECONDARY_TASK(ped);
 	PED::SET_PED_CONFIG_FLAG(ped, 233, true);     // PedIsEnemyToPlayer — so his own AI presses the attack
 	PED::SET_PED_COMBAT_ATTRIBUTES(ped, 5, true); // CA_ALWAYS_FIGHT
-
-	Hash weapon;
-	bool melee;
-	if ((rand() % 100) >= Tune::kArmedChancePct)    { weapon = joaat("WEAPON_UNARMED");   melee = true;  }
-	else if ((rand() % 100) < Tune::kGunVsKnifePct) { weapon = WEAPON_REVOLVER_CATTLEMAN; melee = false; }
-	else                                            { weapon = WEAPON_MELEE_KNIFE;        melee = true;  }
-	PED::SET_PED_COMBAT_ATTRIBUTES(ped, 93, melee);  // CA_PREFER_MELEE: keep the knife / fists out
-	PED::SET_PED_COMBAT_ATTRIBUTES(ped, 54, !melee); // CA_ALWAYS_EQUIP_BEST_WEAPON: don't auto-swap to the revolver
-	WEAPON::SET_CURRENT_PED_WEAPON(ped, weapon, true, WEAPON_ATTACH_POINT_HAND_PRIMARY, false, false);
-
-	PED::SET_COMBAT_FLOAT(ped, 20, 0.0f); // far
-	PED::SET_COMBAT_FLOAT(ped, 21, 0.0f); // near
-	TASK::TASK_COMBAT_PED(ped, pedMe, 0, 0);
+	if (!adoptNativeCombat)
+	{
+		if (!taskRecovery) WEAPON::SET_CURRENT_PED_WEAPON(ped, C.weapon, false, WEAPON_ATTACH_POINT_HAND_PRIMARY, false, false);
+		TASK::TASK_COMBAT_PED(ped, pedMe, 0, 0);
+	}
 	PED::SET_PED_KEEP_TASK(ped, true); // the combat task sticks so he can't drop into flee / cower
-
-	C.task = TARGET_AGGRO;
-	C.remembersPlayer = true;
-	C.lastContactMs = GetTickCount64();
-}
-
-// True if the target has a clear line of sight to the player within his sight range.
-// NOTE: CAN_PED_SEE_ENTITY reported "seen" with no line of sight, and HAS_ENTITY_CLEAR_LOS_TO_ENTITY
-// reports clear at any distance (~190 m) — so: raw LOS trace, capped to sight range.
-static bool TargetCanSeePlayer()
-{
-	return Within(playerPos, C.targetPos, Tune::kReAggroSightDist) &&
-	       ENTITY::HAS_ENTITY_CLEAR_LOS_TO_ENTITY(C.target, pedMe, 17) != 0;
 }
 
 // First contact: he turns hostile when the player aims at or intimidates him while he is looking
@@ -622,47 +687,41 @@ static bool PlayerProvoked(Ped ped)
 {
 	bool looking = PED::IS_PED_HEADTRACKING_PED(ped, pedMe) != 0;
 	return (looking && (PLAYER::IS_PLAYER_FREE_AIMING_AT_ENTITY(me, ped) || PED::_IS_PED_INTIMIDATED(ped)))
-	    || ENTITY::HAS_ENTITY_BEEN_DAMAGED_BY_ENTITY(ped, pedMe, true, true);
+		&& Within(playerPos, C.targetPos, Tune::kReAggroSightDist) &&
+		ENTITY::HAS_ENTITY_CLEAR_LOS_TO_ENTITY(ped, pedMe, 17);
 }
 
 // ===== [ HUMAN TARGET: PER-FRAME AI ] =====
 // Ped tasks are issued on state transitions only — never re-issued per frame (that thrashes the ped AI).
 static void UpdateHumanTarget(Ped ped, const ContractDef& def)
 {
-	switch (C.task)
+	TargetAI::Config config;
+	config.acquireSightDist = Tune::kReAggroSightDist;
+	config.retainSightDist = Tune::kRetainSightDist;
+	config.lossGraceMs = Tune::kDeAggroGraceMs;
+	config.searchMs = Tune::kTargetSearchMs;
+	TargetAI::Observation observation;
+	observation.nowMs = RuntimeNowMs();
+	observation.distance = std::sqrt(DistSq(playerPos, C.targetPos));
+	observation.clearLineOfSight = observation.distance <= config.retainSightDist && ENTITY::HAS_ENTITY_CLEAR_LOS_TO_ENTITY(ped, pedMe, 17);
+	observation.provoked = C.damagedByPlayer || PlayerProvoked(ped);
+	observation.nativeInCombat = PED::IS_PED_IN_COMBAT(ped, pedMe) != 0;
+	int taskStatus = TASK::GET_SCRIPT_TASK_STATUS(ped, joaat("SCRIPT_TASK_COMBAT"), true);
+	observation.combatTaskActive = observation.nativeInCombat || taskStatus == 0 || taskStatus == 1;
+	observation.canAct = !PED::IS_PED_RAGDOLL(ped) && !TASK::IS_PED_GETTING_UP(ped) && !PED::IS_PED_HOGTIED(ped) && !PED::IS_PED_LASSOED(ped);
+	TargetAI::Decision decision = TargetAI::Step(C.ai, config, observation);
+	if (decision.updateLastKnownPosition) C.lastKnownPlayerPos = playerPos;
+	switch (decision.action)
 	{
-	case TARGET_WANDER:
-		if (PED::IS_PED_IN_COMBAT(ped, pedMe))
-		{
-			// His own AI is already fighting the player (antagonised into it): commit him and hand control
-			// to AGGRO so de-aggro governs it. No weapon re-roll — he's already armed and shooting.
-			PED::SET_PED_CONFIG_FLAG(ped, 233, true);
-			PED::SET_PED_COMBAT_ATTRIBUTES(ped, 5, true);
-			PED::SET_PED_KEEP_TASK(ped, true);
-			C.remembersPlayer = true;
-			C.lastContactMs = GetTickCount64();
-			C.task = TARGET_AGGRO;
-		}
-		else if (C.remembersPlayer ? TargetCanSeePlayer() : PlayerProvoked(ped))
-		{
-			EnterCombat(ped);
-		}
+	case TargetAI::Action::Engage: EnterCombat(ped, false, decision.taskRecovery); break;
+	case TargetAI::Action::AdoptCombat: EnterCombat(ped, true, false); break;
+	case TargetAI::Action::Search:
+		PED::SET_PED_CONFIG_FLAG(ped, 233, false);
+		PED::SET_PED_COMBAT_ATTRIBUTES(ped, 5, false);
+		TASK::TASK_GO_TO_COORD_ANY_MEANS(ped, C.lastKnownPlayerPos, 1.5f, 0, false, 0, 0.0f);
 		break;
-
-	case TARGET_AGGRO:
-		if (TargetCanSeePlayer() || Within(playerPos, C.targetPos, Tune::kDeAggroDist))
-		{
-			C.lastContactMs = GetTickCount64();
-		}
-		else if (GetTickCount64() - C.lastContactMs > Tune::kDeAggroGraceMs)
-		{
-			// Lost the player long enough: drop hostility so his combat AI stops hunting, holster and
-			// wander. He still remembers the player, so coming back into sight re-triggers combat.
-			PED::SET_PED_CONFIG_FLAG(ped, 233, false);
-			PED::SET_PED_COMBAT_ATTRIBUTES(ped, 5, false);
-			StartWander(ped, def);
-		}
-		break;
+	case TargetAI::Action::Wander: StartWander(ped, def); break;
+	case TargetAI::Action::None: break;
 	}
 }
 
@@ -672,7 +731,7 @@ const TargetBehavior kHumanTarget = { SetupHumanTarget, UpdateHumanTarget };
 // Longer contracts pay more (linear up to kFullPayMinutes); getting wanted after the crime cuts the pay.
 static int ComputePayoutCents()
 {
-	ULONGLONG end = C.photoMs ? C.photoMs : GetTickCount64();
+	ULONGLONG end = C.photoMs ? C.photoMs : RuntimeNowMs();
 	float minutes = (float)(end - C.startMs) / 60000.0f;
 	float t = minutes / Tune::kFullPayMinutes;
 	if (t < 0.0f) t = 0.0f;
@@ -692,14 +751,13 @@ static void UpdateCrimeTracking()
 	if (!TargetExists()) return;
 	if (!C.crimeMs)
 	{
-		if (PED::IS_PED_IN_COMBAT(C.target, pedMe) || ENTITY::HAS_ENTITY_BEEN_DAMAGED_BY_ENTITY(C.target, pedMe, true, true))
+		if (PED::IS_PED_IN_COMBAT(C.target, pedMe) || C.damagedByPlayer || C.ai.state == TargetAI::State::Engaged)
 		{
-			C.crimeMs = GetTickCount64();
+			C.crimeMs = RuntimeNowMs();
 			C.bountyAtCrime = LAW::GET_BOUNTY(me);
 		}
-		return;
 	}
-	if (!C.gotWanted &&
+	if (C.crimeMs && !C.gotWanted &&
 		(LAW::IS_LAW_INCIDENT_ACTIVE(me) || LAW::GET_WANTED_SCORE(me) > 0 || LAW::GET_BOUNTY(me) > C.bountyAtCrime))
 	{
 		C.gotWanted = true;
@@ -709,16 +767,17 @@ static void UpdateCrimeTracking()
 // ===== [ CONTRACT LIFECYCLE ] =====
 static void ClearContract(bool deleteTarget)
 {
+	StopHandoff();
 	RemoveBlip(C.searchBlip);
 	RemoveBlip(C.targetBlip);
 	PLAYER::_CLEAR_PED_EAGLE_EYE_TRAILS_FOR_PLAYER(me);
-	PLAYER::_UNREGISTER_EAGLE_EYE_FOR_ENTITY(me, C.target);
-	DestroyCardObject();
+	if (TargetExists()) PLAYER::_UNREGISTER_EAGLE_EYE_FOR_ENTITY(me, C.target);
+	DestroyCardObject(true);
 	ReleaseTargetPhoto();
 	if (C.cashObj && ENTITY::DOES_ENTITY_EXIST(C.cashObj)) OBJECT::DELETE_OBJECT(&C.cashObj);
 	if (C.def && C.def->onCleanup) C.def->onCleanup();
 	if (deleteTarget && TargetExists()) PED::DELETE_PED(&C.target);
-	ENTITY::SET_ENTITY_AS_NO_LONGER_NEEDED(&C.target);
+	if (TargetExists()) ENTITY::SET_ENTITY_AS_NO_LONGER_NEEDED(&C.target);
 	C = ActiveContract();
 	ResetPrompt(giverPrompt);
 	ResetPrompt(camPrompt);
@@ -731,15 +790,22 @@ static bool StartContract()
 	ClearContract(true);
 	for (int attempt = 0; attempt < Tune::kSpawnAttempts; ++attempt)
 	{
+		if (!PlayerAvailable()) break;
 		const ContractDef& def = kContracts[rand() % kContractCount];
 		Hash model = def.models.list[rand() % def.models.count];
 		Ped ped = SpawnTargetWithPhoto(model, def);
 		if (!ped) continue;
+		if (!PlayerAvailable())
+		{
+			PED::DELETE_PED(&ped);
+			ReleaseTargetPhoto();
+			break;
+		}
 
 		C.def = &def;
 		C.target = ped;
 		C.targetPos = def.spawn;
-		C.startMs = GetTickCount64();
+		C.startMs = RuntimeNowMs();
 		def.behavior->setup(ped, def);
 		if (def.onSpawned) def.onSpawned(def);
 		AddSearchBlip();
@@ -751,7 +817,7 @@ static bool StartContract()
 
 static void UpdateTargetAI()
 {
-	if (PED::IS_PED_DEAD_OR_DYING(C.target, true)) return;
+	if (!C.def || !TargetExists() || PED::IS_PED_DEAD_OR_DYING(C.target, true)) return;
 	C.def->behavior->update(C.target, *C.def);
 }
 
@@ -794,7 +860,7 @@ static void CheckTargetFound()
 	bool nearWithLOS = Within(playerPos, C.targetPos, C.def->searchRadius) &&
 	                   ENTITY::HAS_ENTITY_CLEAR_LOS_TO_ENTITY(pedMe, C.target, 17) != 0;
 	bool aimed = nearWithLOS && (PLAYER::IS_PLAYER_FREE_AIMING_AT_ENTITY(me, C.target) || PLAYER::IS_PLAYER_TARGETTING_ENTITY(me, C.target, false));
-	bool hurt  = ENTITY::HAS_ENTITY_BEEN_DAMAGED_BY_ENTITY(C.target, pedMe, true, true) != 0;
+	bool hurt  = C.damagedByPlayer;
 	bool fight = PED::IS_PED_IN_COMBAT(C.target, pedMe) != 0;
 
 	if (interacting || aimed || hurt || fight)
@@ -809,8 +875,11 @@ static void CheckTargetFound()
 // ===== [ CORPSE + PHOTO ] =====
 static bool IsInHandheldCamera()
 {
-	return PAD::IS_CONTROL_ENABLED(0, INPUT_CAMERA_TAKE_PHOTO) ||
-	       PAD::IS_CONTROL_ENABLED(0, INPUT_CAMERA_ADVANCED_TAKE_PHOTO);
+	Hash weapon = 0;
+	if (!WEAPON::GET_CURRENT_PED_WEAPON(pedMe, &weapon, true, WEAPON_ATTACH_POINT_HAND_PRIMARY, false)) return false;
+	Hash context = PAD::_GET_CURRENT_CONTROL_CONTEXT(4);
+	return (weapon == joaat("WEAPON_KIT_CAMERA") || weapon == joaat("WEAPON_KIT_CAMERA_ADVANCED")) &&
+		(context == joaat("PHOTOCAMERAINUSE") || context == joaat("ADVANCEDPHOTOCAMERA"));
 }
 
 static void CreateCameraPrompt()
@@ -823,13 +892,14 @@ static void CreateCameraPrompt()
 	HUD::_UI_PROMPT_SET_STANDARD_MODE(camPrompt, true);
 	HUD::_UI_PROMPT_SET_PRIORITY(camPrompt, 3);
 	HUD::_UI_PROMPT_SET_GROUP(camPrompt, camGroup, 0);
-	ShowPrompt(camPrompt, false);
 	HUD::_UI_PROMPT_REGISTER_END(camPrompt);
+	ShowPrompt(camPrompt, false);
 }
 
 static void CheckTargetDeath()
 {
 	CreateCameraPrompt(); // lazily, on the first FOUND frame — as it always has been
+	ShowPrompt(camPrompt, false);
 	if (!PED::IS_PED_DEAD_OR_DYING(C.target, true)) return;
 
 	if (!C.corpseBlipPlaced)
@@ -839,71 +909,86 @@ static void CheckTargetDeath()
 		AddCorpseBlip();
 		C.corpseBlipPlaced = true;
 	}
-	MAP::SET_BLIP_COORDS(C.targetBlip, C.targetPos);
+	if (MAP::DOES_BLIP_EXIST(C.targetBlip)) MAP::SET_BLIP_COORDS(C.targetBlip, C.targetPos);
 
 	// Making our prompt the ACTIVE prompt in the native CAMERA_ITEM_GROUP this frame renders it inside the
 	// handheld camera AND intercepts the take-photo input: the corpse shot triggers our prompt instead of
 	// the native capture, so the game never saves it. Once we reach CONTRACT_DEAD this stops running and
 	// the native shutter works (and saves) normally again.
-	if (!IsInHandheldCamera() || !ENTITY::IS_ENTITY_ON_SCREEN(C.target)) return;
+	if (!IsInHandheldCamera() || !Within(playerPos, C.targetPos, Tune::kCorpsePhotoDistance) ||
+		!ENTITY::IS_ENTITY_ON_SCREEN(C.target) || !ENTITY::HAS_ENTITY_CLEAR_LOS_TO_ENTITY(pedMe, C.target, 17)) return;
 
 	ShowPrompt(camPrompt, true);
 	HUD::_UI_PROMPT_SET_ACTIVE_GROUP_THIS_FRAME(camGroup, "CAM_CONG_HC", 1, 0, 0, 0);
-	if (HUD::_UI_PROMPT_IS_PRESSED(camPrompt))
+	if (HUD::_UI_PROMPT_IS_JUST_PRESSED(camPrompt))
 	{
 		DisplaySubtitle("RETURN TO CLERK");
 		AUDIO::PLAY_SOUND_FRONTEND("take_photo", "Photo_Mode_Sounds", true, 0);
 		ShowPrompt(camPrompt, false);
 		RemoveBlip(C.targetBlip);
-		C.photoMs = GetTickCount64();
+		C.photoMs = RuntimeNowMs();
 		g_state = CONTRACT_DEAD;
 	}
 }
 
 // ===== [ HAND-IN: PHOTO FOR CASH ] =====
+static void SettlePayment()
+{
+	if (g_state != CONTRACT_PAID || C.paymentCredited) return;
+	C.paymentCredited = true;
+	MONEY::_MONEY_INCREMENT_CASH_BALANCE(C.payoutCents, 0);
+	char money[16], message[64];
+	FormatMoney(money, sizeof money, C.payoutCents);
+	sprintf_s(message, "REWARD RECEIVED: %s", money);
+	DisplaySubtitle(message);
+	ClearContract(false);
+	giverCooldownUntilMs = RuntimeNowMs() + Tune::kGiverCooldownMs;
+}
+
 static void UpdatePayment()
 {
-	ULONGLONG now = GetTickCount64();
-
-	if (Cd.inHand && now >= C.handInStartMs + Tune::kHandInCardMs) DestroyCardObject();
-
-	if (!C.cashSpawned && now >= C.handInStartMs + Tune::kCashSpawnDelayMs)
+	ULONGLONG now = RuntimeNowMs();
+	ShowPrompt(giverPrompt, false);
+	if (!C.cashSpawned)
 	{
 		C.cashSpawned = true;
 		Vector3 giver = ENTITY::DOES_ENTITY_EXIST(C.payingGiver) ? ENTITY::GET_ENTITY_COORDS(C.payingGiver, true, false) : playerPos;
 		Vector3 counter((giver.x + playerPos.x) * 0.5f, (giver.y + playerPos.y) * 0.5f, giver.z + Tune::kCounterHeight);
-		C.cashObj = OBJECT::CREATE_AMBIENT_PICKUP(Card::kCashPickup, counter, 0, C.payoutCents, 0, true, true, 0, 0.0f);
+		// An inert prop cannot independently award cash. Every collection/fallback uses one credit path.
+		if (LoadModel(Card::kCashModel))
+		{
+			C.cashObj = OBJECT::CREATE_OBJECT(Card::kCashModel, counter, true, true, false, false, false);
+			STREAMING::SET_MODEL_AS_NO_LONGER_NEEDED(Card::kCashModel);
+		}
 
 		char money[16], msg[64];
 		FormatMoney(money, sizeof money, C.payoutCents);
 		if (!C.cashObj || !ENTITY::DOES_ENTITY_EXIST(C.cashObj))
 		{
 			// No pickup could be placed — pay directly rather than short the player.
-			MONEY::_MONEY_INCREMENT_CASH_BALANCE(C.payoutCents, 0);
-			sprintf_s(msg, "REWARD RECEIVED: %s", money);
-			DisplaySubtitle(msg);
-			ClearContract(false);
+			SettlePayment();
 			return;
 		}
 		sprintf_s(msg, "TAKE YOUR PAYMENT: %s", money);
 		DisplaySubtitle(msg);
+		ResetPrompt(giverPrompt);
+		giverCooldownUntilMs = now + Tune::kGiverCooldownMs;
 		return;
 	}
 
-	if (!C.cashSpawned) return;
-	bool taken    = !ENTITY::DOES_ENTITY_EXIST(C.cashObj);
-	bool timedOut = now > C.handInStartMs + Tune::kCashSpawnDelayMs + Tune::kCashTimeoutMs;
-	if (taken)
+	if (!ENTITY::DOES_ENTITY_EXIST(C.cashObj) || now - C.handInStartMs >= Tune::kCashTimeoutMs)
 	{
-		C.cashObj = 0;
-		DisplaySubtitle("REWARD RECEIVED");
-		ClearContract(false);
+		SettlePayment();
+		return;
 	}
-	else if (timedOut)
-	{
-		MONEY::_MONEY_INCREMENT_CASH_BALANCE(C.payoutCents, 0); // left on the counter too long: pay it out anyway
-		ClearContract(false);
-	}
+	if (now < giverCooldownUntilMs || !CanStartInteraction() ||
+		!Within(playerPos, ENTITY::GET_ENTITY_COORDS(C.cashObj, true, false), 2.5f)) return;
+	Hash group = joaat("BOUNTY_CONTRACT_PAYMENT");
+	HUD::_UI_PROMPT_SET_GROUP(giverPrompt, group, 0);
+	HUD::_UI_PROMPT_SET_TEXT(giverPrompt, Literal("Take Payment"));
+	ShowPrompt(giverPrompt, true);
+	HUD::_UI_PROMPT_SET_ACTIVE_GROUP_THIS_FRAME(group, Literal("Contract Payment"), 1, 0, 0, 0);
+	if (HUD::_UI_PROMPT_HAS_HOLD_MODE_COMPLETED(giverPrompt)) SettlePayment();
 }
 
 // ===== [ GIVER (CLERK) PROMPT ] =====
@@ -912,8 +997,8 @@ static void CreateGiverPrompt()
 	giverPrompt = HUD::_UI_PROMPT_REGISTER_BEGIN();
 	HUD::_UI_PROMPT_SET_CONTROL_ACTION(giverPrompt, 0x620A6C5E);
 	HUD::_UI_PROMPT_SET_STANDARDIZED_HOLD_MODE(giverPrompt, SHORT_TIMED_EVENT_MP);
-	ShowPrompt(giverPrompt, false);
 	HUD::_UI_PROMPT_REGISTER_END(giverPrompt);
+	ShowPrompt(giverPrompt, false);
 }
 
 // The giver spot the player is standing at while aiming at `ped`, if any: the spot for this ped's
@@ -934,37 +1019,152 @@ static const GiverSpot* FindGiverSpot(Ped ped)
 	return best;
 }
 
-// Clerk handoff animations. The clip names read as if assigned to the wrong ped — they are NOT:
-// this pairing is what produces the correct visuals in game. Do not swap them.
-static void PlayGiverHandoff(Ped giver, bool payout)
+// In the original Pay Alden scene the *_player clip is the donor and trainworker is the receiver.
+// Keep the verified role reversal when the clerk gives the player a contract.
+namespace HandoffAnim
 {
-	const int kGiverFlags  = AF_FORCE_START | AF_NOT_INTERRUPTABLE | AF_USE_KINEMATIC_PHYSICS | AF_USE_MOVER_EXTRACTION | AF_UPPERBODY | AF_SECONDARY;
-	const int kPlayerFlags = AF_FORCE_START | AF_NOT_INTERRUPTABLE;
-	if (!payout)
+	constexpr const char* donorDict = "script_rc@chrb@ig1_visit_clerk";
+	constexpr const char* donorClip = "arthur_gives_money_player";
+	constexpr const char* receiverDict = "script_rc@chrb@ig_1_waitinginline";
+	constexpr const char* receiverClip = "gives_money_trainworker";
+}
+
+static void StopHandoff()
+{
+	if (!handoff.active) return;
+	Ped donor = handoff.payout ? handoff.player : handoff.giver;
+	Ped receiver = handoff.payout ? handoff.giver : handoff.player;
+	// Stop only our clips. The clerk's base scenario stays alive under the upper-body overlay.
+	if (ENTITY::DOES_ENTITY_EXIST(donor)) TASK::STOP_ANIM_TASK(donor, HandoffAnim::donorDict, HandoffAnim::donorClip, -4.0f);
+	if (ENTITY::DOES_ENTITY_EXIST(receiver)) TASK::STOP_ANIM_TASK(receiver, HandoffAnim::receiverDict, HandoffAnim::receiverClip, -4.0f);
+	STREAMING::REMOVE_ANIM_DICT(HandoffAnim::donorDict);
+	STREAMING::REMOVE_ANIM_DICT(HandoffAnim::receiverDict);
+	handoff = HandoffRuntime();
+	giverCooldownUntilMs = RuntimeNowMs() + Tune::kGiverCooldownMs;
+}
+
+static bool BeginHandoff(Ped giver, bool payout)
+{
+	if (!CanStartInteraction() || !LivingPed(giver)) return false;
+	STREAMING::REQUEST_ANIM_DICT(HandoffAnim::donorDict);
+	STREAMING::REQUEST_ANIM_DICT(HandoffAnim::receiverDict);
+	bool loaded = WaitUntil(Tune::kStreamTimeoutMs, [&] {
+		return !LivingPed(giver) || (STREAMING::HAS_ANIM_DICT_LOADED(HandoffAnim::donorDict) &&
+			STREAMING::HAS_ANIM_DICT_LOADED(HandoffAnim::receiverDict));
+	});
+	if (!loaded || !CanStartInteraction() || !LivingPed(giver) ||
+		!Within(ENTITY::GET_ENTITY_COORDS(pedMe, true, false), ENTITY::GET_ENTITY_COORDS(giver, true, false), 3.0f) ||
+		!AttachCardToHand(payout ? pedMe : giver))
 	{
-		PlayAnimOnPed(giver, "script_rc@chrb@ig1_visit_clerk",     "arthur_gives_money_player", 8.0f, 1.0f, -1, kGiverFlags);
-		PlayAnimOnPed(pedMe, "script_rc@chrb@ig_1_waitinginline",  "gives_money_trainworker",   1.0f, 1.0f, -1, kPlayerFlags);
+		STREAMING::REMOVE_ANIM_DICT(HandoffAnim::donorDict);
+		STREAMING::REMOVE_ANIM_DICT(HandoffAnim::receiverDict);
+		DestroyCardObject();
+		return false;
 	}
-	else
+	// Creating the card can itself yield for model streaming; validate again before issuing tasks.
+	if (!CanStartInteraction() || !LivingPed(giver) || PED::IS_PED_IN_COMBAT(giver, 0) ||
+		!Within(ENTITY::GET_ENTITY_COORDS(pedMe, true, false), ENTITY::GET_ENTITY_COORDS(giver, true, false), 3.0f))
 	{
-		PlayAnimOnPed(pedMe, "script_rc@chrb@ig1_visit_clerk",     "arthur_gives_money_player", 8.0f, 1.0f, -1, kPlayerFlags);
-		PlayAnimOnPed(giver, "script_rc@chrb@ig_1_waitinginline",  "gives_money_trainworker",   1.0f, 1.0f, -1, kGiverFlags);
+		STREAMING::REMOVE_ANIM_DICT(HandoffAnim::donorDict);
+		STREAMING::REMOVE_ANIM_DICT(HandoffAnim::receiverDict);
+		DestroyCardObject();
+		return false;
 	}
+	ApplyCardCustomTexture();
+	handoff.active = true;
+	handoff.payout = payout;
+	handoff.giver = giver;
+	handoff.player = pedMe;
+	float donorDuration = ENTITY::GET_ANIM_DURATION(HandoffAnim::donorDict, HandoffAnim::donorClip);
+	float receiverDuration = ENTITY::GET_ANIM_DURATION(HandoffAnim::receiverDict, HandoffAnim::receiverClip);
+	float duration = donorDuration > receiverDuration ? donorDuration : receiverDuration;
+	if (!(duration > 0.0f && duration < 30.0f)) duration = 6.0f;
+	handoff.config.timeoutMs = static_cast<ULONGLONG>(duration * 1000.0f) + 2000;
+	handoff.config.transferPhase = Tune::kHandoffTransferPhase;
+	const int giverFlags = AF_FORCE_START | AF_UPPERBODY | AF_SECONDARY;
+	const int playerFlags = AF_FORCE_START;
+	const int ikFlags = AIK_DISABLE_ARM_IK | AIK_DISABLE_TORSO_REACT_IK | AIK_DISABLE_TORSO_IK | AIK_DISABLE_HEAD_IK | AIK_DISABLE_LEG_IK;
+	// Both dictionaries and the textured prop are ready before either task starts.
+	TASK::TASK_PLAY_ANIM(payout ? pedMe : giver, HandoffAnim::donorDict, HandoffAnim::donorClip,
+		4.0f, -4.0f, -1, payout ? playerFlags : giverFlags, 0.0f, false, ikFlags, false, nullptr, false);
+	TASK::TASK_PLAY_ANIM(payout ? giver : pedMe, HandoffAnim::receiverDict, HandoffAnim::receiverClip,
+		4.0f, -4.0f, -1, payout ? giverFlags : playerFlags, 0.0f, false, ikFlags, false, nullptr, false);
+	handoff.progress.startedMs = RuntimeNowMs();
+	return true;
+}
+
+static void UpdateHandoff()
+{
+	if (!handoff.active) return;
+	Handoff::Observation observation;
+	observation.nowMs = RuntimeNowMs();
+	observation.payout = handoff.payout;
+	observation.actorsValid = PlayerAvailable() && handoff.player == pedMe && LivingPed(handoff.giver) &&
+		Cd.obj && ENTITY::DOES_ENTITY_EXIST(Cd.obj) && !PED::IS_PED_RAGDOLL(pedMe) &&
+		!PED::IS_PED_IN_COMBAT(handoff.giver, 0) && !PED::IS_PED_IN_COMBAT(pedMe, 0) &&
+		Within(playerPos, ENTITY::GET_ENTITY_COORDS(handoff.giver, true, false), 3.5f);
+	if (observation.actorsValid)
+	{
+		const char* giverDict = handoff.payout ? HandoffAnim::receiverDict : HandoffAnim::donorDict;
+		const char* giverClip = handoff.payout ? HandoffAnim::receiverClip : HandoffAnim::donorClip;
+		const char* playerDict = handoff.payout ? HandoffAnim::donorDict : HandoffAnim::receiverDict;
+		const char* playerClip = handoff.payout ? HandoffAnim::donorClip : HandoffAnim::receiverClip;
+		observation.giverPlaying = ENTITY::IS_ENTITY_PLAYING_ANIM(handoff.giver, giverDict, giverClip, 3) != 0;
+		observation.playerPlaying = ENTITY::IS_ENTITY_PLAYING_ANIM(pedMe, playerDict, playerClip, 3) != 0;
+		observation.giverPhase = ENTITY::_GET_ENTITY_ANIM_CURRENT_TIME(handoff.giver, giverDict, giverClip);
+		observation.playerPhase = ENTITY::_GET_ENTITY_ANIM_CURRENT_TIME(pedMe, playerDict, playerClip);
+		observation.giverFinished = ENTITY::HAS_ENTITY_ANIM_FINISHED(handoff.giver, giverDict, giverClip, 3) != 0;
+		observation.playerFinished = ENTITY::HAS_ENTITY_ANIM_FINISHED(pedMe, playerDict, playerClip, 3) != 0;
+	}
+	Handoff::Decision decision = Handoff::Step(handoff.progress, handoff.config, observation);
+	if (decision.transfer && !AttachCardToHand(handoff.payout ? handoff.giver : pedMe)) decision.cancel = true;
+	if (decision.cancel)
+	{
+		bool payout = handoff.payout;
+		StopHandoff();
+		DestroyCardObject();
+		if (payout) DisplaySubtitle("HANDOVER INTERRUPTED. COLLECT PAYMENT AT THE CLERK.");
+		else { C.cardOpenPending = false; DisplaySubtitle("CONTRACT READY. PRESS I TO INSPECT."); }
+		return;
+	}
+	if (decision.complete)
+	{
+		bool payout = handoff.payout;
+		Ped giver = handoff.giver;
+		StopHandoff();
+		if (payout)
+		{
+			DestroyCardObject();
+			C.payingGiver = giver;
+			C.handInStartMs = RuntimeNowMs();
+			g_state = CONTRACT_PAID;
+		}
+		else C.cardOpenPending = true;
+		return;
+	}
+	// Frame-scoped controls need no persistent player-control flag to restore after cancellation.
+	for (Hash input : { INPUT_MOVE_LR, INPUT_MOVE_UD, INPUT_SPRINT, INPUT_JUMP, INPUT_ATTACK, INPUT_AIM })
+		PAD::DISABLE_CONTROL_ACTION(0, input, true);
 }
 
 static void UpdateGiverPrompt()
 {
+	if (handoff.active || Cd.obj || !CanStartInteraction() || RuntimeNowMs() < giverCooldownUntilMs)
+	{
+		ShowPrompt(giverPrompt, false);
+		return;
+	}
 	Entity aimed = 0;
 	Ped giver = 0;
 	const GiverSpot* spot = nullptr;
 	if (PLAYER::GET_PLAYER_TARGET_ENTITY(me, &aimed) && ENTITY::IS_ENTITY_A_PED(aimed))
 	{
 		giver = ENTITY::GET_PED_INDEX_FROM_ENTITY_INDEX(aimed);
-		if (ENTITY::DOES_ENTITY_EXIST(giver)) spot = FindGiverSpot(giver);
+		if (LivingPed(giver) && !PED::IS_PED_IN_COMBAT(giver, pedMe)) spot = FindGiverSpot(giver);
 	}
 	if (!spot)
 	{
-		ShowPrompt(giverPrompt, false);
+		ResetPrompt(giverPrompt);
 		return;
 	}
 
@@ -975,19 +1175,17 @@ static void UpdateGiverPrompt()
 	HUD::_UI_PROMPT_SET_TEXT(giverPrompt, Literal(text));
 	ShowPrompt(giverPrompt, true);
 	if (!HUD::_UI_PROMPT_HAS_HOLD_MODE_COMPLETED(giverPrompt)) return;
+	ResetPrompt(giverPrompt);
+	giverCooldownUntilMs = RuntimeNowMs() + Tune::kGiverCooldownMs;
 
 	switch (g_state)
 	{
 	case CONTRACT_NONE:
 	{
-		ULONGLONG handoffMs = GetTickCount64();
-		PlayGiverHandoff(giver, false);
+		DisplaySubtitle("PREPARING CONTRACT");
 		if (StartContract())
 		{
-			// The clerk is handing the card over; the player examines it once the handoff anim has played.
-			ULONGLONG now = GetTickCount64();
-			ULONGLONG at  = handoffMs + Tune::kCardOpenDelayMs;
-			C.cardOpenAtMs = at > now ? at : now;
+			if (!BeginHandoff(giver, false)) C.cardOpenPending = true;
 			DisplaySubtitle("FIND THE TARGET");
 		}
 		else
@@ -1006,12 +1204,7 @@ static void UpdateGiverPrompt()
 	case CONTRACT_DEAD:
 		// Hand the clerk the corpse photo; he puts the money on the counter (UpdatePayment).
 		C.payoutCents   = ComputePayoutCents();
-		C.payingGiver   = giver;
-		C.handInStartMs = GetTickCount64();
-		PlayGiverHandoff(giver, true);
-		AttachCardToHand();
-		ShowPrompt(giverPrompt, false);
-		g_state = CONTRACT_PAID;
+		if (!BeginHandoff(giver, true)) DisplaySubtitle("HANDOVER UNAVAILABLE. TRY THE CLERK AGAIN.");
 		break;
 
 	case CONTRACT_PAID:
@@ -1024,7 +1217,7 @@ static void UpdatePlayer()
 {
 	me = PLAYER::PLAYER_ID();
 	pedMe = PLAYER::PLAYER_PED_ID();
-	playerPos = ENTITY::GET_ENTITY_COORDS(pedMe, true, false);
+	if (pedMe && ENTITY::DOES_ENTITY_EXIST(pedMe)) playerPos = ENTITY::GET_ENTITY_COORDS(pedMe, true, false);
 	if (TargetExists()) C.targetPos = ENTITY::GET_ENTITY_COORDS(C.target, true, false);
 }
 
@@ -1034,8 +1227,29 @@ void ScriptMain()
 	CreateGiverPrompt();
 	while (true)
 	{
+		Ped previousPlayer = pedMe;
 		UpdatePlayer();
+		SetRuntimePaused(!PlayerAvailable() || HUD::IS_PAUSE_MENU_ACTIVE() || CAMERA::IS_SCREEN_FADED_OUT());
 		MaintainPortraitAndCard();
+		bool bypassPressed = IsKeyJustUp(Tune::kBypassClerkKey);
+		bool inspectPressed = IsKeyJustUp(Tune::kInspectCardKey);
+		if (!PlayerAvailable() || (previousPlayer && previousPlayer != pedMe))
+		{
+			StopHandoff();
+			DestroyCardObject(true);
+			C.cardOpenPending = false;
+			ResetPrompt(giverPrompt);
+			ResetPrompt(camPrompt);
+			WAIT(0);
+			continue;
+		}
+		if (HUD::IS_PAUSE_MENU_ACTIVE() || CAMERA::IS_SCREEN_FADED_OUT())
+		{
+			ShowPrompt(giverPrompt, false);
+			ShowPrompt(camPrompt, false);
+			WAIT(0);
+			continue;
+		}
 
 		// A contract whose target vanished (deleted by another script, fell out of the world) can never
 		// be completed — end it instead of leaving stale blips on the map.
@@ -1045,27 +1259,41 @@ void ScriptMain()
 			ClearContract(false);
 		}
 
-		// I: look at the contract card again.
-		if (ContractActive() && !Cd.obj && !C.cardOpenAtMs)
+		// U bypasses the clerk for a new contract; an existing hunt is never silently discarded.
+		if (bypassPressed && !handoff.active && !Cd.obj && CanStartInteraction())
 		{
-			if (IsKeyJustUp(Tune::kInspectCardKey)) OpenCard();
+			if (g_state == CONTRACT_NONE)
+			{
+				DisplaySubtitle("PREPARING CONTRACT");
+				if (StartContract()) { C.cardOpenPending = true; DisplaySubtitle("FIND THE TARGET"); }
+				else DisplaySubtitle("NO CONTRACTS AVAILABLE");
+			}
+			else if (ContractActive()) C.cardOpenPending = true;
 		}
-		UpdateCard();
+		if (inspectPressed && ContractActive() && !handoff.active && !Cd.obj) C.cardOpenPending = true;
+
+		UpdateHandoff();
+		// Select the contract state only AFTER processing a prompt that can clear/change it.
+		if (g_state != CONTRACT_PAID) UpdateGiverPrompt();
+		if (!PlayerAvailable()) { WAIT(0); continue; }
+		if (TargetExists())
+		{
+			C.targetPos = ENTITY::GET_ENTITY_COORDS(C.target, true, false);
+			C.damagedByPlayer = ENTITY::HAS_ENTITY_BEEN_DAMAGED_BY_ENTITY(C.target, pedMe, true, true) != 0;
+		}
+		ShowPrompt(camPrompt, false);
 
 		switch (g_state)
 		{
 		case CONTRACT_NONE:
-			UpdateGiverPrompt();
 			break;
 		case CONTRACT_UNKNOWN:
-			UpdateGiverPrompt();
 			UpdateTrails();
 			UpdateTargetAI();
 			UpdateCrimeTracking();
 			CheckTargetFound();
 			break;
 		case CONTRACT_FOUND:
-			UpdateGiverPrompt();
 			UpdateTrails();
 			UpdateTargetAI();
 			UpdateCrimeTracking();
@@ -1073,13 +1301,17 @@ void ScriptMain()
 			break;
 		case CONTRACT_DEAD:
 			UpdateTrails();
-			UpdateGiverPrompt();
 			UpdateCrimeTracking();
 			break;
 		case CONTRACT_PAID:
 			UpdatePayment();
 			break;
 		}
+		// Every consumer sees the same damage event, then history is cleared so it cannot keep
+		// re-triggering aggression through walls for the rest of the contract.
+		if (C.damagedByPlayer && TargetExists()) ENTITY::CLEAR_ENTITY_LAST_DAMAGE_ENTITY(C.target);
+		C.damagedByPlayer = false;
+		UpdateCard(); // render-target drawing must remain last
 		WAIT(0);
 	}
 }

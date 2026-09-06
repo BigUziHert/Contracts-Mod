@@ -51,16 +51,19 @@ static_assert(Joaat("g_m_m_unigrays_01")                == 0x15EB41F6, "Joaat mi
 namespace Tune
 {
 	// --- target combat ---
-	constexpr int   kArmedChancePct   = 90;      // of every aggro: 90% draws a weapon, 10% fists
+	constexpr int   kArmedChancePct   = 90;      // each target: 90% armed, 10% fists; never rerolled in combat
 	constexpr int   kGunVsKnifePct    = 75;      // of the armed rolls: 75% gun, 25% knife
-	constexpr float kReAggroSightDist = 45.0f;   // how far he can see / notice the player. Must exceed kDeAggroDist.
-	constexpr float kDeAggroDist      = 20.0f;   // inside this he stays engaged with no line of sight needed
+	constexpr float kReAggroSightDist = 45.0f;   // distance for reacquiring a remembered player
+	constexpr float kRetainSightDist  = 55.0f;   // wider retention range prevents boundary oscillation
 	constexpr DWORD kDeAggroGraceMs   = 8000;    // contact must be lost this long before he gives up the chase
+	constexpr DWORD kTargetSearchMs   = 10000;  // investigate the last seen location before returning to wander
 	// --- player feedback ---
 	constexpr float kTrailEnableDist  = 12.0f;   // eagle-eye trail on the target within this range
 	// --- giver interaction ---
 	constexpr float kGiverPlayerDist  = 1.8f;    // player must be this close to the giver's spot
 	constexpr float kGiverSpotDist    = 0.5f;    // giver must be this close to their own spot
+	constexpr DWORD kGiverCooldownMs  = 750;    // fresh hold after a completed interaction
+	constexpr float kHandoffTransferPhase = 0.48f; // estimated hand contact, tune in game; no verified clip event
 	// --- payout (all money is in CENTS: 2500 = $25.00) ---
 	constexpr int   kPayoutMinCents   = 2500;    // $25 floor
 	constexpr int   kPayoutMaxCents   = 17500;   // $175 ceiling
@@ -68,13 +71,12 @@ namespace Tune
 	constexpr float kWantedPayoutMult = 0.5f;    // multiplier if the player got wanted after the crime
 	constexpr int   kPayoutStepCents  = 25;      // payout is rounded down to this step
 	// --- hand-in: photo + money on the counter ---
-	constexpr DWORD kCashSpawnDelayMs = 1500;    // clerk anim runs this long before the cash appears
-	constexpr DWORD kHandInCardMs     = 2500;    // the corpse photo stays in the player's hand this long
 	constexpr float kCounterHeight    = 1.0f;    // cash spawns this far above the clerk's feet (drops onto the counter)
-	constexpr DWORD kCashTimeoutMs    = 120000;  // if the player never takes the cash, the contract closes anyway
+	constexpr DWORD kCashTimeoutMs    = 120000;  // uncollected cash is credited directly after this interval
 	// --- contract card ---
-	constexpr DWORD kCardOpenDelayMs  = 2500;    // wait for the clerk handoff anim before the player examines the card
+	constexpr int   kBypassClerkKey   = 0x55;    // U: issue a contract remotely (or inspect an existing contract)
 	constexpr int   kInspectCardKey   = 0x49;    // 'I' — look at the card again mid-contract (photograph recipe, as Contracts Remastered)
+	constexpr float kCorpsePhotoDistance = 25.0f;
 	constexpr bool  kCardFaceRenderTarget = true;// retain render-target support for compatible props; custom textures draw the normal card face
 	constexpr bool  kPedshotHidden    = true;    // hide the target while his photo is taken next to the player
 	constexpr int   kPedshotReadyMs   = 4000;    // wait for the ped's assets to stream before the photo
@@ -307,7 +309,7 @@ namespace Card
 	};
 	constexpr bool kCardCustomTexture = true;      // also try OBJECT::SET_CUSTOM_TEXTURES_ON_OBJECT with the portrait (R* uses it for letter textures)
 	constexpr const char* kHandBone     = "PH_R_Hand";
-	constexpr Hash kCashPickup = Joaat("PICKUP_MONEY_VARIABLE");
+	constexpr Hash kCashModel = Joaat("P_CS_BILLSINGLE01X"); // the original clerk scene's banknote
 
 	// --- target portrait (the game's persona-photo / pedshot pipeline) ---
 	constexpr const char* kPhotoName  = "MINIGAME_PROFILE_PHOTO";   // one of the three names the MP pedshot flow accepts (MP_PROFILE_PHOTO, MP_MISSION_PHOTO, MINIGAME_PROFILE_PHOTO)
