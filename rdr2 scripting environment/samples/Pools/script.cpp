@@ -25,7 +25,7 @@
 
 // ===== [ STATE ] =====
 enum ContractState { CONTRACT_NONE, CONTRACT_UNKNOWN, CONTRACT_FOUND, CONTRACT_DEAD, CONTRACT_PAID };
-enum class ContractStartFailure { None, Interrupted, InvalidModel, ModelLoadTimeout, PedCreationFailed, PortraitFailed, PedPoolFull, CleanupPending };
+enum class ContractStartFailure { None, Interrupted, InvalidModel, ModelLoadTimeout, PedCreationFailed, PortraitFailed, PedPoolFull, CleanupPending, PhotoDiagnosticComplete };
 static ContractStartFailure lastStartFailure = ContractStartFailure::None;
 static const char* lastPhotoStage = "none";
 
@@ -312,6 +312,7 @@ static void ReportContractStartFailure()
 	case ContractStartFailure::PortraitFailed: DisplaySubtitle("TARGET PHOTO COULD NOT BE PREPARED. TRY AGAIN."); break;
 	case ContractStartFailure::PedPoolFull: DisplaySubtitle("NO ROOM FOR ANOTHER TARGET. TRY AGAIN AFTER LEAVING THE AREA."); break;
 	case ContractStartFailure::CleanupPending: DisplaySubtitle("PREVIOUS TARGET IS STILL BEING REMOVED. TRY AGAIN SHORTLY."); break;
+	case ContractStartFailure::PhotoDiagnosticComplete: DisplaySubtitle("PHOTO TEST FINISHED. SEE BountyContracts-photo-test.log."); break;
 	case ContractStartFailure::None: DisplaySubtitle("CONTRACT REQUEST FAILED. TRY AGAIN."); break;
 	}
 }
@@ -636,6 +637,131 @@ static bool EnsureTargetPhotoReady()
 	return WaitUntil(Card::kPhotoNameMs, TargetPhotoReady); // maintenance polls the owned download
 }
 
+#ifdef BOUNTY_PHOTO_SELF_TEST
+// Opt-in diagnostic build: one provisional subject, no contract/card, no cache rotation.
+// In particular, probe A never generates or writes: it tests whether a released
+// consumer can reopen the SAME published photo before testing a second write.
+static void LogPhotoCacheTest(const char* phase, bool success, ULONGLONG started,
+	unsigned captures, const char* previousName, const char* observedName)
+{
+	HMODULE module = nullptr;
+	wchar_t path[MAX_PATH] = {};
+	if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+		reinterpret_cast<LPCWSTR>(&LogPhotoCacheTest), &module)) return;
+	DWORD length = GetModuleFileNameW(module, path, MAX_PATH);
+	if (!length || length >= MAX_PATH) return;
+	wchar_t* slash = std::wcsrchr(path, L'\\');
+	if (!slash || wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - path), L"BountyContracts-photo-test.log") != 0) return;
+	FILE* file = nullptr;
+	if (_wfopen_s(&file, path, L"a") != 0 || !file) return;
+	SYSTEMTIME time;
+	GetSystemTime(&time);
+	bool previousValid = previousName[0] && NETWORK::_TEXTURE_DOWNLOAD_TEXTURE_NAME_IS_VALID(previousName);
+	fprintf(file, "%04u-%02u-%02uT%02u:%02u:%02uZ photo-test-v1 phase=%s ok=%d elapsedMs=%llu captures=%u slot=%d cache=%d stage=%s download=%d status=%d requests=%u name=\"%s\" previous=\"%s\" previousValid=%d nameValid=%d generated=%d written=%d writeComplete=%d busyBefore=%d busyAfter=%d busyRequest=%d freePeds=%d\n",
+		time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond,
+		phase, success ? 1 : 0, GetTickCount64() - started, captures, Card::kPhotoSlot, Card::kPhotoCacheType,
+		lastPhotoStage, C.photoDownload, C.photoDownloadStatus, C.photoRequestAttempts, observedName,
+		previousName, previousValid ? 1 : 0, C.photoLookupValid ? 1 : 0, C.photoGenOk ? 1 : 0,
+		C.photoWritten ? 1 : 0, C.photoWriteComplete ? 1 : 0, C.photoBusyBefore ? 1 : 0,
+		C.photoBusyAfterCleanup ? 1 : 0, C.photoBusyAtRequest ? 1 : 0, PED::_GET_NUM_FREE_SLOTS_IN_PED_POOL());
+	fclose(file);
+}
+
+static bool ProbeExistingPhoto(char (&name)[64])
+{
+	// Clear the accepted name so WaitUntil's normal maintenance cannot create a
+	// second consumer or change the outcome before this probe gets to poll it.
+	ReleaseTargetPhoto();
+	C.photoRequestAttempts = 0;
+	name[0] = '\0';
+	lastPhotoStage = "probe_explicit";
+	return WaitUntil(Card::kPhotoNameMs, [&] { return LookupPhotoTexture(Card::kPhotoCacheType, name); });
+}
+
+static bool ProbeBackupPhoto(char (&name)[64])
+{
+	ReleaseTargetPhoto();
+	C.photoRequestAttempts = 0;
+	name[0] = '\0';
+	lastPhotoStage = "probe_backup";
+	return WaitUntil(Card::kPhotoNameMs, [&]
+	{
+		++C.photoRequestAttempts;
+		const char* borrowed = NETWORK::_REQUEST_PEDSHOT_TEXTURE_LOCAL_BACKUP_DOWNLOAD(Card::kPhotoSlot, Card::kPhotoCacheType);
+		if (!borrowed || !*borrowed || strnlen_s(borrowed, sizeof name) >= sizeof name) return false;
+		strcpy_s(name, borrowed); // copy before another native invalidates its return buffer
+		strcpy_s(C.photoLookupName, name);
+		C.photoLookupValid = NETWORK::_TEXTURE_DOWNLOAD_TEXTURE_NAME_IS_VALID(name) != 0;
+		return C.photoLookupValid;
+	});
+}
+
+static bool RunPhotoCacheSelfTest(Ped subject)
+{
+	ULONGLONG started = GetTickCount64();
+	unsigned captures = 0;
+	char previousName[64] = "";
+	char name[64] = "";
+	LogPhotoCacheTest("begin", true, started, captures, previousName, name);
+	// Caller releases any remaining handle and removes this one provisional ped,
+	// including when a wait is interrupted. A failed probe is a completed test.
+	if (!PlayerAvailable()) return false;
+	bool initial = PhotographPed(subject);
+	++captures;
+	LogPhotoCacheTest("initial", initial, started, captures, previousName, C.photoLookupName);
+	if (!initial || !PlayerAvailable()) return PlayerAvailable();
+	strcpy_s(previousName, C.photoTexture);
+
+	bool reopened = ProbeExistingPhoto(name);
+	LogPhotoCacheTest("A_reopen_without_write", reopened, started, captures, previousName, name);
+	if (!PlayerAvailable()) return false;
+	if (reopened)
+	{
+		strcpy_s(previousName, name); // invalidate the latest accepted consumer name if B fails
+		// PhotographPed releases A's owned handle before writing again. Keep the
+		// same subject so later recovery cannot accidentally accept an older target.
+		bool rewritten = PhotographPed(subject);
+		++captures;
+		LogPhotoCacheTest("B_second_capture", rewritten, started, captures, previousName, C.photoLookupName);
+		if (rewritten || !PlayerAvailable()) return PlayerAvailable();
+		// A producer failure cannot tell us whether a readback workaround works.
+		if (!C.photoWritten || !C.photoWriteComplete) return true;
+	}
+
+	ReleaseTargetPhoto();
+	if (previousName[0])
+	{
+		// Experimental control based on pause_menu's mugshot invalidation. Only
+		// the exact name returned by our own successful download may be released.
+		lastPhotoStage = "probe_name_invalidation";
+		bool validBefore = NETWORK::_TEXTURE_DOWNLOAD_TEXTURE_NAME_IS_VALID(previousName) != 0;
+		LogPhotoCacheTest("C_before_name_release", validBefore, started, captures, previousName, "");
+		if (!PlayerAvailable()) return false;
+		NETWORK::_TEXTURE_DOWNLOAD_RELEASE_BY_NAME(previousName);
+		bool invalidated = WaitUntil(Card::kPhotoNameMs, [&]
+		{
+			return !NETWORK::_TEXTURE_DOWNLOAD_TEXTURE_NAME_IS_VALID(previousName);
+		});
+		LogPhotoCacheTest(validBefore ? "C_name_invalidation" : "C_name_already_invalid",
+			invalidated, started, captures, previousName, "");
+		if (!PlayerAvailable()) return false;
+		if (invalidated)
+		{
+			bool recovered = ProbeExistingPhoto(name); // deliberately no generate/write
+			LogPhotoCacheTest("C_reopen_without_write", recovered, started, captures, previousName, name);
+			if (recovered || !PlayerAvailable()) return PlayerAvailable();
+		}
+	}
+
+	// Last, after C: this probes backup recovery after name invalidation, not an
+	// independent untouched-cache control. It provides no explicit owned handle.
+	// Never put its name in C.photoTexture, which would start normal handle polling.
+	bool backup = ProbeBackupPhoto(name);
+	LogPhotoCacheTest("D_backup_without_write", backup, started, captures, previousName, name);
+	return PlayerAvailable();
+}
+#endif
+
 // Spawns the target in front of the player first — hidden, frozen, no collision, exactly how the persona-
 // photo script parks its clone — so his clothes and textures stream in and the portrait can be taken.
 // Then moves him to his town.
@@ -648,6 +774,15 @@ static Ped SpawnTargetWithPhoto(Hash model, const ContractDef& def)
 	ENTITY::SET_ENTITY_HEADING(ped, ENTITY::GET_ENTITY_HEADING(pedMe) + 180.0f); // facing the player / camera
 	PED::SET_BLOCKING_OF_NON_TEMPORARY_EVENTS(ped, false);
 	TASK::CLEAR_PED_TASKS_IMMEDIATELY(ped, false, true);
+
+#ifdef BOUNTY_PHOTO_SELF_TEST
+	ENTITY::SET_ENTITY_VISIBLE(ped, false);
+	bool testComplete = RunPhotoCacheSelfTest(ped);
+	ReleaseTargetPhoto();
+	RequestOwnedPedCleanup(ped);
+	lastStartFailure = testComplete ? ContractStartFailure::PhotoDiagnosticComplete : ContractStartFailure::Interrupted;
+	return 0;
+#endif
 
 	bool photographed = false;
 	for (int attempt = 1; attempt <= Card::kPhotoAttempts; ++attempt)
@@ -1144,10 +1279,12 @@ static bool StartContract()
 		if (!ped)
 		{
 			// Capture attempts log their own texture state before releasing it.
-			if (lastStartFailure != ContractStartFailure::PortraitFailed) LogContractStartFailure(model, attempt + 1);
+			if (lastStartFailure != ContractStartFailure::PortraitFailed &&
+				lastStartFailure != ContractStartFailure::PhotoDiagnosticComplete) LogContractStartFailure(model, attempt + 1);
 			// Capture already retried this subject. Do not multiply capture timeouts by rerolling models.
 			if (lastStartFailure == ContractStartFailure::Interrupted || lastStartFailure == ContractStartFailure::PortraitFailed ||
-				lastStartFailure == ContractStartFailure::PedPoolFull || lastStartFailure == ContractStartFailure::CleanupPending) break;
+				lastStartFailure == ContractStartFailure::PedPoolFull || lastStartFailure == ContractStartFailure::CleanupPending ||
+				lastStartFailure == ContractStartFailure::PhotoDiagnosticComplete) break;
 			if (attempt + 1 < Tune::kSpawnAttempts) WAIT(0);
 			continue;
 		}

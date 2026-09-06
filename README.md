@@ -21,7 +21,7 @@ Capture now follows the same type-2 producer sequence as the cache consumer: wai
 
 Failed or cancelled targets also remain tracked until a later frame confirms that the original entity has disappeared. A zeroed `DELETE_PED` argument alone is not treated as confirmation. Further creation waits briefly for cleanup, then reports a pending-cleanup message if needed. Deletion retries only touch the matching model owned by this script. `BountyContracts-cleanup.log` records requested, confirmed, blocked, and released targets with counts, so a failed deletion can be distinguished from general NPC pool pressure. The pool count alone cannot identify which script owns the occupied slots.
 
-The cache change follows the type-2 handle lifecycle in the game's [persona photo script](https://github.com/creativewild/rdr2-scripts-decompiled/blob/953155c10ab0809fdcfb287f98650cd7e7eed1c4/1491.50/script_mp_rel/persona_photos.ysc.c) and [download consumer](https://github.com/JayKoZa/RDR2-Decompiled-Scripts/blob/a111493215b9db0b11c8f477816280f412c8b2de/script_mp_rel/net_ugc_end_flow.c#L7879-L7981). Repeated contracts still need in-game validation in story mode; the tests verify ownership and retry logic using simulated native responses.
+The cache change follows the type-2 handle lifecycle in the game's [persona photo script](https://github.com/creativewild/rdr2-scripts-decompiled/blob/953155c10ab0809fdcfb287f98650cd7e7eed1c4/1491.50/script_mp_rel/persona_photos.ysc.c) and [download consumer](https://github.com/JayKoZa/RDR2-Decompiled-Scripts/blob/a111493215b9db0b11c8f477816280f412c8b2de/script_mp_rel/net_ugc_end_flow.c#L7879-L7981). **Repeated portraits still fail in the reported story-mode session.** The latest `start-v4` log shows a completed write followed by 13 download requests returning -1; checked cleanup subsequently returned the failed target's NPC slot. Standalone tests verify ownership and retry logic using simulated native responses and do not establish the engine-level cause.
 
 Targets keep one weapon loadout, pursue with the game's combat AI, search the last place they saw you after losing sight for eight seconds, then return to their roaming area after ten seconds of searching. They remember you and can re-engage on sight. Task recovery is delayed and rate-limited, and does not interrupt ragdoll or lasso recovery.
 
@@ -61,11 +61,27 @@ $bountyBuildArgs = @(
 
 Adjust the MSBuild path if Visual Studio is installed elsewhere. The ScriptHookRDR2 headers and x64 import library are included in the scripting environment.
 
+## Optional portrait diagnostic build
+
+Build with `/p:BountyPhotoDiagnostics=true`, a separate `OutDir` under `dist/diagnostic/`, and a separate `IntDir` under `tmp`. This defines `BOUNTY_PHOTO_SELF_TEST`; ordinary builds do not run these probes. The downloadable diagnostic ASI replaces `TestScript.asi` temporarily. Keep only one copy of the mod in the game folder.
+
+Fully exit and restart the game with the diagnostic ASI, load story mode, stand on foot outside menus, and press **U once**. Wait for **Photo test finished**. This build creates one hidden provisional NPC, runs bounded portrait tests, then removes the NPC without issuing a contract. A clerk request runs the same test; completing a bounty is unnecessary. Read `BountyContracts-photo-test.log` and `BountyContracts-cleanup.log` beside the installed ASI. Restore the normal ASI and restart to resume bounty gameplay.
+
+The log identifies each probe:
+
+- `initial`: capture and read the first portrait normally. If this fails, stop so later tests do not assume a published first portrait.
+- `A_reopen_without_write`: release the download and reopen the same slot, without another capture or write.
+- `B_second_capture`: only if A succeeds, capture the same subject again and read it back.
+- `C_before_name_release` / `C_name_invalidation` / `C_reopen_without_write`: after a readback failure, record validity, release the exact most recently accepted texture name, wait for invalidation, then reopen the existing photo without writing again. `C_name_already_invalid` identifies names that were invalid before release; this does not demonstrate an invalidation transition.
+- `D_backup_without_write`: if C cannot recover, try the backup reader last, with no explicit download handle or accepted card texture active. This measures backup recovery after C, not an independent backup test against untouched cache state.
+
+The name-invalidation probe is experimental, based on the game's [pause-menu mugshot lifecycle](https://github.com/JayKoZa/RDR2-Decompiled-Scripts/blob/a111493215b9db0b11c8f477816280f412c8b2de/script_mp_rel/pause_menu.c#L333-L360); it is not a verified fix for this cache. A successful handle or valid name alone does not prove fresh pixels. No gameplay fallback, slot rotation, or unverified cache type is enabled by this diagnostic build.
+
 ## Development
 
 Use `dev` for ongoing work. Update `main` when explicitly requested.
 
-Run `./tests/run-tests.ps1` from PowerShell to compile and execute the deterministic AI, handoff, keyboard, card-texture, spawn, portrait-startup, portrait-cache, and owned-ped cleanup tests. The native-shim tests exercise actual production functions; they cannot verify the game's rendering or establish the cause of an in-game engine failure. Build output stays under `tmp/tests`.
+Run `./tests/run-tests.ps1` from PowerShell to compile and execute the deterministic AI, handoff, keyboard, card-texture, spawn, portrait-startup, portrait-cache, owned-ped cleanup, and diagnostic-driver tests. The native-shim tests exercise actual production functions; they cannot verify the game's rendering or establish the cause of an in-game engine failure. Build output stays under `tmp/tests`.
 
 For in-game validation, check **U** from idle, receiving a contract at two different clerks, **I** and card flip/put-away, interrupting a handoff, escaping behind a wall and returning, a lasso/ragdoll encounter, photographing a corpse, and collecting one reward. Pause during a handoff as well: gameplay deadlines should stay frozen. The physical hand transfer and native AI behavior cannot be verified by the standalone tests.
 
