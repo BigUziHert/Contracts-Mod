@@ -28,6 +28,9 @@ enum ContractState { CONTRACT_NONE, CONTRACT_UNKNOWN, CONTRACT_FOUND, CONTRACT_D
 enum class ContractStartFailure { None, Interrupted, InvalidModel, ModelLoadTimeout, PedCreationFailed, PortraitFailed, PedPoolFull, CleanupPending, PhotoDiagnosticComplete };
 static ContractStartFailure lastStartFailure = ContractStartFailure::None;
 static const char* lastPhotoStage = "none";
+// Session-wide portrait slot bookkeeping; see NextPhotoSlot in the target portrait section.
+static unsigned photoSlotsBound = 0; // one bit per slot offset from Card::kPhotoSlot whose texture a card was bound to
+static int photoSlotCursor = 0;
 
 // The single ped created by this mod remains tracked even if DELETE_PED clears its argument.
 // Keeping this outside C prevents contract reset from losing an unconfirmed deletion.
@@ -483,8 +486,6 @@ static void ReleaseTargetPhoto();
 // one. Both records survive contract reset: slots bound during this session are skipped for the
 // rest of it, and the cursor spreads the remaining writes so a retry never repeats its slot.
 // Only once every slot has been bound does the least recently used one get rewritten.
-static unsigned photoSlotsBound = 0; // one bit per slot offset from Card::kPhotoSlot
-static int photoSlotCursor = 0;
 static void MarkPhotoSlotBound()
 {
 	int offset = C.photoSlot - Card::kPhotoSlot;
