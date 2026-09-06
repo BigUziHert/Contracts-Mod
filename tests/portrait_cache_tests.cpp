@@ -131,6 +131,9 @@ static unsigned ActiveDownloads()
 }
 static ULONGLONG GetTickCount64() { return world.nowMs; }
 static ULONGLONG RuntimeNowMs() { return world.nowMs; }
+static void SetRuntimePaused(bool) {} // Runtime pause accounting is covered by spawn_tests.
+namespace HUD { static bool IS_PAUSE_MENU_ACTIVE() { return false; } }
+namespace CAMERA { static bool IS_SCREEN_FADED_OUT() { return false; } }
 static bool PlayerAvailable() { return world.playerAvailable; }
 static void MaintainOwnedPedCleanup() {} // The independent spawn suite exercises ped ownership.
 static void WAIT(DWORD delay)

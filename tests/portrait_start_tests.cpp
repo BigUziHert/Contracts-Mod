@@ -27,7 +27,7 @@ static void Check(bool condition, const char* description)
     }
 }
 
-enum class CaptureResult { Failure, Success, Interrupt, RemoveSubject };
+enum class CaptureResult { Failure, Success, Interrupt, RemoveSubject, SuccessRemoveSubject, SuccessKillSubject, SuccessInterrupt };
 struct FailureLog { Hash model; int attempt; int reason; };
 static struct World
 {
@@ -38,6 +38,7 @@ static struct World
     bool interruptAfterSpawn = false;
     bool interruptOnYield = false;
     bool targetExists = false;
+    bool targetDying = false;
     bool frozen = false;
     bool collision = true;
     bool visible = true;
@@ -131,7 +132,7 @@ namespace PED
 {
 static bool IS_PED_DEAD_OR_DYING(Ped ped, bool)
 {
-    return ped == kPlayer && world.playerDying;
+    return (ped == kPlayer && world.playerDying) || (ped == kTarget && world.targetDying);
 }
 static void SET_BLOCKING_OF_NON_TEMPORARY_EVENTS(Ped ped, bool)
 {
@@ -174,9 +175,11 @@ static bool PhotographPed(Ped subject)
     world.subjects.push_back(subject);
     world.captureFrames.push_back(world.frame);
     world.visible = false; // PhotographPed hides its subject before entering the capture pipeline.
-    world.acceptedPhoto = result == CaptureResult::Success;
-    if (result == CaptureResult::Interrupt) world.playerId = 99;
-    if (result == CaptureResult::RemoveSubject) world.targetExists = false;
+    world.acceptedPhoto = result == CaptureResult::Success || result == CaptureResult::SuccessRemoveSubject ||
+        result == CaptureResult::SuccessKillSubject || result == CaptureResult::SuccessInterrupt;
+    if (result == CaptureResult::Interrupt || result == CaptureResult::SuccessInterrupt) world.playerId = 99;
+    if (result == CaptureResult::RemoveSubject || result == CaptureResult::SuccessRemoveSubject) world.targetExists = false;
+    if (result == CaptureResult::SuccessKillSubject) world.targetDying = true;
     return world.acceptedPhoto;
 }
 
@@ -289,6 +292,21 @@ int main()
     Check(Prepare() == 0 && world.subjects.size() == 1 && world.frame == 0,
         "a vanished target is not retried");
     CheckFailed(0);
+
+    Reset({ CaptureResult::SuccessRemoveSubject });
+    Check(Prepare() == 0 && world.subjects.size() == 1 && world.frame == 0,
+        "a successful texture cannot deploy a subject removed during capture");
+    CheckFailed(0);
+
+    Reset({ CaptureResult::SuccessKillSubject });
+    Check(Prepare() == 0 && world.subjects.size() == 1 && world.frame == 0,
+        "a subject killed during successful capture is cleaned up without retry or deployment");
+    CheckFailed(1);
+
+    Reset({ CaptureResult::SuccessInterrupt });
+    Check(Prepare() == 0 && lastStartFailure == ContractStartFailure::Interrupted,
+        "player replacement during successful capture aborts before exposing the subject");
+    CheckFailed(1);
 
     Reset({});
     world.spawnFails = true;

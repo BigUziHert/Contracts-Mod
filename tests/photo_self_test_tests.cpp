@@ -64,6 +64,9 @@ static struct TestWorld
 #include "photo_self_test_state.h"
 
 static ULONGLONG GetTickCount64() { return world.nowMs; }
+static void SetRuntimePaused(bool) {} // Runtime pause accounting is covered by spawn_tests.
+namespace HUD { static bool IS_PAUSE_MENU_ACTIVE() { return false; } }
+namespace CAMERA { static bool IS_SCREEN_FADED_OUT() { return false; } }
 static bool PlayerAvailable() { return world.playerAvailable; }
 static void MaintainOwnedPedCleanup() {}
 static void MaintainPortraitAndCard()

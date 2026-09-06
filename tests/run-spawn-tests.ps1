@@ -21,9 +21,24 @@ foreach ($bountyConstant in @('kStreamTimeoutMs', 'kPedSpawnRetryMs', 'kPedSpawn
     $bountyHeader += $bountyMatches[0].Value
 }
 $bountyHeader += '}'
+$bountyHeader += 'namespace Card {'
+foreach ($bountyConstant in @('kPhotoSlotCount', 'kStateOutro')) {
+    $bountyMatches = [regex]::Matches($bountyData, ('constexpr\s+\w+\s+' + $bountyConstant + '\s*=[^;]+;'))
+    if ($bountyMatches.Count -ne 1) { throw "Expected exactly one production constant: $bountyConstant" }
+    $bountyHeader += $bountyMatches[0].Value
+}
+$bountyHeader += '}'
 $bountyPatterns = @(
+    '(?m)^enum ContractState\s*\{[^\r\n]+\};',
+    '(?m)^static ContractState\s+g_state[^\r\n]+;',
     '(?m)^enum class ContractStartFailure\s*\{[^\r\n]+\};',
     '(?m)^static ContractStartFailure lastStartFailure[^\r\n]+;',
+    '(?m)^static const char\* lastPhotoStage[^\r\n]+;',
+    '(?m)^static unsigned photoSlotsBound[^\r\n]+;',
+    '(?m)^static ULONGLONG pausedDurationMs[^\r\n]+;',
+    '(?m)^static ULONGLONG pauseStartedMs[^\r\n]+;',
+    '(?ms)^static void SetRuntimePaused\(bool paused\)\s*\{.*?^\}',
+    '(?ms)^static ULONGLONG RuntimeNowMs\(\)\s*\{.*?^\}',
     '(?m)^static bool LivingPed\(Ped ped\)[^\r\n]+',
     '(?m)^static bool PlayerAvailable\(\)[^\r\n]+',
     '(?ms)^struct OwnedPedRuntime\s*\{.*?^\};',
@@ -39,7 +54,13 @@ $bountyPatterns = @(
     '(?ms)^template<typename Pred> static bool WaitUntil\([^\r\n]+\)\s*\{.*?^\}',
     '(?ms)^static bool LoadModel\(Hash model\)\s*\{.*?^\}',
     '(?ms)^static Ped SpawnPed\(Hash model, const Vector3& pos\)\s*\{.*?^\}',
-    '(?ms)^static void StartRemoteContract\(\)\s*\{.*?^\}'
+    '(?ms)^static bool CanPrepareContract\(\)\s*\{.*?^\}',
+    '(?ms)^static void StartRemoteContract\(\)\s*\{.*?^\}',
+    '(?m)^static Ped remoteRequestPlayer[^\r\n]+;',
+    '(?m)^static ULONGLONG remoteRequestUntilMs[^\r\n]+;',
+    '(?m)^static Ped remoteCardPlayer[^\r\n]+;',
+    '(?m)^static ULONGLONG remoteCardUntilMs[^\r\n]+;',
+    '(?ms)^static bool ConsumeRemoteContractRequest\(bool pressed\)\s*\{.*?^\}'
 )
 foreach ($bountyPattern in $bountyPatterns) {
     $bountyMatches = [regex]::Matches($bountySource, $bountyPattern)

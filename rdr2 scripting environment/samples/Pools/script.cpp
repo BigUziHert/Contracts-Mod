@@ -25,7 +25,7 @@
 
 // ===== [ STATE ] =====
 enum ContractState { CONTRACT_NONE, CONTRACT_UNKNOWN, CONTRACT_FOUND, CONTRACT_DEAD, CONTRACT_PAID };
-enum class ContractStartFailure { None, Interrupted, InvalidModel, ModelLoadTimeout, PedCreationFailed, PortraitFailed, PedPoolFull, CleanupPending, PhotoDiagnosticComplete };
+enum class ContractStartFailure { None, Interrupted, InvalidModel, ModelLoadTimeout, PedCreationFailed, PortraitFailed, PedPoolFull, CleanupPending, PhotoDiagnosticComplete, PhotoCacheExhausted };
 static ContractStartFailure lastStartFailure = ContractStartFailure::None;
 static const char* lastPhotoStage = "none";
 // Session-wide portrait slot bookkeeping; see NextPhotoSlot in the target portrait section.
@@ -334,6 +334,7 @@ static void ReportContractStartFailure()
 	case ContractStartFailure::PedPoolFull: DisplaySubtitle("NO ROOM FOR ANOTHER TARGET. TRY AGAIN AFTER LEAVING THE AREA."); break;
 	case ContractStartFailure::CleanupPending: DisplaySubtitle("PREVIOUS TARGET IS STILL BEING REMOVED. TRY AGAIN SHORTLY."); break;
 	case ContractStartFailure::PhotoDiagnosticComplete: DisplaySubtitle("PHOTO TEST FINISHED. SEE BountyContracts-photo-test.log."); break;
+	case ContractStartFailure::PhotoCacheExhausted: DisplaySubtitle("PORTRAIT SLOTS FULL. RESTART THE GAME FOR NEW CONTRACTS."); break;
 	case ContractStartFailure::None: DisplaySubtitle("CONTRACT REQUEST FAILED. TRY AGAIN."); break;
 	}
 }
@@ -371,6 +372,7 @@ template<typename Pred> static bool WaitUntil(DWORD timeoutMs, Pred pred)
 	for (;;)
 	{
 		MaintainOwnedPedCleanup();
+		SetRuntimePaused(!PlayerAvailable() || HUD::IS_PAUSE_MENU_ACTIVE() || CAMERA::IS_SCREEN_FADED_OUT());
 		if (!PlayerAvailable()) return false;
 		MaintainPortraitAndCard();
 		if (pred()) return true;
@@ -861,14 +863,15 @@ static Ped SpawnTargetWithPhoto(Hash model, const ContractDef& def)
 	bool photographed = false;
 	for (int attempt = 1; attempt <= Card::kPhotoAttempts; ++attempt)
 	{
-		if (PlayerAvailable() && ENTITY::DOES_ENTITY_EXIST(ped) && PhotographPed(ped))
+		// Capture yields: a completed texture does not prove its subject/player still exists.
+		if (PlayerAvailable() && LivingPed(ped) && PhotographPed(ped) && PlayerAvailable() && LivingPed(ped))
 		{
 			photographed = true;
 			break;
 		}
 		lastStartFailure = PlayerAvailable() ? ContractStartFailure::PortraitFailed : ContractStartFailure::Interrupted;
 		LogContractStartFailure(model, attempt);
-		if (lastStartFailure == ContractStartFailure::Interrupted || !ENTITY::DOES_ENTITY_EXIST(ped)) break;
+		if (lastStartFailure == ContractStartFailure::Interrupted || !LivingPed(ped)) break;
 		if (attempt < Card::kPhotoAttempts) WAIT(0);
 	}
 	if (!photographed)
@@ -1464,11 +1467,29 @@ static void ClearContract(bool deleteTarget)
 	g_state = CONTRACT_NONE;
 }
 
+// Reject known preparation failures before ending an existing hunt or releasing its portrait.
+static bool CanPrepareContract()
+{
+	if (!PlayerAvailable())
+	{
+		lastStartFailure = ContractStartFailure::Interrupted;
+		LogContractStartFailure(0, 0);
+		return false;
+	}
+	for (int i = 0; i < Card::kPhotoSlotCount; ++i)
+		if (!(photoSlotsBound & (1u << i))) return true;
+	lastStartFailure = ContractStartFailure::PhotoCacheExhausted;
+	lastPhotoStage = "photo_slots_exhausted";
+	LogContractStartFailure(0, 0);
+	return false;
+}
+
 // Rolls a random contract, photographs and spawns its target. False if nothing could be spawned.
 static bool StartContract()
 {
 	lastStartFailure = ContractStartFailure::None;
 	lastPhotoStage = "none";
+	if (!CanPrepareContract()) return false;
 	ClearContract(true);
 	for (int attempt = 0; attempt < Tune::kSpawnAttempts; ++attempt)
 	{
@@ -1930,6 +1951,7 @@ static void StartRemoteContract()
 	// Run creation on a fresh game frame after the keyboard event, then refresh the player snapshot.
 	WAIT(0);
 	UpdatePlayer();
+	SetRuntimePaused(!PlayerAvailable() || HUD::IS_PAUSE_MENU_ACTIVE() || CAMERA::IS_SCREEN_FADED_OUT());
 	if (pedMe != requestedPlayer || !CanStartInteraction())
 	{
 		lastStartFailure = ContractStartFailure::Interrupted;
@@ -1939,6 +1961,50 @@ static void StartRemoteContract()
 	}
 	if (StartContract()) { C.cardOpenPending = true; DisplaySubtitle("FIND THE TARGET"); }
 	else ReportContractStartFailure();
+}
+
+// Keep one U release across this card's put-away outro. Other blocked interactions discard it.
+static Ped remoteRequestPlayer = 0;
+static ULONGLONG remoteRequestUntilMs = 0;
+static Ped remoteCardPlayer = 0;
+static ULONGLONG remoteCardUntilMs = 0;
+static bool ConsumeRemoteContractRequest(bool pressed)
+{
+	ULONGLONG now = RuntimeNowMs();
+	if (!PlayerAvailable() || HUD::IS_PAUSE_MENU_ACTIVE() || CAMERA::IS_SCREEN_FADED_OUT() ||
+		handoff.active || g_state == CONTRACT_PAID || (remoteRequestPlayer && remoteRequestPlayer != pedMe))
+	{
+		remoteRequestPlayer = 0;
+		remoteCardPlayer = 0;
+		return false;
+	}
+	if (Cd.examining && Cd.inspectingPed == pedMe)
+	{
+		remoteCardPlayer = pedMe;
+		remoteCardUntilMs = now + 3000;
+	}
+	bool puttingAway = Cd.examining && Cd.inspectingPed == pedMe &&
+		(TASK::GET_ITEM_INTERACTION_STATE(pedMe) == Card::kStateOutro || !OwnCardTaskRunning());
+	// Remember our inspector briefly: the first U release can arrive after prop retirement.
+	if (remoteCardPlayer == pedMe && now < remoteCardUntilMs && !Cd.obj &&
+		TASK::GET_ITEM_INTERACTION_STATE(pedMe) == Card::kStateOutro)
+		puttingAway = true;
+	if (!Cd.obj && !puttingAway) remoteCardPlayer = 0;
+	bool ready = !Cd.obj && CanStartInteraction();
+	if (pressed && (ready || puttingAway))
+	{
+		remoteRequestPlayer = pedMe;
+		remoteRequestUntilMs = now + 3000;
+	}
+	if (!remoteRequestPlayer) return false;
+	if (now >= remoteRequestUntilMs || (!ready && !puttingAway))
+	{
+		remoteRequestPlayer = 0;
+		return false;
+	}
+	if (!ready) return false;
+	remoteRequestPlayer = 0;
+	return true;
 }
 
 void ScriptMain()
@@ -1952,7 +2018,7 @@ void ScriptMain()
 		UpdatePlayer();
 		SetRuntimePaused(!PlayerAvailable() || HUD::IS_PAUSE_MENU_ACTIVE() || CAMERA::IS_SCREEN_FADED_OUT());
 		MaintainPortraitAndCard();
-		bool bypassPressed = IsKeyJustUp(Tune::kBypassClerkKey);
+		bool bypassPressed = ConsumeRemoteContractRequest(IsKeyJustUp(Tune::kBypassClerkKey));
 		bool inspectPressed = IsKeyJustUp(Tune::kInspectCardKey);
 		if (!PlayerAvailable() || (previousPlayer && previousPlayer != pedMe))
 		{

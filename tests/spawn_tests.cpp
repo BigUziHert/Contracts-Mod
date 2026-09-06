@@ -65,6 +65,12 @@ static struct World
     unsigned deleteDelayFrames = 0;
     unsigned deletionFrame = std::numeric_limits<unsigned>::max();
     bool interactionAllowed = true;
+    bool paused = false;
+    bool faded = false;
+    bool ownCardTask = false;
+    Hash itemState = 0;
+    unsigned pauseFrame = std::numeric_limits<unsigned>::max();
+    unsigned resumeFrame = std::numeric_limits<unsigned>::max();
     unsigned interactionBlockedFrame = std::numeric_limits<unsigned>::max();
     bool remoteStartSucceeds = true;
     bool contractActive = false;
@@ -90,6 +96,7 @@ static void WAIT(DWORD delay)
     if (world.frame >= world.deletionFrame) world.spawnedAlive = false;
     if (world.frame >= world.playerChangeFrame) world.playerId = 99;
     if (world.frame >= world.interactionBlockedFrame) world.interactionAllowed = false;
+    if (world.frame >= world.pauseFrame) world.paused = world.frame < world.resumeFrame;
     Check(world.frame < 10000, "polling remains bounded");
 }
 
@@ -97,6 +104,13 @@ namespace PLAYER
 {
 static Ped PLAYER_PED_ID() { return world.playerId; }
 }
+
+namespace HUD { static bool IS_PAUSE_MENU_ACTIVE() { return world.paused; } }
+namespace CAMERA { static bool IS_SCREEN_FADED_OUT() { return world.faded; } }
+namespace TASK { static Hash GET_ITEM_INTERACTION_STATE(Ped) { return world.itemState; } }
+
+// Only the hash constant is needed here; the production compile verifies the full Joaat table.
+constexpr Hash Joaat(const char*) { return 0x13AA268C; }
 
 namespace STREAMING
 {
@@ -218,6 +232,9 @@ static void DELETE_PED(Ped* ped)
 }
 
 static struct { bool cardOpenPending = false; } C;
+static struct { int obj = 0; bool examining = false; Ped inspectingPed = 0; } Cd;
+static struct { bool active = false; } handoff;
+static bool OwnCardTaskRunning() { return world.ownCardTask; }
 static void DisplaySubtitle(const char* message) { world.messages.push_back(message); }
 static void UpdatePlayer();
 static bool CanStartInteraction();
@@ -261,6 +278,15 @@ static void Reset()
     world = World();
     pedMe = kPlayer;
     C = {};
+    Cd = {};
+    handoff = {};
+    g_state = CONTRACT_NONE;
+    photoSlotsBound = 0;
+    pausedDurationMs = pauseStartedMs = 0;
+    remoteRequestPlayer = 0;
+    remoteRequestUntilMs = 0;
+    remoteCardPlayer = 0;
+    remoteCardUntilMs = 0;
     ownedPed = OwnedPedRuntime();
     ownedPedsCreated = ownedPedsDeleted = ownedPedsReleased = 0;
     lastStartFailure = ContractStartFailure::None;
@@ -492,6 +518,108 @@ static void TestRemoteStart()
     Check(world.messages.size() == 1, "failed remote creation never displays a successful hunt objective");
 }
 
+static void TestPauseDuringWait()
+{
+    Reset();
+    const ULONGLONG started = RuntimeNowMs();
+    world.pauseFrame = 1;
+    world.resumeFrame = 5;
+    Check(WaitUntil(1000, [] { return world.frame == 6; }), "wait completes across a whole pause interval");
+    Check(world.nowMs == started + 6 * kFrameMs && RuntimeNowMs() == started + 2 * kFrameMs,
+        "streaming uses wall time while runtime excludes a pause entirely inside the wait");
+
+    Reset();
+    world.pauseFrame = 1;
+    Check(!WaitUntil(100, [] { return false; }), "a paused streaming operation still has a bounded timeout");
+    Check(RuntimeNowMs() == 1000 + kFrameMs, "runtime stays frozen when a wait returns during pause");
+    world.nowMs += 5000;
+    SetRuntimePaused(false);
+    Check(RuntimeNowMs() == 1000 + kFrameMs, "resuming after the timeout excludes the remaining pause");
+}
+
+static void TestContractPreflight()
+{
+    Reset();
+    photoSlotsBound = 0xFFFFFFFFu;
+    Check(!CanPrepareContract() && lastStartFailure == ContractStartFailure::PhotoCacheExhausted,
+        "all inspected slots refuse preparation before the caller clears its active contract");
+    Check(photoSlotsBound == 0xFFFFFFFFu && world.creates == 0 && world.releases == 0,
+        "exhaustion neither resets slot ownership nor starts capture");
+    for (int slot = 0; slot < Card::kPhotoSlotCount; ++slot)
+    {
+        photoSlotsBound = 0xFFFFFFFFu & ~(1u << slot);
+        Check(CanPrepareContract(), "any single remaining slot permits preparation");
+    }
+    Reset();
+    world.playerDying = true;
+    Check(!CanPrepareContract() && lastStartFailure == ContractStartFailure::Interrupted,
+        "an unavailable player is rejected before contract reset");
+}
+
+static void TestDeferredRemoteInput()
+{
+    Reset();
+    Check(ConsumeRemoteContractRequest(true), "idle U is consumed immediately");
+    Check(!ConsumeRemoteContractRequest(false), "one release cannot start twice");
+
+    Cd = { 123, true, kPlayer };
+    world.ownCardTask = true;
+    world.itemState = Card::kStateOutro;
+    world.interactionAllowed = false;
+    Check(!ConsumeRemoteContractRequest(true) && remoteRequestPlayer == kPlayer,
+        "U during owned card outro is retained while its prop exists");
+    world.nowMs += 400; // well beyond keyboard.cpp's 100 ms release window
+    Check(!ConsumeRemoteContractRequest(false), "pending request waits for the outro");
+    Cd = {};
+    Check(!ConsumeRemoteContractRequest(false) && remoteRequestPlayer == kPlayer,
+        "prop retirement does not discard U while the native outro still runs");
+    world.itemState = 0;
+    world.interactionAllowed = true;
+    Check(ConsumeRemoteContractRequest(false), "the stored release runs after prop and task retirement");
+    Check(!ConsumeRemoteContractRequest(false), "the stored release runs exactly once");
+
+    Reset();
+    Cd = { 123, true, kPlayer };
+    world.ownCardTask = true;
+    world.interactionAllowed = false;
+    Check(!ConsumeRemoteContractRequest(false), "own inspection is observed before prop retirement");
+    Cd = {};
+    world.itemState = Card::kStateOutro;
+    Check(!ConsumeRemoteContractRequest(true) && remoteRequestPlayer == kPlayer,
+        "a first U release after prop retirement still queues during our remembered outro");
+    world.itemState = 0;
+    world.interactionAllowed = true;
+    Check(ConsumeRemoteContractRequest(false), "post-retirement first release runs when the native outro finishes");
+
+    for (int cancel = 0; cancel < 6; ++cancel)
+    {
+        Reset();
+        Cd = { 123, true, kPlayer };
+        world.itemState = Card::kStateOutro;
+        world.ownCardTask = true;
+        world.interactionAllowed = false;
+        Check(!ConsumeRemoteContractRequest(true) && remoteRequestPlayer, "cancellation test queues one outro release");
+        if (cancel == 0) world.paused = true;
+        if (cancel == 1) world.faded = true;
+        if (cancel == 2) { world.playerId = 99; pedMe = 99; }
+        if (cancel == 3) world.nowMs += 3000;
+        if (cancel == 4) handoff.active = true;
+        if (cancel == 5) g_state = CONTRACT_PAID;
+        Check(!ConsumeRemoteContractRequest(false) && !remoteRequestPlayer,
+            "pause, fade, player change, expiry, handoff and payment cancel a queued request");
+    }
+    Reset();
+    world.interactionAllowed = false;
+    Check(!ConsumeRemoteContractRequest(true) && !remoteRequestPlayer, "other blocked interactions do not queue U");
+    Reset();
+    Cd = { 123, true, kPlayer };
+    world.ownCardTask = true;
+    Check(!ConsumeRemoteContractRequest(true) && !remoteRequestPlayer, "ordinary inspection requires put-away before replacing");
+    Reset();
+    g_state = CONTRACT_DEAD;
+    Check(ConsumeRemoteContractRequest(true), "a photographed contract retains the existing U reopen path");
+}
+
 int main()
 {
     Check(Tune::kPedSpawnRetryMs > Tune::kPedSpawnRetryDelayMs && Tune::kPedSpawnRetryDelayMs > 0,
@@ -507,5 +635,8 @@ int main()
     TestModelFailures();
     TestPlayerInterruption();
     TestRemoteStart();
+    TestPauseDuringWait();
+    TestContractPreflight();
+    TestDeferredRemoteInput();
     std::printf("All %u spawn checks passed (actual production functions).\n", checks);
 }

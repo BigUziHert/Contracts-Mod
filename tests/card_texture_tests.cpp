@@ -106,6 +106,7 @@ static void Check(bool condition, const char* description)
 }
 
 static ULONGLONG RuntimeNowMs() { return nowMs; }
+static void SetRuntimePaused(bool) {} // Runtime pause accounting is covered by spawn_tests.
 static ULONGLONG GetTickCount64() { return nowMs; }
 static bool PlayerAvailable() { return playerAvailable; }
 static bool CanStartInteraction() { return probeCanStart && PlayerAvailable() && !probeTaskRunning; }
@@ -214,6 +215,7 @@ static bool IS_PAUSE_MENU_ACTIVE()
 }
 namespace CAMERA
 {
+static bool IS_SCREEN_FADED_OUT() { return false; }
 static Vector3 GET_GAMEPLAY_CAM_COORD() { return probeCamera; }
 static Vector3 GET_GAMEPLAY_CAM_ROT(int order)
 {
