@@ -26,6 +26,7 @@ static struct
 static struct
 {
     Object obj = 7;
+    bool ownsObj = true;
     bool customApplied = false;
     ULONGLONG textureRefreshUntilMs = 0;
     bool examining = false;
@@ -37,8 +38,14 @@ static ULONGLONG nowMs = 1000;
 static bool objectAlive = true;
 static bool inspectorAlive = true;
 static bool objectTextured = false;
+static bool objectVisible = true;
+static bool textureAvailable = true;
+static bool playerAvailable = true;
+static ULONGLONG textureAvailableAtMs = 0;
 static unsigned binds = 0;
 static unsigned cacheRequests = 0;
+static unsigned visibilityWrites = 0;
+static unsigned waitCalls = 0;
 static unsigned flipWrites = 0;
 static unsigned checks = 0;
 
@@ -53,6 +60,15 @@ static void Check(bool condition, const char* description)
 }
 
 static ULONGLONG RuntimeNowMs() { return nowMs; }
+static ULONGLONG GetTickCount64() { return nowMs; }
+static bool PlayerAvailable() { return playerAvailable; }
+static void WAIT(DWORD milliseconds)
+{
+    Check(milliseconds == 0, "readiness polling yields one game frame");
+    ++waitCalls;
+    nowMs += 10;
+    if (textureAvailableAtMs && nowMs >= textureAvailableAtMs) textureAvailable = true;
+}
 static bool TargetPhotoReady() { return C.photoTexture[0] && C.photoTextureValid; }
 static Hash joaat(const char* text) { return std::strcmp(text, "test_portrait") == 0 ? 123u : 0u; }
 
@@ -61,6 +77,12 @@ namespace ENTITY
 static bool DOES_ENTITY_EXIST(int entity)
 {
     return (entity == 7 && objectAlive) || (entity == 88 && inspectorAlive);
+}
+static void SET_ENTITY_VISIBLE(Object object, bool visible)
+{
+    Check(object == 7 && objectAlive && Cd.ownsObj, "visibility changes only affect the live owned card");
+    ++visibilityWrites;
+    objectVisible = visible;
 }
 }
 namespace OBJECT
@@ -79,6 +101,11 @@ static void _REQUEST_PEDSHOT_TEXTURE_LOCAL_BACKUP_DOWNLOAD(int slot, int cacheTy
 {
     Check(slot == Card::kPhotoSlot && cacheType == C.photoCacheType, "portrait cache ownership is preserved");
     ++cacheRequests;
+}
+static bool _TEXTURE_DOWNLOAD_TEXTURE_NAME_IS_VALID(const char* name)
+{
+    Check(std::strcmp(name, "test_portrait") == 0, "residency checks use the accepted portrait name");
+    return textureAvailable;
 }
 }
 namespace PED
@@ -104,7 +131,9 @@ static void Reset()
     nowMs = 1000;
     objectAlive = inspectorAlive = true;
     objectTextured = false;
-    binds = cacheRequests = flipWrites = 0;
+    objectVisible = textureAvailable = playerAvailable = true;
+    textureAvailableAtMs = 0;
+    binds = cacheRequests = flipWrites = visibilityWrites = waitCalls = 0;
 }
 
 static void TestHandoffToInspection()
@@ -150,23 +179,80 @@ static void TestDelayedReadiness()
 {
     Reset();
     C.photoTextureValid = false;
+    textureAvailable = false;
     RefreshCardTextureAfterTransition();
     MaintainPortraitAndCard();
-    Check(binds == 0 && !Cd.customApplied && cacheRequests == 0,
-        "unready portrait is neither bound nor marked applied");
+    Check(binds == 0 && !Cd.customApplied && cacheRequests == 1 && !objectVisible,
+        "unready portrait stays requested while its owned card is hidden");
     nowMs = Cd.textureRefreshUntilMs + 1;
-    C.photoTextureValid = true;
+    textureAvailable = true;
     MaintainPortraitAndCard();
-    Check(binds == 1 && objectTextured,
-        "first ready portrait is applied even if streaming outlasted the settling window");
+    Check(binds == 1 && objectTextured && objectVisible && C.photoTextureValid,
+        "recovered portrait is bound and shown even after the old settling window expired");
+    Check(Cd.textureRefreshUntilMs == nowMs + Card::kTextureSettleMs,
+        "residency recovery starts a fresh bounded settling window");
+    nowMs = Cd.textureRefreshUntilMs;
     MaintainPortraitAndCard();
-    Check(binds == 1, "late first success does not create an unbounded retry loop");
+    Check(binds == 1, "recovery settling expires without an unbounded retry loop");
 
     Reset();
     C.photoTexture[0] = '\0';
     RefreshCardTextureAfterTransition();
     MaintainPortraitAndCard();
-    Check(binds == 0 && !Cd.customApplied, "an empty texture name cannot count as ready");
+    Check(binds == 0 && !Cd.customApplied && cacheRequests == 0 && !objectVisible,
+        "an empty texture name is never requested or shown as a ready card");
+}
+
+static void TestResidencyLossAfterSuccessfulBinding()
+{
+    Reset();
+    RefreshCardTextureAfterTransition();
+    nowMs = Cd.textureRefreshUntilMs + 1;
+    textureAvailable = objectTextured = false;
+    MaintainPortraitAndCard();
+    Check(!C.photoTextureValid && !objectVisible && binds == 1 && cacheRequests == 1,
+        "lost residency hides a previously settled card without losing its accepted name");
+    MaintainPortraitAndCard();
+    Check(cacheRequests == 2 && std::strcmp(C.photoTexture, "test_portrait") == 0,
+        "invalid residency keeps requesting the same accepted slot");
+    textureAvailable = true;
+    MaintainPortraitAndCard();
+    Check(C.photoTextureValid && objectTextured && objectVisible && binds == 2,
+        "false-to-true residency invalidates an old applied latch and restores the card");
+
+    Cd.ownsObj = false;
+    textureAvailable = false;
+    const unsigned previousVisibilityWrites = visibilityWrites;
+    MaintainPortraitAndCard();
+    Check(visibilityWrites == previousVisibilityWrites && objectVisible,
+        "residency loss never hides a foreign game-owned prop");
+}
+
+static void TestReadinessGate()
+{
+    Reset();
+    C.photoTexture[0] = '\0';
+    Check(!EnsureTargetPhotoReady() && cacheRequests == 0 && waitCalls == 0,
+        "readiness gate rejects a portrait that was never accepted without polling");
+
+    Reset();
+    textureAvailable = false; // The remembered flag is stale until maintenance rechecks it.
+    textureAvailableAtMs = nowMs + 30;
+    Check(EnsureTargetPhotoReady() && waitCalls == 3 && C.photoTextureValid && objectVisible && objectTextured,
+        "readiness gate revalidates stale readiness and waits for residency recovery");
+
+    Reset();
+    textureAvailable = false;
+    const ULONGLONG startedMs = nowMs;
+    Check(!EnsureTargetPhotoReady() && !objectVisible && binds == 0,
+        "readiness gate fails cleanly while an unavailable portrait remains hidden");
+    Check(nowMs - startedMs >= Card::kPhotoNameMs && nowMs - startedMs < Card::kPhotoNameMs + 10,
+        "readiness gate stops at the production timeout");
+
+    Reset();
+    playerAvailable = false;
+    Check(!EnsureTargetPhotoReady() && cacheRequests == 0 && waitCalls == 0,
+        "player cancellation stops readiness polling immediately");
 }
 
 static void TestMissingObjectsAndInspector()
@@ -202,6 +288,8 @@ int main()
     Check(Card::kTextureSettleMs > 0, "production settling interval is positive");
     TestHandoffToInspection();
     TestDelayedReadiness();
+    TestResidencyLossAfterSuccessfulBinding();
+    TestReadinessGate();
     TestMissingObjectsAndInspector();
     std::printf("All %u card texture checks passed (actual production functions).\n", checks);
 }

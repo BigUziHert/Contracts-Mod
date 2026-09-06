@@ -82,7 +82,9 @@ namespace Tune
 	constexpr int   kPedshotReadyMs   = 4000;    // wait for the ped's assets to stream before the photo
 	// --- streaming ---
 	constexpr DWORD kStreamTimeoutMs  = 5000;    // give up on a model / anim that won't load instead of hanging the script
-	constexpr int   kSpawnAttempts    = 3;       // contract rerolls before "no contracts available"
+	constexpr DWORD kPedSpawnRetryMs = 1200;    // allow transient creation failures to recover across game frames
+	constexpr DWORD kPedSpawnRetryDelayMs = 100; // avoid retrying a loaded model several times in one frame
+	constexpr int   kSpawnAttempts    = 3;       // contract/model rerolls before reporting a creation failure
 }
 
 // ===== [ TYPES ] =====
@@ -322,6 +324,7 @@ namespace Card
 	constexpr DWORD kPhotoUploadMs    = 5000;                       // wait for a previous / current upload to finish
 	constexpr DWORD kPhotoWriteMs     = 8000;                       // poll _NETWORK_PERSONA_PHOTO_WRITE_LOCAL with fixed arguments
 	constexpr DWORD kPhotoNameMs      = 3000;                       // poll _REQUEST_PEDSHOT_TEXTURE_LOCAL_BACKUP_DOWNLOAD this long
+	constexpr int kPhotoAttempts = 2;                              // retry one failed capture before declining to issue a broken card
 }
 // Hashes verified against femga's documented values.
 static_assert(Card::kStateIntro       == 0x19FF3C2A, "card state hash");

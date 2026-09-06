@@ -21,9 +21,13 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <cwchar>
 
 // ===== [ STATE ] =====
 enum ContractState { CONTRACT_NONE, CONTRACT_UNKNOWN, CONTRACT_FOUND, CONTRACT_DEAD, CONTRACT_PAID };
+enum class ContractStartFailure { None, Interrupted, InvalidModel, ModelLoadTimeout, PedCreationFailed, PortraitFailed };
+static ContractStartFailure lastStartFailure = ContractStartFailure::None;
+static const char* lastPhotoStage = "none";
 
 struct ActiveContract
 {
@@ -147,9 +151,46 @@ static bool CanStartInteraction()
 		!TASK::IS_PED_RUNNING_TASK_ITEM_INTERACTION(pedMe);
 }
 
+// Failure-only local diagnostics. Keep gameplay free of the old debug overlay, while preserving
+// the actual failing stage instead of calling every startup error "no contracts available".
+static void LogContractStartFailure(Hash model, int attempt)
+{
+	HMODULE module = nullptr;
+	wchar_t path[MAX_PATH] = {};
+	if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+		reinterpret_cast<LPCWSTR>(&LogContractStartFailure), &module)) return;
+	DWORD length = GetModuleFileNameW(module, path, MAX_PATH);
+	if (!length || length >= MAX_PATH) return;
+	wchar_t* slash = std::wcsrchr(path, L'\\');
+	if (!slash) return;
+	if (wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - path), L"BountyContracts-startup.log") != 0) return;
+	FILE* file = nullptr;
+	if (_wfopen_s(&file, path, L"a") != 0 || !file) return;
+	SYSTEMTIME time;
+	GetSystemTime(&time);
+	fprintf(file, "%04u-%02u-%02uT%02u:%02u:%02uZ start-v2 failure=%d photo=%s attempt=%d model=%08X player=%d current=%d alive=%d freePeds=%d\n",
+		time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond,
+		static_cast<int>(lastStartFailure), lastPhotoStage, attempt, model, pedMe, PLAYER::PLAYER_PED_ID(),
+		LivingPed(pedMe) ? 1 : 0, PED::_GET_NUM_FREE_SLOTS_IN_PED_POOL());
+	fclose(file);
+}
+
 static const char* Literal(const char* text) { return MISC::VAR_STRING(10, "LITERAL_STRING", text); }
 
 static void DisplaySubtitle(const char* message) { DisplayObjective(message); }
+
+static void ReportContractStartFailure()
+{
+	switch (lastStartFailure)
+	{
+	case ContractStartFailure::Interrupted: DisplaySubtitle("CONTRACT REQUEST INTERRUPTED. TRY AGAIN."); break;
+	case ContractStartFailure::InvalidModel: DisplaySubtitle("CONTRACT MODEL UNAVAILABLE. TRY AGAIN."); break;
+	case ContractStartFailure::ModelLoadTimeout: DisplaySubtitle("TARGET MODEL COULD NOT LOAD. TRY AGAIN."); break;
+	case ContractStartFailure::PedCreationFailed: DisplaySubtitle("TARGET COULD NOT SPAWN. TRY AGAIN."); break;
+	case ContractStartFailure::PortraitFailed: DisplaySubtitle("TARGET PHOTO COULD NOT BE PREPARED. TRY AGAIN."); break;
+	case ContractStartFailure::None: DisplaySubtitle("CONTRACT REQUEST FAILED. TRY AGAIN."); break;
+	}
+}
 
 static void FormatMoney(char* out, size_t size, int cents) { sprintf_s(out, size, "$%d.%02d", cents / 100, cents % 100); }
 
@@ -201,15 +242,43 @@ static bool LoadModel(Hash model)
 
 static Ped SpawnPed(Hash model, const Vector3& pos)
 {
-	if (!LoadModel(model)) return 0;
-	Ped ped = PED::CREATE_PED(model, pos, 0.0f, 0, 1, 1, 1);
-	if (ped && ENTITY::DOES_ENTITY_EXIST(ped))
+	lastStartFailure = ContractStartFailure::None;
+	if (!PlayerAvailable()) { lastStartFailure = ContractStartFailure::Interrupted; return 0; }
+	if (!STREAMING::IS_MODEL_VALID(model) || !STREAMING::IS_MODEL_IN_CDIMAGE(model) || !STREAMING::IS_MODEL_A_PED(model))
 	{
-		PED::_SET_RANDOM_OUTFIT_VARIATION(ped, true);
-		ENTITY::PLACE_ENTITY_ON_GROUND_PROPERLY(ped, 1);
+		lastStartFailure = ContractStartFailure::InvalidModel;
+		return 0;
 	}
+	if (!LoadModel(model))
+	{
+		lastStartFailure = PlayerAvailable() ? ContractStartFailure::ModelLoadTimeout : ContractStartFailure::Interrupted;
+		return 0;
+	}
+
+	Ped ped = 0;
+	ULONGLONG nextAttemptMs = 0;
+	// A loaded model does not guarantee that the engine can create its ped this frame.
+	// Keep the model requested and let the game advance between failed creation attempts.
+	bool created = WaitUntil(Tune::kPedSpawnRetryMs, [&] {
+		ULONGLONG now = GetTickCount64();
+		if (now < nextAttemptMs) return false;
+		nextAttemptMs = now + Tune::kPedSpawnRetryDelayMs;
+		ped = PED::CREATE_PED(model, pos, 0.0f, false, true, true, true);
+		return ped && ENTITY::DOES_ENTITY_EXIST(ped);
+	});
+	if (!created || !PlayerAvailable())
+	{
+		lastStartFailure = PlayerAvailable() ? ContractStartFailure::PedCreationFailed : ContractStartFailure::Interrupted;
+		if (ped && ENTITY::DOES_ENTITY_EXIST(ped)) PED::DELETE_PED(&ped);
+		STREAMING::SET_MODEL_AS_NO_LONGER_NEEDED(model);
+		return 0;
+	}
+	ENTITY::SET_ENTITY_AS_MISSION_ENTITY(ped, true, true);
+	PED::_SET_RANDOM_OUTFIT_VARIATION(ped, true);
+	ENTITY::PLACE_ENTITY_ON_GROUND_PROPERLY(ped, 1);
 	STREAMING::SET_MODEL_AS_NO_LONGER_NEEDED(model);
-	return ENTITY::DOES_ENTITY_EXIST(ped) ? ped : 0;
+	if (!ENTITY::DOES_ENTITY_EXIST(ped)) { lastStartFailure = ContractStartFailure::PedCreationFailed; return 0; }
+	return ped;
 }
 
 // ===== [ BLIPS ] =====
@@ -250,8 +319,19 @@ static void AddCorpseBlip()
 // card material and flip flag during yielding waits, which do not run UpdateCard().
 static void MaintainPortraitAndCard()
 {
-	if (C.photoTexture[0] && C.photoTextureValid)
+	if (C.photoTexture[0])
+	{
+		bool wasValid = C.photoTextureValid;
 		NETWORK::_REQUEST_PEDSHOT_TEXTURE_LOCAL_BACKUP_DOWNLOAD(Card::kPhotoSlot, C.photoCacheType);
+		C.photoTextureValid = NETWORK::_TEXTURE_DOWNLOAD_TEXTURE_NAME_IS_VALID(C.photoTexture) != 0;
+		if (C.photoTextureValid && !wasValid)
+		{
+			Cd.customApplied = false;
+			Cd.textureRefreshUntilMs = RuntimeNowMs() + Card::kTextureSettleMs;
+		}
+	}
+	if (Cd.obj && Cd.ownsObj && ENTITY::DOES_ENTITY_EXIST(Cd.obj))
+		ENTITY::SET_ENTITY_VISIBLE(Cd.obj, C.photoTexture[0] && C.photoTextureValid);
 	ApplyCardCustomTexture(); // also runs while the inspect task has not yet reported its primary item
 	if (Cd.examining && Cd.inspectingPed && ENTITY::DOES_ENTITY_EXIST(Cd.inspectingPed))
 		PED::_SET_PED_BLACKBOARD_BOOL(Cd.inspectingPed, Card::kFlipBlackboard, true, -1);
@@ -284,6 +364,7 @@ static bool FinishPhotoAttempt(bool success)
 // Photographs `subject` (parked, frozen, in front of the player) into the local persona-photo cache.
 static bool PhotographPed(Ped subject)
 {
+	lastPhotoStage = "subject";
 	const int ct = Card::kPhotoCacheType;
 	C.photoCacheType = ct;
 	C.photoPedWasReady = C.photoGenOk = false;
@@ -294,6 +375,7 @@ static bool PhotographPed(Ped subject)
 	if (!ENTITY::DOES_ENTITY_EXIST(subject)) return FinishPhotoAttempt(false);
 
 	ENTITY::SET_ENTITY_VISIBLE(subject, !Tune::kPedshotHidden);
+	lastPhotoStage = "previous_upload";
 	if (!WaitUntil(Card::kPhotoUploadMs, []
 	{
 		C.photoUploadPending = NETWORK::_NETWORK_IS_PREVIOUS_UPLOAD_PENDING() != 0;
@@ -305,6 +387,7 @@ static bool PhotographPed(Ped subject)
 	GRAPHICS::_PEDSHOT_SET_PERSONA_PHOTO_TYPE(Card::kPhotoType);
 	GRAPHICS::_0xA1A86055792FB249(0);
 	const char* photoName = PED::IS_PED_MALE(subject) ? Card::kPhotoName : Card::kPhotoFemaleName;
+	lastPhotoStage = "ped_assets";
 	C.photoPedWasReady = WaitUntil(Tune::kPedshotReadyMs, [&]
 	{
 		PED::FORCE_PED_MOTION_STATE(subject, joaat("MotionState_DoNothing"), false, 0, false);
@@ -313,12 +396,14 @@ static bool PhotographPed(Ped subject)
 	if (!C.photoPedWasReady) return FinishPhotoAttempt(false);
 
 	GRAPHICS::_PEDSHOT_PREVIOUS_PERSONA_PHOTO_DATA_CLEANUP();
+	lastPhotoStage = "generate";
 	C.photoGenOk = GRAPHICS::_PEDSHOT_GENERATE_PERSONA_PHOTO(photoName, subject, 0) != 0;
 	GRAPHICS::_PEDSHOT_PREVIOUS_PERSONA_PHOTO_DATA_CLEANUP();
 	PED::FORCE_PED_MOTION_STATE(subject, joaat("MotionState_DoNothing"), false, 0, false);
 	if (!C.photoGenOk) return FinishPhotoAttempt(false);
 	WAIT(0); // the SP script enters the write state on a later frame
 
+	lastPhotoStage = "write";
 	C.photoWritten = WaitUntil(Card::kPhotoWriteMs, [&]
 	{
 		PED::FORCE_PED_MOTION_STATE(subject, joaat("MotionState_DoNothing"), false, 0, false);
@@ -328,6 +413,7 @@ static bool PhotographPed(Ped subject)
 	if (!C.photoWritten) return FinishPhotoAttempt(false);
 
 	WAIT(0);
+	lastPhotoStage = "commit";
 	if (!WaitUntil(Card::kPhotoUploadMs, [&]
 	{
 		PED::FORCE_PED_MOTION_STATE(subject, joaat("MotionState_DoNothing"), false, 0, false);
@@ -338,10 +424,12 @@ static bool PhotographPed(Ped subject)
 	FinishPhotoCapture();
 
 	char name[64] = "";
+	lastPhotoStage = "texture_name";
 	if (!WaitUntil(Card::kPhotoNameMs, [&] { return LookupPhotoTexture(ct, name); }))
 		return FinishPhotoAttempt(false);
 	strcpy_s(C.photoTexture, name);
 	Cd.customApplied = false;   // re-apply the (new) texture to any card that is out
+	lastPhotoStage = "none";
 	return FinishPhotoAttempt(true);
 }
 
@@ -355,6 +443,12 @@ static void ReleaseTargetPhoto()
 }
 static bool TargetPhotoReady() { return C.photoTexture[0] && C.photoTextureValid; }
 
+static bool EnsureTargetPhotoReady()
+{
+	if (!C.photoTexture[0]) return false;
+	return WaitUntil(Card::kPhotoNameMs, TargetPhotoReady); // maintenance requests/revalidates the accepted slot
+}
+
 // Spawns the target in front of the player first — hidden, frozen, no collision, exactly how the persona-
 // photo script parks its clone — so his clothes and textures stream in and the portrait can be taken.
 // Then moves him to his town.
@@ -362,14 +456,31 @@ static Ped SpawnTargetWithPhoto(Hash model, const ContractDef& def)
 {
 	Ped ped = SpawnPed(model, ENTITY::GET_OFFSET_FROM_ENTITY_IN_WORLD_COORDS(pedMe, 0.0f, Card::kPhotoPedOffsetY, 0.0f));
 	if (!ped) return 0;
-	ENTITY::SET_ENTITY_AS_MISSION_ENTITY(ped, true, true);
 	ENTITY::FREEZE_ENTITY_POSITION(ped, true);
 	ENTITY::SET_ENTITY_COLLISION(ped, false, false);
 	ENTITY::SET_ENTITY_HEADING(ped, ENTITY::GET_ENTITY_HEADING(pedMe) + 180.0f); // facing the player / camera
 	PED::SET_BLOCKING_OF_NON_TEMPORARY_EVENTS(ped, false);
 	TASK::CLEAR_PED_TASKS_IMMEDIATELY(ped, false, true);
 
-	PhotographPed(ped);
+	bool photographed = false;
+	for (int attempt = 1; attempt <= Card::kPhotoAttempts; ++attempt)
+	{
+		if (PlayerAvailable() && ENTITY::DOES_ENTITY_EXIST(ped) && PhotographPed(ped))
+		{
+			photographed = true;
+			break;
+		}
+		lastStartFailure = PlayerAvailable() ? ContractStartFailure::PortraitFailed : ContractStartFailure::Interrupted;
+		LogContractStartFailure(model, attempt);
+		if (lastStartFailure == ContractStartFailure::Interrupted || !ENTITY::DOES_ENTITY_EXIST(ped)) break;
+		if (attempt < Card::kPhotoAttempts) WAIT(0);
+	}
+	if (!photographed)
+	{
+		if (ENTITY::DOES_ENTITY_EXIST(ped)) PED::DELETE_PED(&ped);
+		ReleaseTargetPhoto();
+		return 0;
+	}
 
 	ENTITY::SET_ENTITY_VISIBLE(ped, true);
 	ENTITY::SET_ENTITY_COLLISION(ped, true, false);
@@ -414,8 +525,10 @@ static void SetCardTitle(Object obj)
 
 static bool CreateCardObject()
 {
+	if (!TargetPhotoReady()) return false;
 	if (Cd.obj) return ENTITY::DOES_ENTITY_EXIST(Cd.obj) != 0;
 	if (!LoadModel(Card::kPropModel)) return false;
+	if (!TargetPhotoReady()) { STREAMING::SET_MODEL_AS_NO_LONGER_NEEDED(Card::kPropModel); return false; }
 	Cd.obj = OBJECT::CREATE_OBJECT(Card::kPropModel, ENTITY::GET_OFFSET_FROM_ENTITY_IN_WORLD_COORDS(pedMe, 0.0f, 0.5f, 0.0f), true, true, true, false, false);
 	STREAMING::SET_MODEL_AS_NO_LONGER_NEEDED(Card::kPropModel);
 	if (!ENTITY::DOES_ENTITY_EXIST(Cd.obj)) { Cd.obj = 0; return false; }
@@ -460,6 +573,12 @@ static void DestroyCardObject(bool cancelInspection = false)
 static bool OpenCard(bool reuseHandoffCard = false)
 {
 	if (!CanStartInteraction() || Cd.examining || (Cd.obj && !reuseHandoffCard)) return false;
+	if (!EnsureTargetPhotoReady())
+	{
+		DisplaySubtitle("CONTRACT PHOTO UNAVAILABLE. PRESS I TO RETRY.");
+		return false;
+	}
+	if (!CanStartInteraction()) return false;
 	if (Cd.obj && ENTITY::IS_ENTITY_ATTACHED(Cd.obj)) ENTITY::DETACH_ENTITY(Cd.obj, true, false);
 	Cd.inHand = false;
 	Cd.inspectingPed = pedMe;
@@ -469,6 +588,7 @@ static bool OpenCard(bool reuseHandoffCard = false)
 
 	if (CreateCardObject())
 	{
+		if (!CanStartInteraction()) { DestroyCardObject(); return false; }
 		// The task's first parameter is the title label (natives.h: propNameGxt) — proven in dev-7. Use our
 		// LML label when installed, else the item hash (no title). No retry: re-issuing the task while the
 		// first call was still starting restarted it without the label.
@@ -486,7 +606,7 @@ static bool OpenCard(bool reuseHandoffCard = false)
 		DestroyCardObject(true);
 	}
 
-	if (!CanStartInteraction()) return false;
+	if (!CanStartInteraction() || !TargetPhotoReady()) return false;
 	Cd.inspectingPed = pedMe;
 	auto abandonFallback = [&] {
 		if (PlayerAvailable())
@@ -606,6 +726,13 @@ static void UpdateCard()
 	{
 		if (!OwnCardTaskRunning() && now > Cd.openedMs + 1500) { DestroyCardObject(); return; }
 		PED::_SET_PED_BLACKBOARD_BOOL(pedMe, Card::kFlipBlackboard, true, -1); // the inspect task reads this while it runs
+		if (!TargetPhotoReady() && !Cd.ownsObj)
+		{
+			// We cannot hide a game-owned fallback prop indefinitely. End only our matching task.
+			DestroyCardObject(true);
+			DisplaySubtitle("CONTRACT PHOTO UNAVAILABLE. PRESS I TO RETRY.");
+			return;
+		}
 		if (Cd.obj) SetCardTitle(Cd.obj);                                     // the task resets the prop's name on start
 		Hash itemState = TASK::GET_ITEM_INTERACTION_STATE(pedMe);
 		if (itemState != Cd.textureItemState)
@@ -813,18 +940,34 @@ static void ClearContract(bool deleteTarget)
 // Rolls a random contract, photographs and spawns its target. False if nothing could be spawned.
 static bool StartContract()
 {
+	lastStartFailure = ContractStartFailure::None;
+	lastPhotoStage = "none";
 	ClearContract(true);
 	for (int attempt = 0; attempt < Tune::kSpawnAttempts; ++attempt)
 	{
-		if (!PlayerAvailable()) break;
+		if (!PlayerAvailable())
+		{
+			lastStartFailure = ContractStartFailure::Interrupted;
+			LogContractStartFailure(0, attempt + 1);
+			break;
+		}
 		const ContractDef& def = kContracts[rand() % kContractCount];
 		Hash model = def.models.list[rand() % def.models.count];
 		Ped ped = SpawnTargetWithPhoto(model, def);
-		if (!ped) continue;
+		if (!ped)
+		{
+			LogContractStartFailure(model, attempt + 1);
+			// Capture already retried this subject. Do not multiply capture timeouts by rerolling models.
+			if (lastStartFailure == ContractStartFailure::Interrupted || lastStartFailure == ContractStartFailure::PortraitFailed) break;
+			if (attempt + 1 < Tune::kSpawnAttempts) WAIT(0);
+			continue;
+		}
 		if (!PlayerAvailable())
 		{
 			PED::DELETE_PED(&ped);
 			ReleaseTargetPhoto();
+			lastStartFailure = ContractStartFailure::Interrupted;
+			LogContractStartFailure(model, attempt + 1);
 			break;
 		}
 
@@ -836,6 +979,7 @@ static bool StartContract()
 		if (def.onSpawned) def.onSpawned(def);
 		AddSearchBlip();
 		g_state = CONTRACT_UNKNOWN;
+		lastStartFailure = ContractStartFailure::None;
 		return true;
 	}
 	return false;
@@ -1072,6 +1216,7 @@ static void StopHandoff()
 static bool BeginHandoff(Ped giver, bool payout)
 {
 	if (!CanStartInteraction() || !LivingPed(giver)) return false;
+	if (!EnsureTargetPhotoReady()) return false;
 	STREAMING::REQUEST_ANIM_DICT(HandoffAnim::donorDict);
 	STREAMING::REQUEST_ANIM_DICT(HandoffAnim::receiverDict);
 	bool loaded = WaitUntil(Tune::kStreamTimeoutMs, [&] {
@@ -1216,7 +1361,7 @@ static void UpdateGiverPrompt()
 		}
 		else
 		{
-			DisplaySubtitle("NO CONTRACTS AVAILABLE");
+			ReportContractStartFailure();
 		}
 		break;
 	}
@@ -1245,6 +1390,24 @@ static void UpdatePlayer()
 	pedMe = PLAYER::PLAYER_PED_ID();
 	if (pedMe && ENTITY::DOES_ENTITY_EXIST(pedMe)) playerPos = ENTITY::GET_ENTITY_COORDS(pedMe, true, false);
 	if (TargetExists()) C.targetPos = ENTITY::GET_ENTITY_COORDS(C.target, true, false);
+}
+
+static void StartRemoteContract()
+{
+	Ped requestedPlayer = pedMe;
+	DisplaySubtitle("PREPARING CONTRACT");
+	// Run creation on a fresh game frame after the keyboard event, then refresh the player snapshot.
+	WAIT(0);
+	UpdatePlayer();
+	if (pedMe != requestedPlayer || !CanStartInteraction())
+	{
+		lastStartFailure = ContractStartFailure::Interrupted;
+		LogContractStartFailure(0, 0);
+		ReportContractStartFailure();
+		return;
+	}
+	if (StartContract()) { C.cardOpenPending = true; DisplaySubtitle("FIND THE TARGET"); }
+	else ReportContractStartFailure();
 }
 
 void ScriptMain()
@@ -1290,9 +1453,7 @@ void ScriptMain()
 		{
 			if (g_state == CONTRACT_NONE)
 			{
-				DisplaySubtitle("PREPARING CONTRACT");
-				if (StartContract()) { C.cardOpenPending = true; DisplaySubtitle("FIND THE TARGET"); }
-				else DisplaySubtitle("NO CONTRACTS AVAILABLE");
+				StartRemoteContract();
 			}
 			else if (ContractActive()) C.cardOpenPending = true;
 		}

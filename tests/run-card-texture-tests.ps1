@@ -15,7 +15,7 @@ New-Item -ItemType Directory -Path $bountyOutput -Force | Out-Null
 $bountySource = [IO.File]::ReadAllText($bountySourcePath)
 $bountyData = [IO.File]::ReadAllText($bountyDataPath)
 $bountyHeader = @('#pragma once', '// Generated from production source; do not edit.', 'namespace Card {')
-foreach ($bountyConstant in @('kCardCustomTexture', 'kTextureSettleMs')) {
+foreach ($bountyConstant in @('kCardCustomTexture', 'kTextureSettleMs', 'kPhotoNameMs')) {
     $bountyMatches = [regex]::Matches($bountyData, ('constexpr\s+\w+\s+' + $bountyConstant + '\s*=[^;]+;'))
     if ($bountyMatches.Count -ne 1) { throw "Expected exactly one production constant: $bountyConstant" }
     $bountyHeader += $bountyMatches[0].Value
@@ -27,6 +27,16 @@ foreach ($bountyFunction in @('ApplyCardCustomTexture', 'RefreshCardTextureAfter
     $bountyPattern = '(?ms)^static void ' + $bountyFunction + '\(\)\s*\{.*?^\}'
     $bountyMatches = [regex]::Matches($bountySource, $bountyPattern)
     if ($bountyMatches.Count -ne 1) { throw "Expected exactly one production function: $bountyFunction" }
+    $bountyLine = 1 + ([regex]::Matches($bountySource.Substring(0, $bountyMatches[0].Index), '\n')).Count
+    $bountyHeader += '#line {0} "{1}"' -f $bountyLine, $bountySourcePath.Replace('\', '/')
+    $bountyHeader += $bountyMatches[0].Value
+}
+foreach ($bountyPattern in @(
+    '(?ms)^template<typename Pred> static bool WaitUntil\(DWORD timeoutMs, Pred pred\)\s*\{.*?^\}',
+    '(?ms)^static bool EnsureTargetPhotoReady\(\)\s*\{.*?^\}'
+)) {
+    $bountyMatches = [regex]::Matches($bountySource, $bountyPattern)
+    if ($bountyMatches.Count -ne 1) { throw 'Expected exactly one production readiness gate or wait function.' }
     $bountyLine = 1 + ([regex]::Matches($bountySource.Substring(0, $bountyMatches[0].Index), '\n')).Count
     $bountyHeader += '#line {0} "{1}"' -f $bountyLine, $bountySourcePath.Replace('\', '/')
     $bountyHeader += $bountyMatches[0].Value

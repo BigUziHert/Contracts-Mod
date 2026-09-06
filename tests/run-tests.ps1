@@ -30,3 +30,5 @@ $bountyCommandFile = Join-Path $bountyOutput 'run-tests.cmd'
 & $env:ComSpec /d /c $bountyCommandFile
 if ($LASTEXITCODE -ne 0) { throw 'Regression tests failed.' }
 & (Join-Path $PSScriptRoot 'run-card-texture-tests.ps1') -VisualStudio $VisualStudio
+& (Join-Path $PSScriptRoot 'run-spawn-tests.ps1') -VisualStudio $VisualStudio
+& (Join-Path $PSScriptRoot 'run-portrait-start-tests.ps1') -VisualStudio $VisualStudio
