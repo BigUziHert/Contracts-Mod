@@ -11,6 +11,8 @@ Press **I** to inspect the current contract card again. Use the game's own **Zoo
 
 The clerk hands over the textured card, the player receives it, and inspection opens after both handoff animations finish. Preparation happens before the animations start. An interrupted handoff leaves the contract available through **I**; an interrupted payment handover can be retried at the clerk. **U** opens an existing contract rather than replacing it, and new interactions wait until the player is on foot and out of combat, menus, and other item interactions.
 
+The portrait is rebound when the handed-over card enters inspection and refreshed briefly while its material settles, including task-start waits and intro/flip transitions. This addresses the stale texture flag that could leave the prop's original artwork showing through on first inspection, while reopening with **I** looked correct. The visual fix still needs in-game confirmation.
+
 Targets keep one weapon loadout, pursue with the game's combat AI, search the last place they saw you after losing sight for eight seconds, then return to their roaming area after ten seconds of searching. They remember you and can re-engage on sight. Task recovery is delayed and rate-limited, and does not interrupt ragdoll or lasso recovery.
 
 To photograph a corpse, enter the handheld camera view within 25 metres with a clear view of the target, then use **Take Photo**. Payment uses a decorative banknote and one credit path; if the note disappears or remains uncollected for two minutes, the reward is credited automatically.
@@ -53,7 +55,7 @@ Adjust the MSBuild path if Visual Studio is installed elsewhere. The ScriptHookR
 
 Use `dev` for ongoing work. Update `main` when explicitly requested.
 
-Run `./tests/run-tests.ps1` from PowerShell to compile and execute the deterministic AI, handoff, and actual keyboard-source tests. Build output stays under `tmp/tests`.
+Run `./tests/run-tests.ps1` from PowerShell to compile and execute the deterministic AI, handoff, keyboard, and card-texture tests. The keyboard and texture tests exercise the actual source with game-native shims; they cannot verify the game's rendering. Build output stays under `tmp/tests`.
 
 For in-game validation, check **U** from idle, receiving a contract at two different clerks, **I** and card flip/put-away, interrupting a handoff, escaping behind a wall and returning, a lasso/ragdoll encounter, photographing a corpse, and collecting one reward. Pause during a handoff as well: gameplay deadlines should stay frozen. The physical hand transfer and native AI behavior cannot be verified by the standalone tests.
 

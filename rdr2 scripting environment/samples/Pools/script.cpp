@@ -76,7 +76,9 @@ struct CardRuntime
 	int         renderId = 0;
 	const char* ownedRenderTarget = nullptr;
 	Ped         inspectingPed = 0;
-	bool        customApplied = false; // SET_CUSTOM_TEXTURES_ON_OBJECT tried on this object
+	bool        customApplied = false;
+	ULONGLONG   textureRefreshUntilMs = 0; // retry while the inspection material is being initialized
+	Hash        textureItemState = 0;
 };
 
 static ActiveContract  C;
@@ -172,6 +174,8 @@ static void ResetPrompt(Prompt prompt)
 }
 
 static void MaintainPortraitAndCard();
+static void ApplyCardCustomTexture();
+static void RefreshCardTextureAfterTransition();
 
 // Evaluate once per iteration: a successful write predicate must not be invoked a second time.
 template<typename Pred> static bool WaitUntil(DWORD timeoutMs, Pred pred)
@@ -243,11 +247,12 @@ static void AddCorpseBlip()
 // portrait texture, card face, and flipped information panel were verified together in-game.
 
 // short_update refreshes retained slots each frame, even without a card on screen. Also maintain the
-// flip flag during yielding model/animation/capture waits, which do not run UpdateCard().
+// card material and flip flag during yielding waits, which do not run UpdateCard().
 static void MaintainPortraitAndCard()
 {
 	if (C.photoTexture[0] && C.photoTextureValid)
 		NETWORK::_REQUEST_PEDSHOT_TEXTURE_LOCAL_BACKUP_DOWNLOAD(Card::kPhotoSlot, C.photoCacheType);
+	ApplyCardCustomTexture(); // also runs while the inspect task has not yet reported its primary item
 	if (Cd.examining && Cd.inspectingPed && ENTITY::DOES_ENTITY_EXIST(Cd.inspectingPed))
 		PED::_SET_PED_BLACKBOARD_BOOL(Cd.inspectingPed, Card::kFlipBlackboard, true, -1);
 }
@@ -417,6 +422,7 @@ static bool CreateCardObject()
 	Cd.ownsObj = true;
 	SetCardTitle(Cd.obj);
 	LinkCardRenderTarget(Card::kPropModel);
+	RefreshCardTextureAfterTransition();
 	return true;
 }
 
@@ -469,8 +475,10 @@ static bool OpenCard(bool reuseHandoffCard = false)
 		bool haveLabel = HUD::DOES_TEXT_LABEL_EXIST(Card::kTitleLabel) != 0;
 		Hash firstParam = haveLabel ? joaat(Card::kTitleLabel) : item;
 		TASK::_TASK_ITEM_INTERACTION_2(pedMe, firstParam, Cd.obj, Card::kPrimaryItem, state, 1, 0, -1.0f);
+		RefreshCardTextureAfterTransition(); // the reused handoff prop is entering a new native task
 		if (WaitUntil(Card::kTaskStartWaitMs * 2, OwnCardTaskRunning))
 		{
+			RefreshCardTextureAfterTransition(); // bind again after the task confirms this exact prop
 			Cd.examining = true;
 			Cd.openedMs = RuntimeNowMs();
 			return true;
@@ -508,6 +516,7 @@ static bool OpenCard(bool reuseHandoffCard = false)
 		Cd.ownsObj = false;
 		SetCardTitle(Cd.obj);
 		LinkCardRenderTarget(ENTITY::GET_ENTITY_MODEL(Cd.obj));
+		RefreshCardTextureAfterTransition();
 	}
 	else { abandonFallback(); return false; }
 	Cd.examining = true;
@@ -524,6 +533,7 @@ static bool AttachCardToHand(Ped holder)
 	if (ENTITY::IS_ENTITY_ATTACHED(Cd.obj)) ENTITY::DETACH_ENTITY(Cd.obj, true, false);
 	ENTITY::SET_ENTITY_COLLISION(Cd.obj, false, false);
 	ENTITY::ATTACH_ENTITY_TO_ENTITY(Cd.obj, holder, bone, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, false, false, false, true, 0, true, false, false);
+	RefreshCardTextureAfterTransition();
 	Cd.inHand = true;
 	return true;
 }
@@ -543,12 +553,22 @@ static void DrawCardFace(bool corpse)
 	else        GRAPHICS::DRAW_SPRITE(C.photoTexture, C.photoTexture, 0.5f, 0.5f, 1.0f, 1.0f, 0.0f, 255, 255, 255, 255, false);
 }
 
-// Second route onto the card: the object-level custom texture R* uses to put letter textures on paper props.
+// Object-level custom texture used by R* for documents. A new item task may initialize the material
+// again on the same object. Retry for a bounded settling interval;
+// this native returns void, so customApplied records an attempt, not an engine acknowledgment.
 static void ApplyCardCustomTexture()
 {
-	if (!Card::kCardCustomTexture || Cd.customApplied || !Cd.obj || !TargetPhotoReady()) return;
+	if (!Card::kCardCustomTexture || !Cd.obj || !ENTITY::DOES_ENTITY_EXIST(Cd.obj) || !TargetPhotoReady()) return;
+	if (Cd.customApplied && RuntimeNowMs() >= Cd.textureRefreshUntilMs) return;
 	OBJECT::SET_CUSTOM_TEXTURES_ON_OBJECT(Cd.obj, joaat(C.photoTexture), 0, 0);
 	Cd.customApplied = true;
+}
+
+static void RefreshCardTextureAfterTransition()
+{
+	Cd.customApplied = false;
+	Cd.textureRefreshUntilMs = RuntimeNowMs() + Card::kTextureSettleMs;
+	ApplyCardCustomTexture();
 }
 
 // The "back" of the card: a screen-space panel with the portrait, who the target is, where he is, and the pay.
@@ -587,8 +607,14 @@ static void UpdateCard()
 		if (!OwnCardTaskRunning() && now > Cd.openedMs + 1500) { DestroyCardObject(); return; }
 		PED::_SET_PED_BLACKBOARD_BOOL(pedMe, Card::kFlipBlackboard, true, -1); // the inspect task reads this while it runs
 		if (Cd.obj) SetCardTitle(Cd.obj);                                     // the task resets the prop's name on start
+		Hash itemState = TASK::GET_ITEM_INTERACTION_STATE(pedMe);
+		if (itemState != Cd.textureItemState)
+		{
+			Cd.textureItemState = itemState;
+			RefreshCardTextureAfterTransition(); // intro/base/flip may each initialize the material
+		}
 		ApplyCardCustomTexture();
-		if (CardIsFlipped(TASK::GET_ITEM_INTERACTION_STATE(pedMe))) DrawCardBackPanel();
+		if (CardIsFlipped(itemState)) DrawCardBackPanel();
 		DrawCardFace(false);   // last: it leaves the render target selected
 	}
 	else if (Cd.inHand)
