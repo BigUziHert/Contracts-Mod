@@ -17,7 +17,7 @@
 #include "keyboard.h"
 #include "contract_data.h"
 
-static const char* kBuildTag = "dev-7";   // shown on the HUD and in a banner at startup so an installed build is verifiable
+static const char* kBuildTag = "dev-8";   // shown on the HUD and in a banner at startup so an installed build is verifiable
 
 // ===== [ DEBUG TOGGLES ] ===== (overridable from the build: set CL=/DCONTRACTS_DEBUG_HUD=0)
 #ifndef CONTRACTS_DEBUG_KEYS
@@ -59,6 +59,9 @@ struct ActiveContract
 	bool        photoGenOk = false, photoRegOk = false, photoSceneOk = false; // return values of GENERATE / _0xFD05 / _0x402E (debug)
 	bool        photoAvailBefore = false, photoAvailAfter = false; // PEDSHOT_IS_AVAILABLE before / after generating (debug)
 	char        photoTexture[64] = "";  // texture name to draw ("" = none)
+	int         photoSlot = -1;         // player-slot value the write was accepted with (debug)
+	char        photoProbe1[48] = "";   // printable return of _0x285438C26C732F9D(), if any (debug)
+	char        photoProbe2[48] = "";   // printable return of _0x5C9C3A466B3296A8(0), if any (debug)
 	const char* photoStatus = "-";      // how the texture was obtained, or the last step that failed (debug HUD)
 	ULONGLONG   cardOpenAtMs = 0;       // deferred card examine (after the handoff anim)
 
@@ -214,21 +217,38 @@ static void AddCorpseBlip()
 // uses, i.e. the plausible single-player "write to local cache". Whatever happens, the cache's texture name
 // for that slot is taken so the card and the back panel can show whether it holds the new portrait.
 struct PhotoVariant { int type; int cacheType; };
-static const PhotoVariant kPhotoVariants[] = { { 1, 2 }, { 2, 2 }, { 0, 0 }, { 1, 0 } };
+static const PhotoVariant kPhotoVariants[] = { { 1, 2 }, { 1, 0 }, { 2, 2 } };
+static const int kPhotoSlots[] = { 0, 1, 2 };   // the write's playerSlot argument (Remastered logs a "slot" it picks)
 
-// The persona-photo cache's texture name for the local player and cache type. Null when none.
-static const char* LookupPhotoTexture(int cacheType)
+// The persona-photo cache's texture name for the local player and cache type, copied out immediately —
+// the native returns a pointer into a transient game buffer that later natives overwrite (dev-7 stored
+// the pointer and read garbage). False when none.
+static bool LookupPhotoTexture(int cacheType, char (&out)[64])
 {
 	const char* n = NETWORK::_REQUEST_PEDSHOT_TEXTURE_LOCAL_BACKUP_DOWNLOAD((int)me, cacheType);
-	return (n && *n) ? n : nullptr;
+	if (!n || !*n) return false;
+	strcpy_s(out, n);
+	return true;
+}
+
+// Copies a native's `Any` return into `out` if it looks like a readable printable string. Diagnostic only.
+static void CopyIfString(Any value, char (&out)[48])
+{
+	out[0] = 0;
+	if (value < 0x10000 || value > 0x7FFFFFFFFFFFull) return;
+	const char* p = (const char*)value;
+	if (IsBadReadPtr(p, 8)) return;
+	for (int i = 0; i < 8; ++i) if (p[i] && (p[i] < 32 || p[i] > 126)) return;
+	if (!p[0]) return;
+	strncpy_s(out, p, sizeof(out) - 1);
 }
 
 static bool TakeTargetPhoto(Ped ped)
 {
 	C.photoStatus = "ped not ready";
 	C.photoPedWasReady = WaitUntil(Tune::kPedshotReadyMs, [&] { return PED::IS_PED_READY_TO_RENDER(ped) != 0; });
-	const char* fallbackName = nullptr;
-	int fallbackType = -1;
+	char fallbackName[64] = "";
+	int  fallbackType = -1;
 
 	for (int v = 0; v < (int)(sizeof(kPhotoVariants) / sizeof(kPhotoVariants[0])); ++v)
 	{
@@ -251,32 +271,41 @@ static bool TakeTargetPhoto(Ped ped)
 		C.photoStatus = "waiting for shot";
 		C.photoAvailAfter = WaitUntil(Card::kPhotoAvailMs, [] { return GRAPHICS::PEDSHOT_IS_AVAILABLE() != 0; });
 
-		// Single-player local-cache write (unverified native), then the network write.
+		// Single-player local-cache write (unverified native), then the network write, per player slot.
 		GRAPHICS::_0xA1A86055792FB249(ct);
 		C.photoStatus = "write failed";
-		bool written = WaitUntil(Card::kPhotoWriteMs, [&]
+		bool written = false;
+		for (int slot : kPhotoSlots)
 		{
-			PED::FORCE_PED_MOTION_STATE(ped, joaat("MotionState_DoNothing"), false, 0, false);
-			return NETWORK::_NETWORK_PERSONA_PHOTO_WRITE_LOCAL(Card::kPhotoName, (int)me, 1, ct) != 0;
-		});
+			written = WaitUntil(Card::kPhotoWriteMs / 2, [&]
+			{
+				PED::FORCE_PED_MOTION_STATE(ped, joaat("MotionState_DoNothing"), false, 0, false);
+				return NETWORK::_NETWORK_PERSONA_PHOTO_WRITE_LOCAL(Card::kPhotoName, slot, 1, ct) != 0;
+			});
+			if (written) { C.photoSlot = slot; break; }
+		}
 		if (written) WaitUntil(Card::kPhotoUploadMs, [] { return !NETWORK::_NETWORK_IS_PREVIOUS_UPLOAD_PENDING(); });
 
-		const char* name = nullptr;
-		WaitUntil(written ? Card::kPhotoNameMs : 500, [&] { name = LookupPhotoTexture(ct); return name != nullptr; });
-		if (written && name)
+		char name[64] = "";
+		WaitUntil(written ? Card::kPhotoNameMs : 500, [&] { return LookupPhotoTexture(ct, name); });
+		if (written && name[0])
 		{
 			strcpy_s(C.photoTexture, name);
 			C.photoVariant = v;
 			C.photoStatus = "ok";
 			return true;
 		}
-		if (name && !fallbackName) { fallbackName = name; fallbackType = v; }
+		if (name[0] && !fallbackName[0]) { strcpy_s(fallbackName, name); fallbackType = v; }
 		C.photoStatus = written ? "written, no name" : "write failed";
 	}
 
+	// Diagnostic: two pedshot natives R*'s SP script calls with discarded returns — one may be a texture getter.
+	CopyIfString(GRAPHICS::_0x285438C26C732F9D(), C.photoProbe1);
+	CopyIfString(GRAPHICS::_0x5C9C3A466B3296A8(0), C.photoProbe2);
+
 	// No confirmed write. Use the cache slot's name anyway: after _0xA1A8... it may hold the new portrait,
 	// and the back panel / custom texture will show whether it does.
-	if (fallbackName)
+	if (fallbackName[0])
 	{
 		strcpy_s(C.photoTexture, fallbackName);
 		C.photoVariant = fallbackType;
@@ -486,6 +515,11 @@ static void DrawCardBackPanel()
 	GRAPHICS::DRAW_RECT(0.50f, 0.50f, 0.40f, 0.34f, 18, 14, 11, 225, false, false);
 	if (TargetPhotoReady())
 		GRAPHICS::DRAW_SPRITE(C.photoTexture, C.photoTexture, 0.395f, 0.50f, 0.15f, 0.27f, 0.0f, 255, 255, 255, 255, false);
+	// Diagnostic thumbnails along the panel's bottom edge: the persona-photo name drawn directly, and the
+	// two probed strings. Whichever shows a face is the texture we want.
+	if (C.photoTaken)      GRAPHICS::DRAW_SPRITE(Card::kPhotoName, Card::kPhotoName, 0.33f, 0.63f, 0.05f, 0.09f, 0.0f, 255, 255, 255, 255, false);
+	if (C.photoProbe1[0])  GRAPHICS::DRAW_SPRITE(C.photoProbe1, C.photoProbe1, 0.39f, 0.63f, 0.05f, 0.09f, 0.0f, 255, 255, 255, 255, false);
+	if (C.photoProbe2[0])  GRAPHICS::DRAW_SPRITE(C.photoProbe2, C.photoProbe2, 0.45f, 0.63f, 0.05f, 0.09f, 0.0f, 255, 255, 255, 255, false);
 
 	char lo[16], hi[16], reward[48];
 	FormatMoney(lo, sizeof lo, Tune::kPayoutMinCents);
@@ -1076,10 +1110,11 @@ static void DebugUpdate()
 		ros    = NETWORK::NETWORK_HAS_VALID_ROS_CREDENTIALS() ? 1 : 0;
 		cloud  = NETWORK::NETWORK_IS_CLOUD_AVAILABLE() ? 1 : 0;
 	}
-	sprintf_s(line, "photo: pedReady=%d gen=%d avail=%d/%d online=%d ros=%d cloud=%d var=%d cache=%d how=%s tex=%s",
+	sprintf_s(line, "photo: pedReady=%d gen=%d avail=%d/%d online=%d ros=%d cloud=%d var=%d cache=%d slot=%d how=%s tex=%s p1=%s p2=%s",
 		C.photoPedWasReady ? 1 : 0, C.photoGenOk ? 1 : 0, C.photoAvailBefore ? 1 : 0, C.photoAvailAfter ? 1 : 0,
 		online, ros, cloud,
-		C.photoVariant, C.photoCacheType, C.photoStatus, C.photoTexture[0] ? C.photoTexture : "-");
+		C.photoVariant, C.photoCacheType, C.photoSlot, C.photoStatus, C.photoTexture[0] ? C.photoTexture : "-",
+		C.photoProbe1[0] ? C.photoProbe1 : "-", C.photoProbe2[0] ? C.photoProbe2 : "-");
 	DrawTextToScreen(line, 0.05f, 0.11f, 0.4f, 255, 255, 0, 255);
 
 	Hash cardState = TASK::GET_ITEM_INTERACTION_STATE(pedMe);
