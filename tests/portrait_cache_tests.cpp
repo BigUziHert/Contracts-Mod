@@ -297,7 +297,9 @@ static int _LOCAL_PLAYER_PEDSHOT_TEXTURE_DOWNLOAD_REQUEST(int slot, int cacheTyp
         --world.unavailableRequests;
         return world.unavailableResult;
     }
-    const int id = 101 + static_cast<int>(world.downloads.size());
+    // Handles are opaque: the game hands out negative values about as often as positive ones.
+    const int ordinal = 101 + static_cast<int>(world.downloads.size());
+    const int id = (ordinal % 2 == 0) ? -(0x40000000 + ordinal) : ordinal;
     const int status = world.failedDownloads ? 2 : 0;
     if (world.failedDownloads) --world.failedDownloads;
     world.downloads.push_back(Download{ id, world.nowMs + world.downloadDelayMs, status,
@@ -330,7 +332,7 @@ static bool _TEXTURE_DOWNLOAD_TEXTURE_NAME_IS_VALID(const char* name)
 }
 static void TEXTURE_DOWNLOAD_RELEASE(int id)
 {
-    Check(id > 0, "sentinel handles are never released");
+    Check(id != 0 && id != -1, "sentinel values are never released");
     Download& download = FindDownload(id);
     Check(download.active && download.releases == 0, "each owned download is released exactly once");
     download.active = false;
@@ -572,7 +574,7 @@ static void TestFailureAndCancellationCleanup()
 
     Reset();
     world.cancelOnRequest = true;
-    Check(!PhotographPed(kSubject) && C.photoDownload > 0,
+    Check(!PhotographPed(kSubject) && HasPhotoDownloadHandle(),
         "player interruption exits download polling with diagnostics available");
     ReleaseTargetPhoto();
     CheckFullyReleased();
@@ -697,7 +699,7 @@ static void TestSlotRotation()
     Check(C.photoSlot == Card::kPhotoSlot + 1 && !C.photoTexture[0] && C.photoDownload == -1,
         "release keeps the last written slot for a read-only reopen");
     Check(WaitUntil(Card::kPhotoNameMs, [&] { return LookupPhotoTexture(Card::kPhotoCacheType, name); }) &&
-        world.requests == 2 && C.photoDownload > 0 && C.photoTextureValid,
+        world.requests == 2 && HasPhotoDownloadHandle() && C.photoTextureValid,
         "a read-only reopen requests the last written slot");
     ReleaseTargetPhoto();
     CheckFullyReleased();
@@ -708,6 +710,19 @@ static void TestSlotRotation()
     Check(PhotographPed(kSubject) && C.photoSlot == Card::kPhotoSlot + 2,
         "the next contract continues the rotation instead of rewriting the previous card's slot");
     ReleaseTargetPhoto();
+    CheckFullyReleased();
+}
+
+static void TestOpaqueHandles()
+{
+    Reset();
+    Check(PhotographPed(kSubject) && C.photoDownload > 0 && TargetPhotoReady(), "a positive handle is retained");
+    Check(PhotographPed(kSubject) && C.photoDownload < -1 && world.requests == 2 && world.downloads.size() == 2 &&
+        C.photoDownloadStatus == 0 && TargetPhotoReady(),
+        "a negative handle is polled to completion instead of being re-requested as a failure");
+    Check(world.releases == 1, "the negative handle replaced the previous one through a normal release");
+    ReleaseTargetPhoto();
+    Check(world.releases == 2 && ActiveDownloads() == 0, "negative handles are released exactly like positive ones");
     CheckFullyReleased();
 }
 
@@ -749,6 +764,7 @@ int main()
         "production timing permits bounded request recovery");
     Check(Card::kPhotoSlot >= 0 && Card::kPhotoSlotCount >= 2 && Card::kPhotoSlot + Card::kPhotoSlotCount <= 32,
         "production rotates through at least two of the engine's 32 local persona-photo slots");
+    TestOpaqueHandles();
     TestSlotRotation();
     TestBoundSlotsAreSkipped();
     TestRepeatedCapture();

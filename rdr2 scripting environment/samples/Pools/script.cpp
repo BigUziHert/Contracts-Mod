@@ -76,7 +76,7 @@ struct ActiveContract
 	int         photoSlot = -1;         // local cache slot written by the latest capture; requests use the same slot
 	bool        photoGenOk = false;
 	char        photoTexture[64] = "";  // texture name to draw ("" = none)
-	int         photoDownload = -1;     // owned local-cache download; positive handles require release
+	int         photoDownload = -1;     // owned local-cache download handle: opaque and nonzero; -1 and 0 mean none
 	int         photoDownloadStatus = -1;
 	char        photoLookupName[64] = ""; // last returned name, including an invalid result for diagnostics
 	bool        photoLookupValid = false; // backup-loader validity probe; diagnostic, not handle readiness
@@ -478,6 +478,13 @@ static void AddCorpseBlip()
 static bool LookupPhotoTexture(int cacheType, char (&out)[64]);
 static void ReleaseTargetPhoto();
 
+// A download handle is an opaque nonzero value. The consumer in net_ugc_end_flow treats -1 as
+// "request again later" and 0 as failure, and accepts everything else. Handles received in story
+// mode were frequently negative; testing for a positive value turned those accepted downloads
+// into a portrait failure on roughly every second attempt (start-v5 logs with status=-1 and
+// thirteen requests), so only the two sentinels count as "no handle".
+static bool HasPhotoDownloadHandle() { return C.photoDownload != 0 && C.photoDownload != -1; }
+
 // Every capture writes a slot whose texture no card has been bound to, instead of always slot 0.
 // The download texture is named after its slot, and the diagnostics point to an inspected card
 // keeping that texture referenced after its prop and item task retire: rewriting the same slot
@@ -535,7 +542,7 @@ static bool LookupPhotoTexture(int cacheType, char (&out)[64])
 	C.photoTextureValid = false;
 	C.photoLookupValid = false;
 	if (C.photoSlot < 0) return false; // nothing has been written yet
-	if (C.photoDownload <= 0)
+	if (!HasPhotoDownloadHandle())
 	{
 		if (GetTickCount64() < C.photoNextRequestMs) return false;
 		C.photoNextRequestMs = GetTickCount64() + Card::kPhotoRequestRetryMs;
@@ -547,7 +554,7 @@ static bool LookupPhotoTexture(int cacheType, char (&out)[64])
 		C.photoDownload = NETWORK::_LOCAL_PLAYER_PEDSHOT_TEXTURE_DOWNLOAD_REQUEST(C.photoSlot, cacheType);
 		ULONGLONG requestMs = GetTickCount64() - requestedAt;
 		if (requestMs > C.photoRequestCallMaxMs) C.photoRequestCallMaxMs = requestMs;
-		if (C.photoDownload <= 0) return false;
+		if (!HasPhotoDownloadHandle()) return false; // -1: not yet; 0: refused. Both retry after the backoff.
 	}
 	C.photoDownloadStatus = NETWORK::GET_STATUS_OF_TEXTURE_DOWNLOAD(C.photoDownload);
 	if (C.photoDownloadStatus == 2)
@@ -698,7 +705,7 @@ static bool PhotographPed(Ped subject)
 
 static void ReleaseTargetPhoto()
 {
-	if (C.photoDownload > 0) NETWORK::TEXTURE_DOWNLOAD_RELEASE(C.photoDownload);
+	if (HasPhotoDownloadHandle()) NETWORK::TEXTURE_DOWNLOAD_RELEASE(C.photoDownload);
 	C.photoDownload = -1;
 	C.photoDownloadStatus = -1;
 	C.photoNextRequestMs = 0;

@@ -42,6 +42,7 @@ $bountyPatterns = @(
     '(?ms)^static void MarkPhotoSlotBound\(\)\s*\{.*?^\}',
     '(?ms)^static int NextPhotoSlot\(\)\s*\{.*?^\}',
     '(?ms)^template<typename Pred> static bool WaitUntil\([^\r\n]+\)\s*\{.*?^\}',
+    '(?m)^static bool HasPhotoDownloadHandle\(\)[^\r\n]+',
     '(?ms)^static bool LookupPhotoTexture\(int cacheType, char \(&out\)\[64\]\)\s*\{.*?^\}',
     '(?ms)^static void FinishPhotoCapture\(\)\s*\{.*?^\}',
     '(?ms)^static bool FinishPhotoAttempt\(bool success\)\s*\{.*?^\}',

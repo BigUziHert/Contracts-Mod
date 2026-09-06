@@ -80,13 +80,14 @@ static void WAIT(DWORD delay)
 static int AcquireHandle()
 {
     Check(world.activeHandles.empty(), "a phase cannot allocate over an owned handle");
-    const int handle = 101 + static_cast<int>(world.handlesCreated++);
+    const int ordinal = 101 + static_cast<int>(world.handlesCreated++);
+    const int handle = (ordinal % 2 == 0) ? -(0x40000000 + ordinal) : ordinal; // handles are opaque and may be negative
     world.activeHandles.push_back(handle);
     return handle;
 }
 static void ReleaseTargetPhoto()
 {
-    if (C.photoDownload > 0)
+    if (C.photoDownload != 0 && C.photoDownload != -1)
     {
         Check(world.activeHandles.size() == 1 && world.activeHandles[0] == C.photoDownload,
             "cleanup releases precisely the handle retained by the preceding phase");
@@ -155,7 +156,7 @@ static bool ProbeConsumer(bool object, ULONGLONG started, unsigned captures)
     Check(world.consumers < 4 && PlayerAvailable(), "no consumer runs past a failure or player interruption");
     const unsigned index = world.consumers++;
     Check(started <= world.nowMs && captures == world.captures && captures == index + 2 && C.def &&
-        C.photoTexture[0] && C.photoDownload > 0 && world.activeHandles.size() == 1,
+        C.photoTexture[0] && C.photoDownload != 0 && C.photoDownload != -1 && world.activeHandles.size() == 1,
         "consumer uses the preceding checkpoint's accepted capture and retained handle");
     Check(object == (index % 2 == 0) && std::strcmp(photoTestControl, kControls[index + 1]) == 0,
         "unbound object, plain inspection, bound object, and portrait inspection run in order");
