@@ -13,6 +13,21 @@ The destination windows are authored outdoor visiting hours, not verified busine
 
 Press **I** to inspect the current contract card again. Use the game's own **Zoom**, **Flip**, and **Put Away** prompts while inspecting it.
 
+This testing build starts with **routine debugging enabled**. Press **F8** to hide or
+show both the red map markers and the on-screen panel. Red dots label all 27 authored
+spawn/travel areas across the five towns, plus separate markers for the current
+contract's exact initial spawn and validated destination. Authored area markers are
+reference points; runtime ground checks can choose a nearby safe position.
+
+The upper-left panel refreshes four times per second and shows player-to-target
+distance in metres, town/occupation, what the target is doing, distance from the target
+to its assigned stop, the next planned stop and time, wander radius, indoor/outdoor
+status, navigation/task/availability checks and target coordinates. Planned stops can
+change with hours and access. Combat, searching and restraint override routine labels;
+dead targets stop showing travel plans and retain a fresh body distance while present.
+The overlay pauses with gameplay and uses the existing screen-text renderer.
+See [routine debug controls and checks](docs/routine-debug.md).
+
 The clerk hands over the textured card, the player receives it, and inspection opens after both handoff animations finish. Preparation happens before the animations start. An interrupted handoff leaves the contract available through **I**; an interrupted payment handover can be retried at the clerk. **U** while a hunt is still open ends that hunt and issues a new contract in its place, as **End Contract** at a clerk would; once the corpse has been photographed, **U** reopens that card instead so the pending reward stays collectable. New interactions wait until the player is on foot and out of combat, menus, and other item interactions.
 
 The portrait is rebound when the handed-over card enters inspection, the native item state changes, or its texture becomes available again. Each transition schedules at most five binding attempts: immediately, then after 100, 300, 750, and 1500 ms. Maintenance and drawing share that schedule; slow frames skip missed attempts instead of replaying them. This removes the thousands of duplicate assignments seen during one inspection while retaining retries after material initialization. The timing is a fix candidate that still needs in-game validation; repeated assignments have not been proven to cause the failed downloads.
@@ -101,7 +116,7 @@ Every failed consumer, reopen, or capture stops the sequence. A completed sequen
 
 Use `dev` for ongoing work. Update `main` when explicitly requested.
 
-Run `./tests/run-tests.ps1` from PowerShell to compile and execute sixteen suites: deterministic AI, handoff, keyboard, card-texture, spawn/input/pause, portrait-startup, portrait-cache, owned-ped cleanup, diagnostic-driver, native AI bridge, contract lifecycle, routine spawn, routine scheduling logic, routine plans, native routine runtime, and routine card drawing. The native-shim tests exercise actual production functions. Source review and simulated native responses establish the code's decisions, but cannot verify in-game ground placement, pathfinding, scenario props, animation, card readability or rendering. Build output stays under `tmp/tests`.
+Run `./tests/run-tests.ps1` from PowerShell to compile and execute nineteen suites: deterministic AI, handoff, keyboard, card-texture, spawn/input/pause, portrait-startup, portrait-cache, owned-ped cleanup, diagnostic-driver, native AI bridge, contract lifecycle, routine spawn, routine scheduling logic, routine plans, native routine runtime, routine card drawing, debug display, debug blips and the debug observation bridge. The native-shim tests exercise actual production functions. Source review and simulated native responses establish the code's decisions, but cannot verify in-game ground placement, pathfinding, scenario props, animation, card readability or rendering. Build output stays under `tmp/tests`.
 
 [Town target routines](docs/target-routines.md) explains schedules, fallback, separate search/spawn/wander areas and how to add towns and locations. [Location sources](docs/routine-location-sources.md) records the coordinate evidence and omitted sites. [Activities and transit evidence](docs/routine-activities-and-transit.md) documents smoking/drinking, venue availability, the specific blockers for games/theatre/trams and the remaining in-game checks.
 

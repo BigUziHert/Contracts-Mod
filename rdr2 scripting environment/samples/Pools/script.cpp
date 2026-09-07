@@ -2084,6 +2084,8 @@ static bool ConsumeRemoteContractRequest(bool pressed)
 	return true;
 }
 
+#include "routine_debug.h"
+
 void ScriptMain()
 {
 	srand((unsigned)GetTickCount64());
@@ -2097,6 +2099,7 @@ void ScriptMain()
 		MaintainPortraitAndCard();
 		bool bypassPressed = ConsumeRemoteContractRequest(IsKeyJustUp(Tune::kBypassClerkKey));
 		bool inspectPressed = IsKeyJustUp(Tune::kInspectCardKey);
+		if (IsKeyJustUp(VK_F8)) ToggleRoutineDebug();
 		if (!PlayerAvailable() || (previousPlayer && previousPlayer != pedMe))
 		{
 			StopHandoff();
@@ -2174,6 +2177,7 @@ void ScriptMain()
 		// re-triggering aggression through walls for the rest of the contract.
 		if (C.damagedByPlayer && TargetExists()) ENTITY::CLEAR_ENTITY_LAST_DAMAGE_ENTITY(C.target);
 		C.damagedByPlayer = false;
+		UpdateRoutineDebug();
 		UpdateCard(); // render-target drawing must remain last
 		WAIT(0);
 	}
