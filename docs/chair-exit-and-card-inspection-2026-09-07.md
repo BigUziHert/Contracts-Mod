@@ -1,5 +1,10 @@
 # Chair exit and displaced inspection followup — 2026-09-07
 
+**Later test:** the inspection safeguard described below did not resolve framing.
+It was rolled back after a downward-camera report, and replaced with bounded,
+read-only diagnostics. The chair changes remain. See the [current card investigation](card-framing-investigation-2026-09-07.md);
+the build hash and collision-helper behavior below describe the earlier `e473cde` build.
+
 The owner tested `69e722b` at a Van Horn five-finger-fillet chair. The target appeared
 to pop out immediately on aggression, then drew a knife and attacked. This confirms
 that combat resumed, but does not establish which of the immediate-exit hint,
