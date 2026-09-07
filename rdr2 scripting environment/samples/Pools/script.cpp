@@ -70,6 +70,7 @@ struct ActiveContract
 	ULONGLONG  photoMs = 0;             // corpse photographed
 	int        bountyAtCrime = 0;
 	bool       gotWanted = false;
+	bool       diedBeforeContact = false; // later corpse damage cannot establish hostile contact
 
 	// target portrait
 	bool        photoTaken = false;     // this mod currently owns capture resources that still need cleanup
@@ -931,7 +932,8 @@ static Ped SpawnTargetWithPhoto(Hash model, const ContractDef& def)
 	StartupTrace::Record("destination_revalidate_begin", model, ped, &def.spawn);
 	if (!ValidateRoutineDeployment(ped, def))
 	{
-		lastStartFailure = PlayerAvailable() ? ContractStartFailure::LocationUnavailable : ContractStartFailure::Interrupted;
+		lastStartFailure = !PlayerAvailable() || strcmp(RoutineSpawn::diagnostic.check, "interaction_interrupted") == 0
+			? ContractStartFailure::Interrupted : ContractStartFailure::LocationUnavailable;
 		RequestOwnedPedCleanup(ped);
 		ReleaseTargetPhoto();
 		return 0;
@@ -945,7 +947,8 @@ static Ped SpawnTargetWithPhoto(Hash model, const ContractDef& def)
 	StartupTrace::Record("settling_begin", model, ped, &def.spawn);
 	if (!WaitForRoutinePlacement(ped, def))
 	{
-		lastStartFailure = PlayerAvailable() ? ContractStartFailure::LocationUnavailable : ContractStartFailure::Interrupted;
+		lastStartFailure = !PlayerAvailable() || strcmp(RoutineSpawn::diagnostic.check, "interaction_interrupted") == 0
+			? ContractStartFailure::Interrupted : ContractStartFailure::LocationUnavailable;
 		// Deletion can be deferred. Keep our hidden subject inert while cleanup retries.
 		if (ped == ownedPed.ped && ENTITY::DOES_ENTITY_EXIST(ped) && OwnedPedIdentityMatches())
 		{
@@ -1540,9 +1543,13 @@ static void UpdateCrimeTracking()
 {
 	// A photographed corpse may disappear before collection. Once hostile contact is
 	// recorded, later law incidents still count even without the target entity.
-	if (!C.crimeMs && TargetExists())
+	if (!C.crimeMs && !C.diedBeforeContact && TargetExists())
 	{
-		if (PED::IS_PED_IN_COMBAT(C.target, pedMe) || C.damagedByPlayer || C.ai.state == TargetAI::State::Engaged)
+		// Neutral discovery may already have moved the hunt to FOUND before an
+		// unrelated death, so observe this here as well as in CheckTargetFound.
+		if (!C.damagedByPlayer && ENTITY::IS_ENTITY_DEAD(C.target)) C.diedBeforeContact = true;
+		if (!C.diedBeforeContact &&
+			(PED::IS_PED_IN_COMBAT(C.target, pedMe) || C.damagedByPlayer || C.ai.state == TargetAI::State::Engaged))
 		{
 			C.crimeMs = RuntimeNowMs();
 			C.bountyAtCrime = LAW::GET_BOUNTY(me);
@@ -1715,6 +1722,7 @@ static void CheckTargetFound()
 	if (ENTITY::IS_ENTITY_DEAD(C.target))
 	{
 		// Died before being spotted (long shot, another NPC, a train): straight to the corpse flow.
+		C.diedBeforeContact = !C.crimeMs && !C.damagedByPlayer;
 		RemoveBlip(C.searchBlip);
 		RemoveBlip(C.targetBlip);
 		g_state = CONTRACT_FOUND;
@@ -1732,7 +1740,7 @@ static void CheckTargetFound()
 	bool hurt  = C.damagedByPlayer;
 	bool fight = PED::IS_PED_IN_COMBAT(C.target, pedMe) != 0;
 
-	if (interacting || aimed || hurt || fight)
+	if (interacting || aimed || hurt || fight || C.ai.state == TargetAI::State::Engaged)
 	{
 		DisplaySubtitle("TARGET FOUND");
 		RemoveBlip(C.searchBlip);

@@ -22,7 +22,8 @@ $bountyPatterns = @(
     '(?ms)^static void UpdateCrimeTracking\(\)\s*\{.*?^\}',
     '(?ms)^static void ClearContract\(bool deleteTarget\)\s*\{.*?^\}',
     '(?ms)^static void CheckTargetLost\(\)\s*\{.*?^\}',
-    '(?ms)^static void UpdateTrails\(\)\s*\{.*?^\}'
+    '(?ms)^static void UpdateTrails\(\)\s*\{.*?^\}',
+    '(?ms)^static void CheckTargetFound\(\)\s*\{.*?^\}'
 )
 foreach ($bountyPattern in $bountyPatterns) {
     $bountyMatches = [regex]::Matches($bountySource, $bountyPattern)

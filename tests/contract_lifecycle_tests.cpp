@@ -7,6 +7,7 @@
 
 using ULONGLONG = std::uint64_t;
 using Ped = int;
+using Entity = int;
 using Player = int;
 using Object = int;
 using Blip = int;
@@ -27,7 +28,7 @@ static void Check(bool condition, const char* description)
 }
 
 struct Vector3 { float x = 0, y = 0, z = 0; };
-struct ContractDef { void (*onCleanup)() = nullptr; };
+struct ContractDef { void (*onCleanup)() = nullptr; float searchRadius = 45.0f; };
 static Vector3 playerPos;
 
 struct ActiveContract
@@ -37,6 +38,7 @@ struct ActiveContract
     int bountyAtCrime = 0;
     bool gotWanted = false;
     bool damagedByPlayer = false;
+    bool diedBeforeContact = false;
     TargetAI::Memory ai;
     Blip searchBlip = 0, targetBlip = 0;
     Object cashObj = 0;
@@ -51,6 +53,7 @@ static struct World
     ULONGLONG nowMs = 1000;
     bool targetExists = true;
     bool nativeCombat = false;
+    bool targetDead = false, interacting = false, clearLOS = false, aiming = false;
     bool incidentActive = false;
     int wantedScore = 0;
     int bounty = 0;
@@ -64,6 +67,7 @@ static struct World
     unsigned cashDeletes = 0, cleanupHooks = 0, pedCleanupRequests = 0, pedReleases = 0;
     unsigned giverPromptResets = 0, cameraPromptResets = 0;
     unsigned lostMessages = 0;
+    unsigned foundMessages = 0, foundBlips = 0;
     bool playerAvailable = true, paused = false, faded = false, passedGate = false;
     unsigned giverPromptHides = 0, cameraPromptHides = 0, waits = 0;
 } world;
@@ -93,6 +97,16 @@ static bool Within(const Vector3& a, const Vector3& b, float distance)
 
 namespace ENTITY
 {
+static bool IS_ENTITY_DEAD(Entity entity)
+{
+    Check(entity == kTarget && world.targetExists, "discovery checks its existing target");
+    return world.targetDead;
+}
+static bool HAS_ENTITY_CLEAR_LOS_TO_ENTITY(Entity from, Entity to, int flags)
+{
+    Check(from == kPlayer && to == kTarget && flags == 17, "discovery checks player-to-target sight");
+    return world.clearLOS;
+}
 static bool DOES_ENTITY_EXIST(int entity)
 {
     return (entity == kTarget && world.targetExists) || (entity == kCash && world.cashExists);
@@ -101,6 +115,14 @@ static bool DOES_ENTITY_EXIST(int entity)
 
 namespace PLAYER
 {
+static bool GET_PLAYER_INTERACTION_TARGET_ENTITY(Player player, Entity* target, bool, bool)
+{
+    Check(player == me, "discovery reads the current player's interaction");
+    *target = world.interacting ? kTarget : 0;
+    return world.interacting;
+}
+static bool IS_PLAYER_FREE_AIMING_AT_ENTITY(Player, Entity) { return world.aiming; }
+static bool IS_PLAYER_TARGETTING_ENTITY(Player, Entity, bool) { return world.aiming; }
 static void _REGISTER_EAGLE_EYE_FOR_ENTITY(Player player, int entity, bool)
 {
     Check(player == me && entity == kTarget && world.targetExists,
@@ -166,10 +188,13 @@ static void ResetPrompt(Prompt prompt)
     else ++world.cameraPromptResets;
 }
 static void CleanupHook() { ++world.cleanupHooks; }
+static void AddFoundBlip() { ++world.foundBlips; }
 static void DisplaySubtitle(const char* message)
 {
-    Check(std::strcmp(message, "TARGET LOST") == 0, "lost-target detection explains why the unfinished hunt ended");
-    ++world.lostMessages;
+    const bool lost = std::strcmp(message, "TARGET LOST") == 0;
+    Check(lost || std::strcmp(message, "TARGET FOUND") == 0, "discovery and loss use their matching notification");
+    if (lost) ++world.lostMessages;
+    else ++world.foundMessages;
 }
 
 namespace PED
@@ -209,7 +234,9 @@ static int GET_WANTED_SCORE(Player player)
 
 static void Reset()
 {
+    static const ContractDef def;
     C = ActiveContract();
+    C.def = &def;
     C.target = kTarget;
     C.startMs = 1000;
     world = World();
@@ -250,6 +277,64 @@ static void TestCrimeRequiresHostileContact()
         UpdateCrimeTracking();
         Check(C.crimeMs == 6000 && C.bountyAtCrime == 250,
             "continued hostile contact does not restart the crime time or baseline");
+    }
+}
+
+static void TestDiscoveryAndDeathBeforeContact()
+{
+    Reset();
+    g_state = CONTRACT_UNKNOWN;
+    C.ai.state = TargetAI::State::Engaged;
+    UpdateCrimeTracking();
+    CheckTargetFound();
+    Check(C.crimeMs == world.nowMs && g_state == CONTRACT_FOUND && world.foundMessages == 1 && world.foundBlips == 1,
+        "intimidation-only engagement establishes both crime and discovery without an engine combat flag");
+
+    Reset();
+    g_state = CONTRACT_UNKNOWN;
+    world.targetDead = true;
+    UpdateCrimeTracking();
+    CheckTargetFound();
+    Check(C.diedBeforeContact && g_state == CONTRACT_FOUND && !C.crimeMs && !world.foundMessages,
+        "an externally killed unknown target enters corpse flow without hostile contact");
+    C.damagedByPlayer = true;
+    world.incidentActive = true;
+    world.wantedScore = 10;
+    world.nowMs = 6000;
+    const unsigned previousCombatQueries = world.combatQueries;
+    UpdateCrimeTracking();
+    Check(!C.crimeMs && !C.gotWanted && !world.lawQueries && world.combatQueries == previousCombatQueries,
+        "shooting the discovered corpse cannot start crime tracking or a wanted penalty");
+    ClearContract(false);
+    Check(!C.diedBeforeContact, "new contracts do not inherit the previous corpse's contact exclusion");
+
+    Reset();
+    g_state = CONTRACT_UNKNOWN;
+    world.interacting = true;
+    CheckTargetFound();
+    Check(g_state == CONTRACT_FOUND && !C.crimeMs, "neutral discovery need not start hostile contact");
+    world.targetDead = true;
+    UpdateCrimeTracking(); // FOUND frames no longer call CheckTargetFound.
+    Check(C.diedBeforeContact, "external death is also recorded after neutral discovery");
+    C.damagedByPlayer = true;
+    world.wantedScore = 1;
+    UpdateCrimeTracking();
+    Check(!C.crimeMs && !C.gotWanted && !world.lawQueries,
+        "later corpse damage cannot charge an externally killed target that was already found");
+
+    for (int priorContact = 0; priorContact < 2; ++priorContact)
+    {
+        Reset();
+        g_state = CONTRACT_UNKNOWN;
+        world.targetDead = true;
+        C.damagedByPlayer = priorContact == 0;
+        C.crimeMs = priorContact == 1 ? 500 : 0;
+        CheckTargetFound();
+        Check(!C.diedBeforeContact, "player lethal damage or prior contact preserves crime eligibility");
+        UpdateCrimeTracking();
+        world.wantedScore = 1;
+        UpdateCrimeTracking();
+        Check(C.crimeMs && C.gotWanted, "law tracking remains active for a player-engaged target after death");
     }
 }
 
@@ -466,6 +551,7 @@ static void TestPostInteractionPauseAndPlayerGate()
 int main()
 {
     TestCrimeRequiresHostileContact();
+    TestDiscoveryAndDeathBeforeContact();
     TestLawTrackingSurvivesCorpseDisappearance();
     TestPayoutBoundsAndTiming();
     TestTrailOwnershipAndTransitions();

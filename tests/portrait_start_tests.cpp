@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 using DWORD = std::uint32_t;
@@ -47,6 +48,7 @@ static struct World
     bool acceptedPhoto = false;
     bool destinationValid = true, placementValid = true, groundPlacement = true;
     bool interruptPlacement = false, losePlacementTarget = false;
+    bool interactionAllowed = true, blockDuringPlacement = false;
     bool delayCleanup = false, cleanupRequested = false, identityMatches = true, loseOwnership = false;
     unsigned now = 1000, placementReadyAt = 0;
     unsigned frame = 0;
@@ -212,11 +214,19 @@ static void RequestOwnedPedCleanup(Ped ped)
 }
 
 static void LogContractStartFailure(Hash model, int attempt);
-static bool ValidateRoutineDeployment(Ped, const ContractDef&) { return world.destinationValid; }
+namespace RoutineSpawn
+{
+static struct { const char* check = "none"; } diagnostic;
+static bool Reject(const char* check) { diagnostic.check = check; return false; }
+}
+static bool ValidateRoutineDeployment(Ped, const ContractDef&)
+{
+    if (!world.interactionAllowed) return RoutineSpawn::Reject("interaction_interrupted");
+    return world.destinationValid || RoutineSpawn::Reject("collision_or_nav_unloaded");
+}
 static bool ValidateRoutinePlacement(Ped, const ContractDef&) { return world.placementValid && world.now >= world.placementReadyAt; }
-static bool CanStartInteraction() { return world.playerAlive && world.playerId == pedMe; }
+static bool CanStartInteraction() { return world.playerAlive && world.playerId == pedMe && world.interactionAllowed; }
 static ULONGLONG GetTickCount64() { return world.now; }
-namespace RoutineSpawn { static bool Reject(const char*) { return false; } }
 template<typename Predicate> static bool WaitUntil(DWORD timeout, Predicate predicate)
 {
     const unsigned start = world.now;
@@ -226,6 +236,7 @@ template<typename Predicate> static bool WaitUntil(DWORD timeout, Predicate pred
         if (world.now - start >= timeout) return false;
         world.now += 16;
         if (world.interruptPlacement) world.playerAlive = false;
+        if (world.blockDuringPlacement) world.interactionAllowed = false;
         if (world.losePlacementTarget) world.targetExists = false;
         if (world.loseOwnership) world.identityMatches = false;
     }
@@ -242,6 +253,7 @@ static void Reset(std::vector<CaptureResult> results)
 {
     world = World();
     routineStartDiagnostic = {};
+    RoutineSpawn::diagnostic = {};
     world.results = results;
     pedMe = kPlayer;
     lastStartFailure = ContractStartFailure::None;
@@ -287,6 +299,18 @@ int main()
     Check(Prepare() == 0 && lastStartFailure == ContractStartFailure::LocationUnavailable,
         "destination disappearing during portrait refuses deployment");
     CheckFailed(1);
+    Reset({ CaptureResult::Success });
+    world.interactionAllowed = false;
+    Check(Prepare() == 0 && PlayerAvailable() && lastStartFailure == ContractStartFailure::Interrupted,
+        "pause, fade, mounting or combat before deployment reports interruption with a living player");
+    CheckFailed(1);
+
+    Reset({ CaptureResult::Success });
+    world.placementReadyAt = 1120; world.blockDuringPlacement = true;
+    Check(Prepare() == 0 && PlayerAvailable() && lastStartFailure == ContractStartFailure::Interrupted && world.teleports == 1 && world.reveals == 0,
+        "a blocked interaction during settling reports interruption rather than an unavailable location");
+    Check(world.deletes == 1 && world.releases == 1, "settling interruption cleans up its hidden subject and portrait");
+
     Reset({ CaptureResult::Success });
     world.placementValid = false;
     Check(Prepare() == 0 && world.teleports == 1 && world.reveals == 0 && world.deletes == 1 && world.releases == 1,
