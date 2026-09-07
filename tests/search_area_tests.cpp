@@ -31,6 +31,8 @@ static struct Routine
     Vector3 centre;
     float wanderRadius = RoutineData::kWanderRadius;
     int destination = 0;
+    int fallbackDestination = 0;
+    Vector3 fallbackCentre;
     bool destinationValid = true;
     bool ambientFallback = false;
 } R;
@@ -85,6 +87,7 @@ static void Reset(bool routine = true)
     C.def = &definition;
     // This is the validated arrival, deliberately distinct from the old town anchor.
     R.centre = {2823.0f, -1416.0f, 45.5f};
+    R.fallbackCentre = R.centre;
     C.targetPos = R.centre;
 }
 static void RoutineStartsAtItsValidatedArrival()
@@ -105,41 +108,51 @@ static void RoutineStartsAtItsValidatedArrival()
             "unchanged routine stop and individual target movement make no map write");
     }
 }
-static void NewStopMovesTheSameCircleOnce()
+static void NewStopMovesTheSameCircleOnlyAfterArrival()
 {
     Reset(); AddSearchBlip();
     const Blip original = C.searchBlip;
+    const Vector3 previousStop = w.centre;
     ++R.destination; R.centre = {2684.0f, -1399.0f, 46.7f};
+    for (int frame = 0; frame < 4; ++frame)
+    {
+        C.targetPos = {R.centre.x + 90.0f - 10.0f * frame, R.centre.y, R.centre.z};
+        UpdateSearchArea();
+        Check(SamePoint(w.centre, previousStop) && w.moves == 0,
+            "selecting and travelling toward a new stop retains the previously arrived search area");
+    }
+    // The runtime publishes this cache when travel reaches the wander boundary.
+    C.targetPos = {R.centre.x + R.wanderRadius, R.centre.y, R.centre.z};
+    R.fallbackDestination = R.destination; R.fallbackCentre = R.centre;
     UpdateSearchArea();
     Check(C.searchBlip == original && w.moves == 1 && w.creates == 1 && w.styles == 1 &&
         SamePoint(w.centre, R.centre) && w.radius == 45.0f,
-        "a new valid routine stop moves the original 45 metre circle once without recreating or restyling it");
+        "arrival moves the original 45 metre circle to the new stop without recreating or restyling it");
     for (int frame = 0; frame < 4; ++frame) UpdateSearchArea();
     Check(w.moves == 1 && w.creates == 1, "subsequent frames at the new stop do not repeat the map write");
-    ++R.destination;
+    ++R.destination; R.fallbackDestination = R.destination;
     UpdateSearchArea();
     Check(w.moves == 1, "a new destination id at the same coordinates needs no map write");
 }
 static void InvalidAndInactiveSearchesDoNotMove()
 {
-    for (int blocked = 0; blocked < 10; ++blocked)
+    for (int blocked = 0; blocked < 9; ++blocked)
     {
         Reset(); AddSearchBlip();
         const Vector3 original = w.centre;
-        R.centre = {100, 200, 300};
+        R.centre = {100, 200, 300}; R.fallbackCentre = R.centre;
         if (blocked == 0) C.def = nullptr;
         if (blocked == 1) definition.routine = false;
-        if (blocked == 2) R.destination = -1;
-        if (blocked == 3) R.destinationValid = false;
-        if (blocked == 4) C.searchBlip = 0;
-        if (blocked == 5) w.exists = false;
-        if (blocked == 6) g_state = CONTRACT_NONE;
-        if (blocked == 7) g_state = CONTRACT_FOUND;
-        if (blocked == 8) g_state = CONTRACT_DEAD;
-        if (blocked == 9) g_state = CONTRACT_PAID;
+        if (blocked == 2) R.fallbackDestination = -1;
+        if (blocked == 3) C.searchBlip = 0;
+        if (blocked == 4) w.exists = false;
+        if (blocked == 5) g_state = CONTRACT_NONE;
+        if (blocked == 6) g_state = CONTRACT_FOUND;
+        if (blocked == 7) g_state = CONTRACT_DEAD;
+        if (blocked == 8) g_state = CONTRACT_PAID;
         UpdateSearchArea();
         Check(SamePoint(w.centre, original) && w.moves == 0 && w.creates == 1 && w.styles == 1,
-            "invalid or pending destinations, inactive or found contracts, and missing blips make no map write");
+            "missing arrival cache, inactive or found contracts, and missing blips make no map write");
         Check(w.coordinateReads == 0, "rejected search updates do not read circle coordinates");
     }
 }
@@ -148,7 +161,7 @@ static void LegacySearchKeepsItsDefinition()
     Reset(false); AddSearchBlip();
     Check(SamePoint(w.centre, definition.spawn) && w.radius == definition.searchRadius && w.radius == 310.0f,
         "legacy search retains its authored spawn point and radius");
-    R.centre = {100, 200, 300}; ++R.destination;
+    R.centre = {100, 200, 300}; R.fallbackCentre = R.centre; ++R.destination;
     C.targetPos = {400, 500, 600}; UpdateSearchArea();
     Check(SamePoint(w.centre, definition.spawn) && w.moves == 0 && w.creates == 1 && w.coordinateReads == 0,
         "routine and target movement cannot alter a legacy search circle");
@@ -157,26 +170,35 @@ static void CachedFallbackKeepsItsAuthoredCircle()
 {
     Reset(); AddSearchBlip();
     const Blip original = C.searchBlip;
-    R.centre = {2822, -1415, 45.5f};
+    const Vector3 previousStop = w.centre;
+    R.centre = {2684.0f, -1399.0f, 46.7f}; ++R.destination;
     R.ambientFallback = true; R.destinationValid = false;
     UpdateSearchArea();
-    Check(C.searchBlip == original && w.moves == 1 && w.creates == 1 &&
-        SamePoint(w.centre, R.centre) && w.radius == 45.0f,
-        "route recovery keeps the same 45 metre search circle at the cached authored fallback");
+    Check(C.searchBlip == original && w.moves == 0 && w.creates == 1 &&
+        SamePoint(w.centre, previousStop) && w.radius == 45.0f,
+        "a failed travel endpoint cannot move the search circle away from the last arrived stop");
+    R.destination = R.fallbackDestination; R.centre = R.fallbackCentre;
     for (int frame = 0; frame < 4; ++frame)
     {
         C.targetPos.x += 10;
         UpdateSearchArea();
     }
-    Check(w.moves == 1, "fallback wandering never makes the circle chase individual footsteps");
+    Check(w.moves == 0, "fallback wandering never makes the circle chase individual footsteps");
     R.destination = -1; R.centre = {0, 0, 0};
     UpdateSearchArea();
-    Check(w.moves == 1, "fallback cannot move the search circle without a known authored destination");
+    Check(w.moves == 0 && SamePoint(w.centre, previousStop),
+        "losing the current selection retains the known last-arrived circle");
+    // A stale map coordinate can still be corrected while selection is unavailable.
+    w.centre = {100, 200, 300};
+    UpdateSearchArea();
+    Check(w.moves == 1 && SamePoint(w.centre, previousStop),
+        "search tracking reads the arrival cache independently of current destination validity");
 }
 static void MainUpdatesSearchBeforeItsProtectedTail()
 {
     Reset(); AddSearchBlip(); w.events.clear();
     ++R.destination; R.centre = {100, 200, 300};
+    R.fallbackDestination = R.destination; R.fallbackCentre = R.centre;
     RunProductionSearchFrameTail();
     Check(w.events == std::vector<std::string>{"move", "trace", "debug", "card", "wait"},
         "the actual main tail updates search before inspection trace, debug, card rendering and yield");
@@ -187,7 +209,7 @@ static void MainUpdatesSearchBeforeItsProtectedTail()
 int main()
 {
     RoutineStartsAtItsValidatedArrival();
-    NewStopMovesTheSameCircleOnce();
+    NewStopMovesTheSameCircleOnlyAfterArrival();
     InvalidAndInactiveSearchesDoNotMove();
     LegacySearchKeepsItsDefinition();
     CachedFallbackKeepsItsAuthoredCircle();

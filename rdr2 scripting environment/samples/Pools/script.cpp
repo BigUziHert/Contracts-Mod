@@ -500,7 +500,7 @@ static void AddSearchBlip()
 	float radius = C.def->searchRadius;
 	if (IsRoutine(*C.def))
 	{
-		centre = R.centre;
+		centre = R.fallbackCentre;
 		radius = R.wanderRadius;
 	}
 	C.searchBlip = MAP::BLIP_ADD_FOR_RADIUS(BLIP_STYLE_MP_MISSION_GIVER, centre, radius);
@@ -509,11 +509,11 @@ static void AddSearchBlip()
 static void UpdateSearchArea()
 {
 	if (g_state != CONTRACT_UNKNOWN || !C.def || !IsRoutine(*C.def) ||
-		R.destination < 0 || (!R.destinationValid && !R.ambientFallback) || !C.searchBlip || !MAP::DOES_BLIP_EXIST(C.searchBlip)) return;
-	// Follow changes of routine stop, not the ped's individual wandering steps.
-	// Keep the same circle/handle; an unchanged stop makes no map write.
-	if (DistSq(MAP::GET_BLIP_COORDS(C.searchBlip), R.centre) > .01f)
-		MAP::SET_BLIP_COORDS(C.searchBlip, R.centre);
+		R.fallbackDestination < 0 || !C.searchBlip || !MAP::DOES_BLIP_EXIST(C.searchBlip)) return;
+	// The cache advances on arrival, when the target enters the wander radius.
+	// Selecting a future stop or taking individual steps never moves this circle.
+	if (DistSq(MAP::GET_BLIP_COORDS(C.searchBlip), R.fallbackCentre) > .01f)
+		MAP::SET_BLIP_COORDS(C.searchBlip, R.fallbackCentre);
 }
 static void AddFoundBlip()
 {

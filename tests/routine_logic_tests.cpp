@@ -137,6 +137,55 @@ static void TravelArrivalAndWandering()
     Check(controller.Tick(config, observation).action == Action::None && controller.state == State::Waiting,
         "an unavailable destination is rejected without an artificial standing task");
 }
+static void ConfiguredAreaArrivalBoundary()
+{
+    Config config;
+    config.arrivalDistance = 45.0f;
+    Controller controller;
+    auto observation = Observe(0, 45.01f);
+    Check(controller.Tick(config, observation).action == Action::Travel,
+        "configured area arrival still travels immediately outside the 45 metre boundary");
+    observation.taskActive = true;
+    observation.nowMs = 16;
+    observation.distance = 45.0f;
+    Check(controller.Tick(config, observation).action == Action::Wander && controller.state == State::Wandering,
+        "configured arrival starts wandering exactly at the area boundary");
+    observation.nowMs = 32;
+    observation.distance = 46.0f;
+    Check(controller.Tick(config, observation).action == Action::None && controller.state == State::Wandering,
+        "healthy wandering does not restart travel after crossing back outside the arrival boundary");
+
+    controller.Reset();
+    observation = Observe(0, 44.99f);
+    Check(controller.Tick(config, observation).action == Action::Wander,
+        "a newly selected destination already inside its area needs no centre-directed travel");
+
+    controller.Reset();
+    observation = Observe(0, 45.0f);
+    observation.blocked = true;
+    Check(controller.Tick(config, observation).action == Action::None && controller.state == State::Suspended,
+        "arrival distance never overrides higher-priority activity");
+    observation.blocked = false;
+    ++observation.nowMs;
+    const Decision resumed = controller.Tick(config, observation);
+    Check(resumed.action == Action::None && resumed.reevaluate,
+        "resuming inside the area requires fresh selection before arrival");
+    ++observation.nowMs;
+    Check(controller.Tick(config, observation).action == Action::Wander,
+        "a valid destination can arrive after the resume selection boundary");
+
+    for (bool closed : {false, true})
+    {
+        controller.Reset();
+        observation = Observe(0, 45.0f);
+        observation.destinationOpen = !closed;
+        observation.destinationAvailable = closed;
+        observation.fallbackDestinationId = 12;
+        Check(controller.Tick(config, observation).action == Action::WanderFallback &&
+            controller.state == State::Waiting && controller.destinationId == 12,
+            "an unavailable or closed destination at the area boundary cannot be accepted as arrived");
+    }
+}
 static void BoundedFailureAndCooldown()
 {
     Config config;
@@ -472,6 +521,7 @@ int main()
     OpeningWindowsAndArrival();
     CandidateSelection();
     TravelArrivalAndWandering();
+    ConfiguredAreaArrivalBoundary();
     BoundedFailureAndCooldown();
     UnchangedDestinationReevaluation();
     PriorityResumeClockAndClosure();

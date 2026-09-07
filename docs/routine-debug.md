@@ -37,7 +37,7 @@ update, without changing card render-target selection or portrait code.
 | Doing | Combat, search, restraint, vehicle and unloaded-area priorities override the routine controller. Fighting, Searching for player and Preparing to fight append observed combat evidence: task status (0 queued, 1 performing, 7 missing), engine combat Y/N, and SCENARIO / SEATED when detected. For example, `Fighting [task 0, engine Y, SCENARIO, SEATED]` exposes a queued seated engagement despite the policy label. Smoking/drinking requires a confirmed matching scenario and is labelled ambient; other observed scenarios say Ambient scenario. The mod does not start them. Missing routine tasks show pending/recovery rather than claiming movement. |
 | Stop and distance | Assigned destination and straight-line target-to-stop distance. A fallback label identifies the all-day public destination used outside its normal phase, or the cached authored area used while a route is unavailable. |
 | Next planned | The following schedule phase's authored destination and transition time, including this contract's clock offset. Availability can change the actual next stop. |
-| Wander / indoors | Configured wander radius (45 m at every stop) and current interior classification. This does not prevent a target from walking indoors. The gameplay search circle uses the same radius and follows assigned stop changes. |
+| Wander / indoors | Configured wander radius (45 m at every stop) and current interior classification. This does not prevent a target from walking indoors. The gameplay search circle uses the same radius and moves to the next stop when the target enters its wander area. During travel it stays at the previous stop. |
 | Loaded / routine / open / valid | Current local collision/navigation residency, observed routine task, the assigned stop's visiting window, and route validation status. `Open` is the mod's exterior visiting window, not a shop's business hours. During cached fallback roaming `Valid N` means fresh route selection is pending; it does not command the ped to stand still. `Routine N` during combat means the routine is not the task being observed. |
 | XYZ | Current target coordinates, useful when reporting a wrong level or blocked route. |
 
@@ -61,8 +61,11 @@ streaming, clear nearby entities or change discovery.
    locations. Press F8 twice to confirm all debug markers and text hide, then return.
 2. Press U, inspect/put away the card, and walk toward the target. Confirm player distance
    changes independently of the target's distance to its assigned stop.
-3. Watch a scheduled transition. The destination marker should move to the new validated
-   arrival and the panel should distinguish walking, wandering and any smoking/drinking.
+3. Watch a scheduled transition. The debug destination marker should identify the newly
+   selected stop while the yellow search circle stays at the previous stop. When the target
+   enters the new stop's 45 m area, travel should switch to wandering and the search circle
+   should move there. The target need not reach the marker first. The panel should distinguish
+   walking, wandering and any smoking/drinking.
 4. Provoke or restrain the target. The panel should show that priority without assigning
    another routine task. After death, it should show body distance without a travel plan.
 5. Replace/end a contract. Exact markers should update/remove while catalog dots remain.

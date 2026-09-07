@@ -227,12 +227,16 @@ static bool WaitForRoutinePlacement(Ped ped, const ContractDef& def)
     return accepted;
 }
 
-static int RoutineTravelMinutes(const Vector3& from, const Vector3& to)
+static int RoutineTravelMinutes(const Vector3& from, const Vector3& to, float arrivalRadius = RoutineData::kWanderRadius)
 {
+    const double centreDistance = std::sqrt(static_cast<double>(DistSq(from, to)));
+    // A visit starts at the edge of its wandering area, so its visiting window
+    // only needs to allow the walk to that area, not an extra trip to the centre.
+    if (centreDistance <= arrivalRadius) return 0;
     // Read the actual game-clock rate (act_caunc_rustling.c:24960), never change it.
     const int rate = CLOCK::GET_MILLISECONDS_PER_GAME_MINUTE();
     if (rate <= 0) return Routine::kMinutesPerDay; // only all-day fallbacks remain eligible
-    const double distance = std::sqrt(static_cast<double>(DistSq(from, to)));
+    const double distance = centreDistance - arrivalRadius;
     const double estimate = std::ceil(static_cast<double>(Routine::TravelEstimateMs(distance)) / rate);
     return static_cast<int>(estimate > Routine::kMinutesPerDay ? Routine::kMinutesPerDay : estimate);
 }
@@ -246,7 +250,7 @@ static void SelectRoutineDestination(Ped ped, const Vector3& position, int minut
         if (candidate.id < 0) continue;
         const auto& location = RoutineData::kLocations[candidate.id];
         candidate.available = candidate.available && !R.controller.IsCoolingDown(candidate.id, now);
-        candidate.travelMinutes = RoutineTravelMinutes(position, location.anchor);
+        candidate.travelMinutes = RoutineTravelMinutes(position, location.anchor, location.wanderRadius);
     }
     const int previousDestination = R.destination;
     bool accepted = false;
@@ -357,7 +361,7 @@ static void UpdateRoutine(Ped ped, const ContractDef& def, bool mayAct)
                 R.nextValidationMs = observation.nowMs + 1000;
             }
             observation.destinationOpen = Routine::CanArriveAndStay({location.openMinute, location.closeMinute},
-                observation.minute, R.controller.state == Routine::State::Travelling ? RoutineTravelMinutes(position, R.centre) : 0, 0);
+                observation.minute, R.controller.state == Routine::State::Travelling ? RoutineTravelMinutes(position, R.centre, R.wanderRadius) : 0, 0);
             const int preferred = R.plan.route[static_cast<int>(Routine::PhaseAt(observation.minute, R.plan.offsetMinutes))];
             // Optional availability retries can wait for a native ambient pause to
             // end. Real schedule changes, closed hours and priority still win.
@@ -376,6 +380,9 @@ static void UpdateRoutine(Ped ped, const ContractDef& def, bool mayAct)
     observation.destinationId = R.destination;
     observation.destinationAvailable = R.destinationValid && !R.ambientFallback;
     observation.distance = std::sqrt(DistSq(position, R.centre));
+    // Hand control to native area wandering as soon as the target enters it.
+    // There is no scripted requirement to visit the fixed centre first.
+    config.arrivalDistance = R.wanderRadius;
     const Routine::Decision decision = R.controller.Tick(config, observation);
     if (decision.reevaluate) R.selectPending = true;
     if (R.controller.state == Routine::State::Waiting && R.fallbackDestination >= 0)

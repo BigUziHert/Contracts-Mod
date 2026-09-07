@@ -60,8 +60,9 @@ after success. See [retry behavior and engine limits](routine-radius-and-startup
 
 ## Search, wander and spawn areas
 
-- Search: a 45 m circle around the current validated routine destination. It moves when
-  a new valid stop is assigned, using the same blip; it does not follow individual steps.
+- Search: a 45 m circle around the initial spawn/last arrived routine stop. It stays there
+  during travel, then moves to the next validated stop when the target enters that stop's
+  45 m wander area. It uses the same blip and does not follow individual steps.
 - Candidate radius: 4–12 m around a sourced coordinate, used only for validation.
 - Wander radius: 45 m around that same fixed validated destination point, from the shared
   `RoutineData::kWanderRadius` constant. Travel between stops can extend outside the circle.
@@ -109,18 +110,25 @@ Each contract has four fixed clue destinations and a deterministic schedule offs
 up to 30 minutes. Base phases are Rest 00:00–06:00, Work 06:00–14:00, Shops 14:00–18:00,
 Leisure 18:00–24:00. The offset changes routine transitions, never opening windows.
 Current time and the actual game-clock rate determine selection and a conservative walking
-ETA. A destination needs at least 15 game minutes for a visit after expected arrival;
+ETA to the edge of the destination's wander area. A destination already within reach
+has zero travel ETA. A destination needs at least 15 game minutes for a visit after expected arrival;
 closure during travel triggers another selection. Windows crossing midnight work normally.
 
 `TASK_FOLLOW_NAV_MESH_TO_COORD` follows `act_hunting_2.c:10128` for walking speed, flags
 and unconstrained heading. ETA and each trip's gameplay deadline share a named walking
-speed of 1 metre/second and a 1.2 detour factor. The deadline has a five-minute floor;
+speed of 1 metre/second and a 1.2 detour factor. The deadline conservatively retains the
+full distance to the centre and has a five-minute floor;
 long routes receive more time. Travel retains a 20-second
 no-progress threshold, a four-second recovery interval and at most two retries. Failed
 destinations cool down for 60 seconds. Navigation failure tries the selected all-day public
 fallback. If neither route is usable, the target uses native 45 m wandering around the last
 accepted spawn/arrived stop while selection retries. The cached centre never follows the
-ped's footsteps and never comes from a failed travel endpoint. Arrival starts fixed-centre local wandering.
+ped's footsteps and never comes from a failed travel endpoint. Entering the destination's
+45 m radius starts fixed-centre local wandering immediately and publishes that stop as the
+search area. Selecting a nearby stop whose area already contains the target starts wandering
+without a travel task. The target no longer has to reach within 4 m of the centre first;
+native wandering can still choose to walk through it. Leaving the radius during an established
+wandering visit does not restart scripted travel to the centre.
 Tasks are issued on transitions or bounded recovery, never once per frame.
 
 Per-frame travel never starts a global scene load or waits. It requests missing collision

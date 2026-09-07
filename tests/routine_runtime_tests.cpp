@@ -558,7 +558,7 @@ static void SetDaytimeFixture()
     R.fallbackDestination = R.destination; R.fallbackCentre = R.centre;
     R.definition = {"Valentine", "Livestock hand", "Valentine", R.centre, RoutineData::kWanderRadius,
         RoutineModels(2, RoutineData::LivestockHand), &kHumanTarget, nullptr, ResetRoutine};
-    w.pedPosition = R.centre; w.pedPosition.x += 40;
+    w.pedPosition = R.centre; w.pedPosition.x += 90;
 }
 static void Tick(unsigned elapsed = 16, bool mayAct = true)
 {
@@ -636,6 +636,83 @@ static void TestTravelAndClock()
         Within(R.centre, held, .001f) && R.wanderRadius == radius && w.safeCalls == safeCalls && w.scenarioExits == 0,
         "pause while in a scenario preserves the exact destination and healthy ambient task without candidate projection");
 }
+static void BeginShopTravelFromAcceptedWork()
+{
+    SetDaytimeFixture(); BeginTravel();
+    w.pedPosition = R.centre; Tick();
+    const int held = R.destination;
+    const Vector3 heldCentre = R.centre;
+    w.minute = 900;
+    w.pedPosition = RoutineData::kLocations[R.plan.route[1]].anchor; w.pedPosition.x += 90;
+    Tick(); Tick();
+    Check(R.destination == R.plan.route[1] && R.controller.state == Routine::State::Travelling &&
+        R.fallbackDestination == held && Within(R.fallbackCentre, heldCentre, .001f),
+        "scheduled travel retains the previously accepted area until arrival");
+}
+static void TestArrivalAtWanderBoundary()
+{
+    BeginShopTravelFromAcceptedWork();
+    const int held = R.fallbackDestination, arrived = R.destination;
+    const Vector3 heldCentre = R.fallbackCentre, destinationCentre = R.centre;
+    const int travelCalls = w.travelCalls, wanderCalls = w.wanderCalls;
+    w.pedPosition = destinationCentre; w.pedPosition.x += 45.01f;
+    Tick();
+    Check(R.controller.state == Routine::State::Travelling && w.travelCalls == travelCalls &&
+        w.wanderCalls == wanderCalls && R.fallbackDestination == held && Within(R.fallbackCentre, heldCentre, .001f),
+        "just outside 45 metres continues travel and preserves the previous accepted area");
+    w.pedPosition = destinationCentre; w.pedPosition.x += 45.0f;
+    Tick();
+    Check(R.controller.state == Routine::State::Wandering && w.wanderCalls == wanderCalls + 1 &&
+        w.travelCalls == travelCalls && w.wanderRadius == 45.0f && Within(w.wanderCentre, destinationCentre, .001f),
+        "entry at exactly 45 metres interrupts walking with one native wander task around the fixed destination");
+    Check(R.fallbackDestination == arrived && Within(R.fallbackCentre, destinationCentre, .001f),
+        "the newly arrived area is published in the same update that starts wandering");
+    w.pedPosition.x += 1.0f;
+    for (int frame = 0; frame < 20; ++frame) Tick();
+    Check(w.wanderCalls == wanderCalls + 1 && w.travelCalls == travelCalls &&
+        Within(R.centre, destinationCentre, .001f) && Within(R.fallbackCentre, destinationCentre, .001f),
+        "healthy wandering crossing the boundary does not oscillate into travel or move the authored centre");
+
+    SetDaytimeFixture();
+    const int previous = R.fallbackDestination;
+    w.minute = 900;
+    w.pedPosition = RoutineData::kLocations[R.plan.route[1]].anchor; w.pedPosition.x += 20.0f;
+    Check(StartRoutineWander(77, R.definition), "nearby scheduled fixture requests route selection");
+    Tick(); Tick();
+    Check(R.destination == R.plan.route[1] && R.destination != previous &&
+        R.controller.state == Routine::State::Wandering && w.travelCalls == 0 && w.wanderCalls == 1 &&
+        R.fallbackDestination == R.destination && Within(w.wanderCentre, R.centre, .001f),
+        "selection while already within the next area starts wandering without travelling to its centre");
+
+    BeginShopTravelFromAcceptedWork();
+    const int cached = R.fallbackDestination, beforeBlocked = TaskCount();
+    const Vector3 cachedCentre = R.fallbackCentre;
+    w.pedPosition = R.centre; w.pedPosition.x += 45.0f;
+    Tick(16, false);
+    Check(R.controller.state == Routine::State::Suspended && TaskCount() == beforeBlocked &&
+        R.fallbackDestination == cached && Within(R.fallbackCentre, cachedCentre, .001f),
+        "combat or restraint at the boundary cannot publish arrival or take over the ped");
+    Tick();
+    Check(R.selectPending && TaskCount() == beforeBlocked && R.fallbackDestination == cached,
+        "priority release reselects the route before claiming arrival inside the area");
+    Tick();
+    Check(R.controller.state == Routine::State::Wandering && R.fallbackDestination == R.destination &&
+        R.fallbackDestination != cached && w.wanderCalls == 2,
+        "successful reselection after priority release starts area wandering once");
+
+    BeginShopTravelFromAcceptedWork();
+    const int retained = R.fallbackDestination;
+    const Vector3 retainedCentre = R.fallbackCentre;
+    w.pedPosition = R.centre; w.pedPosition.x += 45.0f;
+    w.occupied = true; Tick(1000);
+    Check(R.controller.state == Routine::State::Waiting && R.ambientFallback &&
+        R.fallbackDestination == retained && Within(R.fallbackCentre, retainedCentre, .001f) &&
+        Within(w.wanderCentre, retainedCentre, .001f),
+        "an unavailable destination at the boundary resumes cached-area wandering without publishing false arrival");
+    Tick();
+    Check(R.ambientFallback && R.fallbackDestination == retained && Within(R.fallbackCentre, retainedCentre, .001f),
+        "failed destination reselection keeps the last arrived area intact");
+}
 static void TestSuspensionAndAvailability()
 {
     SetDaytimeFixture(); BeginTravel();
@@ -662,7 +739,7 @@ static void TestSuspensionAndAvailability()
 
     SetDaytimeFixture();
     w.minute = 1070;
-    w.pedPosition = RoutineData::kLocations[R.plan.route[1]].anchor; w.pedPosition.x += 200;
+    w.pedPosition = RoutineData::kLocations[R.plan.route[1]].anchor; w.pedPosition.x += 245;
     StartRoutineWander(77, R.definition); Tick(); Tick();
     Check(R.destination == R.plan.route[3], "travel plus minimum stay skips a shop that closes before a useful arrival");
     SetDaytimeFixture();
@@ -703,8 +780,10 @@ static void TestTravelRecovery()
 static void TestTravelEstimateAndLongDeadline()
 {
     SetDaytimeFixture();
-    Check(RoutineTravelMinutes({}, {40, 0, 0}) == 24,
-        "short-route ETA uses the issued walking speed and shared detour allowance without the old extra delay");
+    Check(RoutineTravelMinutes({}, {85, 0, 0}) == 24,
+        "short-route ETA allows walking only the remaining 40 metres to the edge of the 45 metre area");
+    Check(RoutineTravelMinutes({}, {45, 0, 0}) == 0 && RoutineTravelMinutes({}, {40, 0, 0}) == 0,
+        "arrival at or inside the wander radius has no remaining travel allowance");
     Check(RoutineTravelMinutes({}, {}) == 0, "a zero-distance visit needs no travel allowance");
     w.minute = 60;
     w.pedPosition = RoutineData::kLocations[R.plan.route[3]].anchor;
@@ -715,8 +794,9 @@ static void TestTravelEstimateAndLongDeadline()
         R.controller.TripTimeoutMs() == estimate,
         "a long same-town route shares its walking estimate with both native and controller deadlines");
     const int eta = RoutineTravelMinutes(w.pedPosition, R.centre);
-    Check(eta == static_cast<int>(std::ceil(static_cast<double>(estimate) / w.clockRate)),
-        "long-route ETA and deadline are derived from the same distance and speed");
+    const auto areaEstimate = Routine::TravelEstimateMs(std::sqrt(static_cast<double>(DistSq(w.pedPosition, R.centre))) - R.wanderRadius);
+    Check(eta == static_cast<int>(std::ceil(static_cast<double>(areaEstimate) / w.clockRate)) && areaEstimate < estimate,
+        "long-route ETA stops at area entry while the task keeps its conservative full-distance deadline");
     w.pedPosition = R.centre; w.pedPosition.x += 200;
     Tick(300000);
     Check(R.controller.state == Routine::State::Travelling && w.travelCalls == 1 && w.standCalls == 0,
@@ -730,6 +810,7 @@ static void TravelToLeisure(unsigned seed)
 {
     SetDaytimeFixture();
     R.plan.seed = seed; w.minute = 1100;
+    w.pedPosition = RoutineData::kLocations[R.plan.route[2]].anchor; w.pedPosition.x += 90;
     BeginTravel();
     Check(R.destination == R.plan.route[2], "ambient fixture physically travels to a real leisure destination");
     w.pedPosition = R.centre;
@@ -1031,6 +1112,7 @@ int main()
     TestDeploymentAndWander();
     TestPedOriginAndBoundedPlacement();
     TestTravelAndClock();
+    TestArrivalAtWanderBoundary();
     TestSuspensionAndAvailability();
     TestTravelRecovery();
     TestTravelEstimateAndLongDeadline();

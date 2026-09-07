@@ -64,7 +64,7 @@ The names are deliberately short for card clues. Ground-level task destinations 
 | `sd_saloon` — slum saloon street | `2813.741, -1182.042, 46.2764` | [rcm_bh_sd_saloon.c:18929](<C:/Users/caleb/Desktop/RDR2 Coding/RDR3-Decompiled-Scripts-master/1491.50/rcm_bh_sd_saloon.c:18929>), explicit navmesh destination outside the saloon interior listed at [saintdenis.c:1984](<C:/Users/caleb/Desktop/RDR2 Coding/RDR3-Decompiled-Scripts-master/1491.50/saintdenis.c:1984>). |
 | `sd_public` — newspaper corner | `2683.454, -1400.018, 46.693` | [saintdenis.c:848](<C:/Users/caleb/Desktop/RDR2 Coding/RDR3-Decompiled-Scripts-master/1491.50/saintdenis.c:848>), named newspaper area. |
 
-The search circle uses the current validated destination and the same 45 m radius as wandering. It moves when a new valid stop is assigned, retaining its blip handle; it does not track the target's individual steps. A target travelling between stops can be outside this circle. The town-level centres remain catalogue reference anchors and no longer position the gameplay search circle.
+The search circle uses the initial spawn/last arrived stop and the same 45 m radius as wandering. It stays at that stop during travel, then moves when the target enters the next validated stop's 45 m area and starts native wandering. The target does not have to walk to the centre first. The circle retains its blip handle and does not track individual steps. A target travelling between stops can be outside this circle. The town-level centres remain catalogue reference anchors and no longer position the gameplay search circle.
 
 ## Unmarked places, construction, and missing coverage
 
