@@ -56,6 +56,23 @@ inline bool Validate(const Vector3& anchor, float radius, float heightTolerance,
     return true;
 }
 
+inline bool Find(const Vector3& anchor, float radius, float heightTolerance, unsigned seed, Vector3& out, Ped ignore = 0)
+{
+    const float offsets[][2] = { {.5f, 0}, {0, .5f}, {-.5f, 0}, {0, -.5f} };
+    for (unsigned attempt = 0; attempt < 5; ++attempt)
+    {
+        Vector3 candidate = anchor;
+        if (attempt < 4)
+        {
+            const auto& offset = offsets[(seed + attempt) % 4];
+            candidate.x += offset[0] * radius;
+            candidate.y += offset[1] * radius;
+        }
+        if (Validate(anchor, radius, heightTolerance, candidate, out, ignore)) return true;
+    }
+    return false;
+}
+
 inline bool Prepare(const Vector3& anchor, float radius, float heightTolerance, unsigned seed, Vector3& out)
 {
     // Do not start over an active global loader. The API has no ownership handle;
@@ -68,23 +85,7 @@ inline bool Prepare(const Vector3& anchor, float radius, float heightTolerance, 
         STREAMING::REQUEST_COLLISION_AT_COORD(anchor);
         return Loaded(anchor);
     });
-    bool found = false;
-    if (loaded && PlayerAvailable())
-    {
-        // Rotate four small offsets, then retry the exact sourced anchor as the fallback.
-        const float offsets[][2] = { {.5f, 0}, {0, .5f}, {-.5f, 0}, {0, -.5f} };
-        for (unsigned attempt = 0; attempt < 5 && !found; ++attempt)
-        {
-            Vector3 candidate = anchor;
-            if (attempt < 4)
-            {
-                const auto& offset = offsets[(seed + attempt) % 4];
-                candidate.x += offset[0] * radius;
-                candidate.y += offset[1] * radius;
-            }
-            found = Validate(anchor, radius, heightTolerance, candidate, out);
-        }
-    }
+    const bool found = loaded && PlayerAvailable() && Find(anchor, radius, heightTolerance, seed, out);
     if (ownsScene) STREAMING::LOAD_SCENE_STOP();
     return found && PlayerAvailable();
 }

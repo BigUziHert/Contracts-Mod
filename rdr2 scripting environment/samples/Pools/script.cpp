@@ -894,7 +894,7 @@ static Ped SpawnTargetWithPhoto(Hash model, const ContractDef& def)
 
 	if (!ValidateRoutineDeployment(ped, def))
 	{
-		lastStartFailure = ContractStartFailure::LocationUnavailable;
+		lastStartFailure = PlayerAvailable() ? ContractStartFailure::LocationUnavailable : ContractStartFailure::Interrupted;
 		RequestOwnedPedCleanup(ped);
 		ReleaseTargetPhoto();
 		return 0;
@@ -1438,6 +1438,12 @@ static void UpdateHumanTarget(Ped ped, const ContractDef& def)
 	case TargetAI::Action::Wander: StartWander(ped, def); break;
 	case TargetAI::Action::None: break;
 	}
+	// The policy can finish its search while the player's old native combat flag lingers.
+	// Honour that lifecycle, while still yielding to an actual combat task or another fight.
+	UpdateRoutine(ped, def, observation.canAct && taskStatus != 0 && taskStatus != 1 &&
+		C.ai.state == TargetAI::State::Wander && !C.ai.pendingEngagement &&
+		!(PED::IS_PED_IN_COMBAT(ped, 0) && !observation.nativeInCombat) &&
+		!PED::IS_PED_IN_ANY_VEHICLE(ped, false));
 }
 
 const TargetBehavior kHumanTarget = { SetupHumanTarget, UpdateHumanTarget };

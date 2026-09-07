@@ -18,6 +18,7 @@ struct Vector3
     Vector3(float a = 0, float b = 0, float c = 0) : x(a), y(b), z(c) {}
 };
 static unsigned checks = 0;
+static ULONGLONG pausedDurationMs = 0;
 static void Check(bool value, const char* message)
 {
     ++checks;
@@ -27,6 +28,11 @@ static bool Within(Vector3 a, Vector3 b, float distance)
 {
     const float dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
     return dx * dx + dy * dy + dz * dz <= distance * distance;
+}
+static float DistSq(Vector3 a, Vector3 b)
+{
+    const float dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
+    return dx * dx + dy * dy + dz * dz;
 }
 
 // Only the game data types are shimmed. The test compiles the actual runtime,
@@ -43,6 +49,7 @@ constexpr Hash Joaat(const char* text)
     value += value << 3; value ^= value >> 11; value += value << 15;
     return value;
 }
+static Hash joaat(const char* text) { return Joaat(text); }
 struct ModelSet { const Hash* list; int count; };
 template<std::size_t N> constexpr ModelSet Models(const Hash (&values)[N]) { return {values, static_cast<int>(N)}; }
 struct ContractDef;
@@ -70,7 +77,8 @@ static constexpr Hash SD_DOCK[] = {Joaat("a_m_m_sddockworkers_02"), Joaat("a_m_m
 struct World
 {
     unsigned now = 1000, waits = 0, cancelAfter = 999999;
-    int minute = 720;
+    unsigned loadedAfter = 0, targetDiesAfter = 999999;
+    int minute = 720, clockRate = 2000, taskStatus = 0;
     bool canInteract = true, collision = true, nav = true, safe = true;
     bool outside = true, groundOk = true, occupied = false, hit = false;
     bool sceneActive = false, startOk = true;
@@ -80,11 +88,18 @@ struct World
     Ped lastIgnored = -1, wanderedPed = 0;
     Vector3 wanderCentre{};
     Vector3 pedPosition{};
+    Vector3 travelCentre{}, occupiedAt{};
+    bool occupiedNear = false;
     float wanderRadius = 0, avoidRadius = 0;
     int wanderCalls = 0, keepCalls = 0, avoidCalls = 0, waterCalls = 0;
+    int travelCalls = 0, standCalls = 0, statusCalls = 0;
+    int travelTimeout = 0;
+    Hash lastTaskHash = 0;
     bool mayEnterWater = true;
 } w;
+static ULONGLONG RuntimeNowMs() { return w.now; }
 static bool PlayerAvailable() { return w.waits < w.cancelAfter; }
+static bool LivingPed(Ped ped) { return ped != 0 && w.waits < w.targetDiesAfter; }
 static bool CanStartInteraction() { return PlayerAvailable() && w.canInteract; }
 template<typename Predicate> static bool WaitUntil(DWORD timeout, Predicate predicate)
 {
@@ -101,19 +116,20 @@ namespace CLOCK
 {
 static int GET_CLOCK_HOURS() { return w.minute / 60; }
 static int GET_CLOCK_MINUTES() { return w.minute % 60; }
+static int GET_MILLISECONDS_PER_GAME_MINUTE() { return w.clockRate; }
 }
 namespace ENTITY
 {
-static bool HAS_COLLISION_LOADED_AROUND_POSITION(Vector3) { return w.collision; }
+static bool HAS_COLLISION_LOADED_AROUND_POSITION(Vector3) { return w.collision && w.now >= w.loadedAfter; }
 static Vector3 GET_ENTITY_COORDS(Ped, bool, bool) { return w.pedPosition; }
 }
 namespace PATH
 {
-static bool IS_NAVMESH_LOADED_IN_AREA(Vector3, Vector3) { return w.nav; }
+static bool IS_NAVMESH_LOADED_IN_AREA(Vector3, Vector3) { return w.nav && w.now >= w.loadedAfter; }
 static bool GET_SAFE_COORD_FOR_PED(Vector3 position, bool, Vector3* result, int)
 {
     ++w.safeCalls; w.inputGround = position.z; *result = position; result->x += w.safeDx;
-    return w.safe && w.requests > w.failFirstRequests;
+    return w.safe && (w.failFirstRequests == 0 || w.requests > w.failFirstRequests);
 }
 static void ADD_NAVMESH_REQUIRED_REGION(float, float, float) {}
 }
@@ -123,9 +139,9 @@ static bool GET_GROUND_Z_AND_NORMAL_FOR_3D_COORD(Vector3, float* ground, Vector3
 {
     *ground = w.inputGround + w.groundDz; *normal = {0, 0, 1}; return w.groundOk;
 }
-static bool IS_POSITION_OCCUPIED(Vector3, float, bool, bool, bool, bool, bool, Ped ignore, bool)
+static bool IS_POSITION_OCCUPIED(Vector3 point, float, bool, bool, bool, bool, bool, Ped ignore, bool)
 {
-    w.lastIgnored = ignore; return w.occupied;
+    w.lastIgnored = ignore; return w.occupied || (w.occupiedNear && Within(point, w.occupiedAt, 20.0f));
 }
 }
 namespace INTERIOR
@@ -159,6 +175,20 @@ static void SET_PED_PATH_MAY_ENTER_WATER(Ped, bool value) { ++w.waterCalls; w.ma
 static void TASK_WANDER_IN_AREA(Ped ped, Vector3 centre, float radius, float, float, int)
 {
     ++w.wanderCalls; w.wanderedPed = ped; w.wanderCentre = centre; w.wanderRadius = radius;
+}
+static int GET_SCRIPT_TASK_STATUS(Ped, Hash hash, bool)
+{
+    ++w.statusCalls; w.lastTaskHash = hash; return w.taskStatus;
+}
+static void TASK_FOLLOW_NAV_MESH_TO_COORD(Ped, Vector3 centre, float speed, int timeout, float range, int flags, float heading)
+{
+    Check(speed == 1.0f && range == 2.0f && flags == 0 && heading == 40000.0f,
+        "travel uses verified walking flags with bounded target range");
+    ++w.travelCalls; w.travelCentre = centre; w.travelTimeout = timeout;
+}
+static void TASK_STAND_STILL(Ped, int duration)
+{
+    Check(duration == -1, "waiting persists until a later explicit routine decision"); ++w.standCalls;
 }
 }
 namespace PED { static void SET_PED_KEEP_TASK(Ped, bool keep) { Check(keep, "routine wander keeps its task"); ++w.keepCalls; } }
@@ -256,28 +286,173 @@ static void TestDeploymentAndWander()
     Check(ValidateRoutineDeployment(77, unrelated), "legacy definitions bypass routine-specific deployment checks");
     Check(ValidateRoutinePlacement(77, unrelated), "legacy definitions bypass routine-specific placement checks");
 
+    w = {}; w.requests = 1; w.loadedAfter = 1100;
+    Check(ValidateRoutineDeployment(77, R.definition) && w.waits > 0 && w.starts == 1 && w.stops == 1,
+        "postcapture residency loss gets one bounded owned-scene reload");
+    w = {}; w.requests = 1; w.loadedAfter = 1100; w.targetDiesAfter = 1;
+    Check(!ValidateRoutineDeployment(77, R.definition) && w.waits > 0 && w.stops == 1,
+        "target death during collision reload prevents deployment after yielding");
+    w = {}; w.collision = false;
+    Check(!ValidateRoutineDeployment(77, R.definition) && w.waits <= 188 && w.stops == 1,
+        "persistent postcapture streaming failure stays hidden and releases loader within its deadline");
+
     w = {};
-    const Vector3 fixed = R.centre;
-    Check(StartRoutineWander(77, R.definition), "active definition starts normal wandering");
-    Check(w.wanderedPed == 77 && Within(w.wanderCentre, fixed, .001f) && w.wanderRadius == R.wanderRadius,
-        "wander starts around fixed validated centre with its own radius");
-    Check(w.avoidRadius == R.wanderRadius && !w.mayEnterWater && w.keepCalls == 1,
-        "wander applies water path policy and keeps the task once");
-    R.definition.spawn = {0, 0, 0};
-    Check(StartRoutineWander(77, R.definition) && Within(w.wanderCentre, fixed, .001f),
-        "fixed activity centre never follows unrelated spawn/position changes");
-    const int issued = w.wanderCalls;
-    Check(!StartRoutineWander(77, unrelated) && w.wanderCalls == issued,
-        "ordinary target definition cannot issue routine tasks");
+    Check(StartRoutineWander(77, R.definition) && R.resumeRequested && w.wanderCalls == 0,
+        "combat recovery requests fresh selection without an obsolete wander task");
+    Check(!StartRoutineWander(77, unrelated) && w.wanderCalls == 0,
+        "ordinary target definition cannot request routine tasks");
 
     const auto cleanup = R.definition.onCleanup;
     cleanup();
     Check(!R.enabled && R.destination == -1 && !IsRoutine(R.definition) && R.plan.townIndex == -1,
         "cleanup retires plan, identity and destination");
-    Check(w.wanderCalls == issued && !StartRoutineWander(77, R.definition),
+    Check(w.wanderCalls == 0 && !StartRoutineWander(77, R.definition) && !R.resumeRequested && !R.selectPending,
         "cleanup touches no game task or borrowed resource and disables later wander");
     cleanup();
-    Check(!R.enabled && w.wanderCalls == issued, "routine cleanup is idempotent");
+    Check(!R.enabled && w.wanderCalls == 0, "routine cleanup is idempotent");
+}
+
+static void SetDaytimeFixture()
+{
+    ResetRoutine(); w = {}; pausedDurationMs = 0;
+    Check(RoutinePlan::Build(R.plan, 2, RoutineData::LivestockHand, 29), "fixture creates a real compatible town route");
+    R.plan.offsetMinutes = 0;
+    R.enabled = true;
+    R.destination = R.plan.route[0];
+    const auto& place = RoutineData::kLocations[R.destination];
+    R.centre = place.anchor; R.wanderRadius = place.wanderRadius;
+    R.definition = {"Valentine", "Livestock hand", "Valentine", R.centre, Tune::kReAggroSightDist,
+        RoutineModels(2, RoutineData::LivestockHand), &kHumanTarget, nullptr, ResetRoutine};
+    w.pedPosition = R.centre; w.pedPosition.x += 40;
+}
+static void Tick(unsigned elapsed = 16, bool mayAct = true)
+{
+    w.now += elapsed; UpdateRoutine(77, R.definition, mayAct);
+}
+static int TaskCount() { return w.travelCalls + w.wanderCalls + w.standCalls; }
+static void BeginTravel()
+{
+    Check(StartRoutineWander(77, R.definition), "routine setup requests its first schedule");
+    Tick();
+    Check(R.selectPending && TaskCount() == 0, "resume first reselects before issuing a task");
+    Tick();
+    Check(R.controller.state == Routine::State::Travelling && w.travelCalls == 1,
+        "validated distant destination produces one physical walking task");
+}
+static void TestTravelAndClock()
+{
+    SetDaytimeFixture(); BeginTravel();
+    const Vector3 fixed = R.centre;
+    Check(Within(w.travelCentre, fixed, .001f) && w.travelTimeout == 300000 && !w.mayEnterWater,
+        "travel targets fixed activity centre with finite deadline and water path policy");
+    for (int frame = 0; frame < 20; ++frame) Tick();
+    Check(w.travelCalls == 1 && w.lastTaskHash == Joaat("SCRIPT_TASK_FOLLOW_NAV_MESH_TO_COORD"),
+        "active navmesh task is observed without per-frame reissue");
+    w.taskStatus = 1;
+    Tick(100);
+    Check(w.travelCalls == 1, "both native status zero and one count as active travel");
+    w.taskStatus = 0;
+    w.pedPosition = fixed;
+    Tick();
+    Check(R.controller.state == Routine::State::Wandering && w.wanderCalls == 1 && Within(w.wanderCentre, fixed, .001f),
+        "arrival switches once to wandering around the validated destination");
+    w.pedPosition.x += 10;
+    for (int frame = 0; frame < 20; ++frame) Tick();
+    Check(w.wanderCalls == 1 && Within(R.centre, fixed, .001f) && w.lastTaskHash == Joaat("SCRIPT_TASK_WANDER_IN_AREA"),
+        "wandering does not move the centre or repeat a running task");
+    w.minute = 900;
+    const int tasks = TaskCount();
+    Tick();
+    Check(R.selectPending && TaskCount() == tasks, "phase change first requests fresh location selection");
+    Tick();
+    Check(R.destination == R.plan.route[1] && w.travelCalls == 2, "afternoon physically travels to the advertised shop frontage");
+
+    w.minute = 1100;
+    Check(StartRoutineWander(77, R.definition), "post-search recovery requests current schedule");
+    Tick(); Tick();
+    Check(R.destination == R.plan.route[2], "resuming after time change chooses evening destination");
+    const int beforeJump = TaskCount();
+    w.minute = 100;
+    Tick();
+    Check(R.selectPending && TaskCount() == beforeJump, "midnight time skip requests reselection without teleporting");
+    Tick();
+    Check(R.destination == R.plan.route[3], "overnight clock selects the advertised all-day fallback");
+
+    SetDaytimeFixture(); BeginTravel();
+    const int beforePause = TaskCount();
+    pausedDurationMs += 45000;
+    Tick();
+    Check(R.selectPending && TaskCount() == beforePause,
+        "pause or fade wholly skipped by the outer loop forces fresh selection before another task");
+    Tick();
+    Check(R.destination == R.plan.route[0] && w.travelCalls == 2 && R.pauseSnapshotMs == pausedDurationMs,
+        "resumption publishes the new pause snapshot and restarts current valid travel once");
+    Tick();
+    Check(w.travelCalls == 2 && !R.selectPending, "unchanged pause duration does not retrigger resumption");
+}
+static void TestSuspensionAndAvailability()
+{
+    SetDaytimeFixture(); BeginTravel();
+    const int tasks = TaskCount(), statusCalls = w.statusCalls;
+    Tick(16, false); Tick(30000, false);
+    Check(R.controller.state == Routine::State::Suspended && TaskCount() == tasks && w.statusCalls == statusCalls,
+        "combat, search or restraint priority performs no routine task or task-status recovery");
+    w.minute = 900;
+    Tick();
+    Check(R.selectPending && TaskCount() == tasks, "resumption re-evaluates clock before taking control");
+    Tick();
+    Check(R.destination == R.plan.route[1], "resumed route uses current phase");
+    const int resumedTasks = TaskCount();
+    w.collision = false;
+    const int requestCount = w.requests;
+    Tick(); Tick();
+    Check(TaskCount() == resumedTasks && R.controller.state == Routine::State::Suspended && w.requests == requestCount + 1,
+        "unloaded target receives one rate-limited stream request and no movement task");
+    Tick(1000);
+    Check(w.requests == requestCount + 2 && TaskCount() == resumedTasks, "stream retry remains rate limited while navigation is unavailable");
+    w.collision = true;
+    Tick(); Tick();
+    Check(R.controller.state != Routine::State::Suspended, "loaded target reselects and resumes without replacement");
+
+    SetDaytimeFixture();
+    w.minute = 1070;
+    w.pedPosition = RoutineData::kLocations[R.plan.route[1]].anchor; w.pedPosition.x += 200;
+    StartRoutineWander(77, R.definition); Tick(); Tick();
+    Check(R.destination == R.plan.route[3], "travel plus minimum stay skips a shop that closes before a useful arrival");
+    SetDaytimeFixture();
+    w.occupiedNear = true; w.occupiedAt = RoutineData::kLocations[R.plan.route[0]].anchor;
+    StartRoutineWander(77, R.definition); Tick(); Tick();
+    Check(R.destination == R.plan.route[3], "occupied work area falls back without clearing or claiming other actors");
+    SetDaytimeFixture(); w.clockRate = 0;
+    StartRoutineWander(77, R.definition); Tick(); Tick();
+    Check(R.destination == R.plan.route[3], "unknown game-clock rate leaves only the all-day fallback eligible");
+}
+static void TestTravelRecovery()
+{
+    SetDaytimeFixture(); BeginTravel();
+    const int failed = R.destination;
+    w.taskStatus = 7;
+    Tick(100); Tick(4100);
+    Check(w.travelCalls == 2, "missing nav task receives the first delayed recovery");
+    Tick(100); Tick(4100);
+    Check(w.travelCalls == 3, "missing nav task receives only the second bounded recovery");
+    Tick(100); Tick(4100);
+    Check(w.travelCalls == 3 && R.selectPending && R.controller.IsCoolingDown(failed, w.now) && w.standCalls == 1,
+        "exhausted recovery waits once and cools down the failed location");
+    Tick();
+    Check(R.destination == R.plan.route[3], "failed destination is excluded from immediate reselection");
+
+    SetDaytimeFixture(); BeginTravel();
+    const int expired = R.destination;
+    Tick(300000);
+    Check(R.controller.IsCoolingDown(expired, w.now) && w.standCalls == 1 && w.travelCalls == 1,
+        "absolute travel deadline ends a stuck task even when native reports it active");
+    ResetRoutine();
+    Check(!R.controller.IsCoolingDown(expired, w.now) && !R.enabled && R.nextValidationMs == 0 && R.nextStreamRequestMs == 0,
+        "cleanup resets cooldown, deferred selection and validation deadlines");
+    const int count = TaskCount();
+    UpdateRoutine(77, R.definition, true);
+    Check(TaskCount() == count, "disabled runtime never revives a cleaned-up target");
 }
 
 int main()
@@ -285,5 +460,8 @@ int main()
     TestPreparedDefinition();
     TestPreparationFailureAndFallback();
     TestDeploymentAndWander();
+    TestTravelAndClock();
+    TestSuspensionAndAvailability();
+    TestTravelRecovery();
     std::printf("Routine runtime bridge: %u checks passed.\n", checks);
 }

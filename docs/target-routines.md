@@ -20,7 +20,7 @@ Source precedents (local build 1491.50): `property_use_core.c:56908` for safe-co
 flags; `short_update.c:87117,87126-87178` for ground/outside and synchronous mask-87
 probes; `spd_sheriffoftumbleweed.c:1911-1924` for occupied arrival with traveller ignored;
 `act_fishing01.c:47009-47025` and `beat_dark_alley_ambush.c:12329,5553-5581` for bounded
-sphere loading; `marston1.c` and `beau_penelope2.c:38953,38978` for nav-region requests.
+sphere loading; `rcm_beau_and_penelope21.c:38953,38978` for nav-region requests.
 Every called native exists in the bundled `inc/natives.h`.
 
 Initial preparation tries five small offsets per location, with a three-second collision/
@@ -79,3 +79,43 @@ they simulate native responses and cannot establish engine navigation or renderi
 Stage 1: catalog, spawn, scheduling-policy and plan suites plus all existing suites;
 full Release/x64 build to `dist/TestScript.asi`. Subsequent routine/card/activity integration
 is recorded below as each stage is completed.
+
+## Stage 2: physical daily travel
+
+Each contract has four fixed clue destinations and a deterministic schedule offset of
+up to 30 minutes. Base phases are Rest 00:00–06:00, Work 06:00–14:00, Shops 14:00–18:00,
+Leisure 18:00–24:00. The offset changes routine transitions, never opening windows.
+Current time and the actual game-clock rate determine selection and a conservative walking
+ETA. A destination needs at least 15 game minutes for a visit after expected arrival;
+closure during travel triggers another selection. Windows crossing midnight work normally.
+
+`TASK_FOLLOW_NAV_MESH_TO_COORD` follows `act_hunting_2.c:10128` for walking speed, flags
+and unconstrained heading. Travel has a five-minute gameplay deadline, a 20-second
+no-progress threshold, a four-second recovery interval and at most two retries. Failed
+destinations cool down for 60 seconds. Navigation failure uses the selected all-day public
+fallback, otherwise an explicit waiting state. Arrival starts fixed-centre local wandering.
+Tasks are issued on transitions or bounded recovery, never once per frame.
+
+Per-frame travel never starts a global scene load or waits. It requests missing collision
+and navmesh at a bounded rate and suspends tasks while the target's local navigation is
+unloaded. Destination validation is at most once per second; selection retries at most
+once per five seconds. Settled fallback visits reconsider the preferred destination after
+60 seconds. This recheck does not reset a travelling fallback's stuck/deadline accounting.
+Portrait deployment can reload its distant destination once if capture outlasted residency.
+
+The combat policy runs first. Combat against anyone, an active combat task, pending
+engagement, last-known-position search, ragdoll, getting up, lasso, being hogtied, hogtied
+and riding in a vehicle suppress routine tasks. After those priorities end, the controller
+selects for the current clock instead of returning to the original spawn. Time jumps and
+phase changes also reselect. The main loop already suspends menus/fades, freezes gameplay
+deadlines and clears contracts on player death/change. Contract cleanup resets all plan,
+destination, retry and cooldown state via its existing hook. Active targets never teleport.
+
+A stale native player-combat flag alone does not override the combat policy's completed
+search. Pending/active combat tasks, new engagement and combat against other actors still
+block routines. A changed accumulated pause duration forces one fresh selection even when
+the outer loop skipped all routine updates during the pause/fade.
+
+A target can enter an interior through normal AI, including during combat. The outdoor
+test applies to authored spawn/arrival points, not to combat position. Routine venues are
+still exterior visits; no doors, interior globals or mission actors are changed.

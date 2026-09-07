@@ -41,8 +41,13 @@ static struct NativeState {
     std::uint64_t now = 0;
     bool los = true, looking = false, aiming = false, intimidated = false, combat = false;
     bool ragdoll = false, gettingUp = false, hogtied = false, beingHogtied = false, lassoed = false;
+    bool otherCombat = false, inVehicle = false;
     int taskStatus = 7;
     int removes = 0, gives = 0, draws = 0, combats = 0, searches = 0, wanders = 0;
+    int routineCalls = 0;
+    bool routineMayAct = false;
+    Ped routinePed = 0;
+    const ContractDef* routineDefinition = nullptr;
     std::vector<Hash> weapons = { 99u };
     std::map<int, bool> combatAttributes, configFlags, fleeAttributes;
     Vector3 searchPoint;
@@ -60,7 +65,8 @@ static void SET_PED_COMBAT_RANGE(Ped, int) {}
 static void SET_PED_COMBAT_MOVEMENT(Ped, int) {}
 static bool IS_PED_HEADTRACKING_PED(Ped, Ped) { return N.looking; }
 static bool _IS_PED_INTIMIDATED(Ped) { return N.intimidated; }
-static bool IS_PED_IN_COMBAT(Ped, Ped) { return N.combat; }
+static bool IS_PED_IN_COMBAT(Ped, Ped opponent) { return N.combat || (opponent == 0 && N.otherCombat); }
+static bool IS_PED_IN_ANY_VEHICLE(Ped, bool) { return N.inVehicle; }
 static bool IS_PED_RAGDOLL(Ped) { return N.ragdoll; }
 static bool IS_PED_HOGTIED(Ped) { return N.hogtied; }
 static bool IS_PED_BEING_HOGTIED(Ped) { return N.beingHogtied; }
@@ -88,6 +94,13 @@ static void SET_CURRENT_PED_WEAPON(Ped, Hash, bool, int, bool, bool) { ++N.draws
 }
 
 static bool StartRoutineWander(Ped, const ContractDef&) { return false; }
+static void UpdateRoutine(Ped ped, const ContractDef& definition, bool mayAct)
+{
+    ++N.routineCalls;
+    N.routineMayAct = mayAct;
+    N.routinePed = ped;
+    N.routineDefinition = &definition;
+}
 #include "target_ai_bridge_under_test.h"
 
 static const Ped target = 2;
@@ -167,10 +180,110 @@ static void CombatTaskStatusRecoveryAndSearch()
         "existing native combat is adopted without replacing task or weapon");
 }
 
+static void RoutineTick(std::uint64_t now, bool mayAct, const char* description)
+{
+    const int callsBefore = N.routineCalls;
+    Tick(now);
+    Check(N.routineCalls == callsBefore + 1, "human AI forwards exactly one routine observation each tick");
+    Check(N.routinePed == target && N.routineDefinition == &def,
+        "routine update receives the same target and contract as the AI bridge");
+    Check(N.routineMayAct == mayAct, description);
+}
+
+static void RoutineYieldsToEncounterPriority()
+{
+    Reset();
+    RoutineTick(1, true, "idle wandering permits the routine");
+    RoutineTick(2, true, "unprovoked nearby player does not suppress routine wandering");
+
+    using Flag = bool NativeState::*;
+    for (Flag restrained : { &NativeState::ragdoll, &NativeState::gettingUp, &NativeState::hogtied,
+        &NativeState::beingHogtied, &NativeState::lassoed })
+    {
+        Reset(); N.*restrained = true;
+        RoutineTick(1, false, "every restraint/get-up transition blocks routine tasks even while AI still wanders");
+        Check(C.ai.state == TargetAI::State::Wander, "restraint-only probe keeps the AI in wander state");
+        N.*restrained = false;
+        RoutineTick(2, true, "routine resumes when an unprovoked restraint ends");
+
+        N.*restrained = true; C.damagedByPlayer = true;
+        RoutineTick(3, false, "deferred damage cannot start a routine during restraint");
+        C.damagedByPlayer = false;
+        Check(C.ai.pendingEngagement, "consumed threat remains pending while target cannot act");
+        RoutineTick(10003, false, "pending engagement remains protected while restraint continues");
+        N.*restrained = false;
+        RoutineTick(10004, false, "release engages the pending threat before any routine can resume");
+        Check(C.ai.state == TargetAI::State::Engaged && !C.ai.pendingEngagement,
+            "deferred threat is consumed into engagement exactly once");
+    }
+
+    for (int status : { 0, 1 })
+    {
+        Reset(); N.taskStatus = status;
+        RoutineTick(1, false, "pending and active combat task statuses block routines before native combat starts");
+        Check(C.ai.state == TargetAI::State::Wander && !N.combat,
+            "combat task gate is exercised independently of the AI state and native combat flag");
+        N.taskStatus = 7;
+        RoutineTick(2, true, "a retired combat task allows unprovoked wandering to resume");
+    }
+
+    Reset(); N.otherCombat = true;
+    RoutineTick(1, false, "combat with a different ambient ped blocks routine task replacement");
+    Check(C.ai.state == TargetAI::State::Wander && !N.combat,
+        "ambient combat gate does not depend on combat against the player");
+    N.otherCombat = false;
+    RoutineTick(2, true, "ending unrelated ambient combat allows the routine again");
+
+    Reset(); N.inVehicle = true;
+    RoutineTick(1, false, "being in any vehicle blocks routine travel and wander tasks");
+    Check(C.ai.state == TargetAI::State::Wander, "vehicle gate is exercised without hostile AI state");
+    N.inVehicle = false;
+    RoutineTick(2, true, "leaving the vehicle allows unprovoked routine wandering");
+
+    Reset(); N.combat = true;
+    RoutineTick(1, false, "adopted native player combat has priority over the routine");
+    Check(C.ai.state == TargetAI::State::Engaged && N.combats == 0,
+        "routine gate preserves the already-running native combat task");
+
+    Reset(); C.damagedByPlayer = true;
+    RoutineTick(1, false, "new scripted engagement blocks routines on the engagement frame");
+    C.damagedByPlayer = false; N.los = false; playerPos = { 100.0f, 0, 0 };
+    RoutineTick(8001, false, "last-known-position search retains priority after combat contact expires");
+    Check(C.ai.state == TargetAI::State::Search && N.searches == 1,
+        "search gate is checked against the actual production combat-to-search transition");
+    RoutineTick(18000, false, "routine cannot resume before the ten-second search finishes");
+    RoutineTick(18001, true, "completed search permits the routine on the resumed-wander transition");
+    Check(C.ai.state == TargetAI::State::Wander && N.wanders == 2,
+        "resumed wandering follows the production search-to-wander transition");
+
+    Reset(); N.combat = true;
+    RoutineTick(1, false, "fresh native player combat is adopted before routine processing");
+    N.los = false; playerPos = { 100.0f, 0, 0 };
+    RoutineTick(8001, false, "lingering player-combat flag does not skip the last-known-position search");
+    Check(C.ai.state == TargetAI::State::Search && N.combat,
+        "native combat remains true throughout the search probe");
+    RoutineTick(18000, false, "lingering combat still cannot allow routines before search expiry");
+    RoutineTick(18001, true, "completed search permits routines despite a stale player-combat flag when its task ended");
+    Check(C.ai.state == TargetAI::State::Wander && N.combat && N.taskStatus == 7,
+        "search-to-wander admission does not depend on clearing the stale native flag");
+    N.taskStatus = 0;
+    RoutineTick(18002, false, "a pending combat task still blocks routines after completed search");
+    N.taskStatus = 1;
+    RoutineTick(18003, false, "an active combat task still blocks routines after completed search");
+    N.taskStatus = 7;
+    RoutineTick(18004, true, "retiring the combat task allows the completed routine lifecycle to continue");
+    N.combat = false;
+    RoutineTick(18005, true, "native player-combat flag can retire without restarting the encounter");
+    N.combat = true;
+    RoutineTick(18006, false, "a fresh native combat edge blocks routines even after an earlier completed search");
+    Check(C.ai.state == TargetAI::State::Engaged, "fresh native combat is adopted as a new engagement");
+}
+
 int main()
 {
     LoadoutsAndFleeConfiguration();
     RestrainedTransitionsWait();
     CombatTaskStatusRecoveryAndSearch();
-    std::puts("Target AI native bridge: 3 scenario groups passed.");
+    RoutineYieldsToEncounterPriority();
+    std::puts("Target AI native bridge: 4 scenario groups passed.");
 }
