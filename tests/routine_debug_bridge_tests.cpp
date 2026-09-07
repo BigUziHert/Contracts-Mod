@@ -41,7 +41,7 @@ static float DistSq(Vector3 a, Vector3 b)
 enum ContractState { CONTRACT_NONE, CONTRACT_UNKNOWN, CONTRACT_FOUND, CONTRACT_DEAD, CONTRACT_PAID };
 static ContractState g_state = CONTRACT_UNKNOWN;
 struct ContractDef { Vector3 spawn{}; };
-struct ActiveContract { Ped target = 77; const ContractDef* def = nullptr; TargetAI::Memory ai; ULONGLONG photoMs = 0; };
+struct ActiveContract { Ped target = 77; const ContractDef* def = nullptr; TargetAI::Memory ai; ULONGLONG photoMs = 0; bool combatExitPending = false; };
 static ActiveContract C;
 static Ped pedMe = 1;
 struct RuntimeFixture
@@ -191,6 +191,11 @@ static void PriorityAndScenarioLabels()
         Check(Activity() == priority.label, "physical restraint/recovery wins over stale routine and engagement state");
     }
     Fixture(); C.ai.state = TargetAI::State::Engaged; Check(Activity() == "Fighting", "engaged policy reports fighting");
+    C.combatExitPending = true;
+    Check(Activity() == "Preparing to fight", "pending chair exit does not claim the combat task is already running");
+    w.gettingUp = true;
+    Check(Activity() == "Getting up", "physical recovery retains priority over pending chair exit");
+    w.gettingUp = C.combatExitPending = false;
     C.ai.state = TargetAI::State::Search; Check(Activity() == "Searching for player", "search policy reports investigation");
     C.ai.state = TargetAI::State::Wander; C.ai.pendingEngagement = true;
     Check(Activity() == "Preparing to fight", "deferred engagement wins over travel");

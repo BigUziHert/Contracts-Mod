@@ -88,8 +88,8 @@ inline Decision Step(Memory& memory, const Config& config, const Observation& ob
             memory.lastContactMs = observation.nowMs;
             memory.stateSinceMs = observation.nowMs;
             memory.taskMissing = false;
-            // Adoption trusts an engine task for a standing ped; the bridge issues
-            // combat itself when the ped is still sitting or using a scenario.
+            // Adoption trusts an engine task for a standing ped; the bridge waits
+            // for a seated/scenario ped to finish exiting before it issues combat.
             decision.action = nativeCombatStarted ? Action::AdoptCombat : Action::Engage;
             if (decision.action == Action::Engage)
             {

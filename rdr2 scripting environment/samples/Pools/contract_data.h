@@ -58,6 +58,7 @@ namespace Tune
 	constexpr DWORD kDeAggroGraceMs   = 8000;    // contact must be lost this long before he gives up the chase
 	constexpr DWORD kTargetSearchMs   = 10000;  // investigate the last seen location before returning to wander
 	constexpr DWORD kCombatSettleMs   = 2500;   // allow a scenario exit and queued combat task to start
+	constexpr DWORD kCombatScenarioExitMs = 8000; // let an observed exit animation finish before a gentle retry
 	// --- player feedback ---
 	constexpr float kTrailEnableDist  = 12.0f;   // eagle-eye trail on the target within this range
 	// --- giver interaction ---

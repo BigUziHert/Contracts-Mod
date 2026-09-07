@@ -34,21 +34,23 @@ static struct Contract {
     bool damagedByPlayer = false;
     TargetAI::Memory ai;
     std::uint64_t combatRequestMs = 0;
+    bool combatExitPending = false, combatExitRecovery = false;
 } C;
 static Ped pedMe = 1;
 static int me = 0;
 static Vector3 playerPos;
-enum class NativeCall { CombatExit, ImmediateExit, DirectedExit, ImmediateClear, Combat, Search };
+enum class NativeCall { CombatExit, NormalExit, ImmediateExit, DirectedExit, Clear, ImmediateClear, Combat, Search };
 static struct NativeState {
     std::uint64_t now = 0;
     bool los = true, looking = false, aiming = false, intimidated = false, combat = false;
     bool ragdoll = false, gettingUp = false, hogtied = false, beingHogtied = false, lassoed = false;
     bool otherCombat = false, inVehicle = false;
-    bool usingScenario = false, sitting = false;
+    bool usingScenario = false, sitting = false, exitingScenario = false;
     bool combatExitSucceeds = true, directedExitSucceeds = true;
     int taskStatus = 7;
     int removes = 0, gives = 0, draws = 0, combats = 0, searches = 0, wanders = 0;
     int scenarioExits = 0, immediateExits = 0, directedExits = 0, clearsImmediate = 0;
+    int normalExits = 0, clears = 0;
     std::vector<NativeCall> calls;
     int routineCalls = 0;
     bool routineMayAct = false;
@@ -85,7 +87,11 @@ static bool SET_PED_SHOULD_PLAY_COMBAT_SCENARIO_EXIT(Ped, Vector3 point, int int
     ++N.scenarioExits; N.exitPoint = point; N.calls.push_back(NativeCall::CombatExit);
     return N.combatExitSucceeds;
 }
-static void SET_PED_SHOULD_PLAY_IMMEDIATE_SCENARIO_EXIT(Ped)
+static void SET_PED_SHOULD_PLAY_NORMAL_SCENARIO_EXIT(Ped)
+{
+    ++N.normalExits; N.calls.push_back(NativeCall::NormalExit);
+}
+[[maybe_unused]] static void SET_PED_SHOULD_PLAY_IMMEDIATE_SCENARIO_EXIT(Ped)
 {
     ++N.immediateExits; N.calls.push_back(NativeCall::ImmediateExit);
 }
@@ -102,11 +108,21 @@ static void TASK_WANDER_IN_AREA(Ped, Vector3, float, float, float, int) { ++N.wa
 static void TASK_COMBAT_PED(Ped, Ped, int, int) { ++N.combats; N.calls.push_back(NativeCall::Combat); }
 static int GET_SCRIPT_TASK_STATUS(Ped, Hash, bool) { return N.taskStatus; }
 static bool IS_PED_GETTING_UP(Ped) { return N.gettingUp; }
+static bool IS_PED_EXITING_SCENARIO(Ped, bool p1)
+{
+    Check(p1, "scenario exit observation uses the source-backed true argument");
+    return N.exitingScenario;
+}
 static void TASK_GO_TO_COORD_ANY_MEANS(Ped, Vector3 point, float, int, bool, int, float)
 {
     ++N.searches; N.searchPoint = point; N.calls.push_back(NativeCall::Search);
 }
-static void CLEAR_PED_TASKS_IMMEDIATELY(Ped, bool p1, bool resetCrouch)
+static void CLEAR_PED_TASKS(Ped, bool p1, bool p2)
+{
+    Check(p1 && !p2, "ordinary task clear retains the source-backed native arguments");
+    ++N.clears; N.calls.push_back(NativeCall::Clear);
+}
+[[maybe_unused]] static void CLEAR_PED_TASKS_IMMEDIATELY(Ped, bool p1, bool resetCrouch)
 {
     Check(!p1 && resetCrouch, "immediate task clear retains the production native arguments");
     ++N.clearsImmediate; N.calls.push_back(NativeCall::ImmediateClear);
@@ -141,7 +157,12 @@ static void Reset()
     C = {}; N = {}; playerPos = { 10.0f, 0, 0 };
     SetupHumanTarget(target, def);
 }
-static void Tick(std::uint64_t now) { N.now = now; UpdateHumanTarget(target, def); }
+static void Tick(std::uint64_t now)
+{
+    N.now = now; UpdateHumanTarget(target, def);
+    Check(N.immediateExits == 0 && N.clearsImmediate == 0,
+        "combat and search never snap scenarios with immediate exit or task-clear natives");
+}
 
 static void LoadoutsAndFleeConfiguration()
 {
@@ -230,30 +251,42 @@ static void SeatedEngagementRequestsExit()
         {
             Reset(); N.*seated = true; N.combat = adopt; C.damagedByPlayer = !adopt;
             Tick(1); C.damagedByPlayer = false;
-            Check(N.scenarioExits == 1 && N.combats == 1 && N.draws == 1,
-                "seated provocation and adoption both request one exit and issue combat");
-            Check(N.calls == std::vector<NativeCall>{ NativeCall::CombatExit, NativeCall::Combat },
-                "combat scenario exit precedes the combat task");
+            Check(N.scenarioExits == 1 && N.clears == 1 && N.combats == 0 && N.draws == 0,
+                "seated provocation and adoption request one ordinary exit before drawing or fighting");
+            Check(N.calls == std::vector<NativeCall>{ NativeCall::CombatExit, NativeCall::Clear },
+                "combat scenario exit hint precedes the ordinary clear without assigning combat");
+            Check(C.combatExitPending && !C.combatExitRecovery,
+                "seated first engagement remembers its deferred first weapon draw");
             Check(N.exitPoint.x == playerPos.x && C.combatRequestMs == 1,
                 "combat exit faces the player and every request records its time");
             Tick(2); Tick(1000);
-            Check(N.scenarioExits == 1 && N.combats == 1 && N.clearsImmediate == 0,
+            Check(N.scenarioExits == 1 && N.clears == 1 && N.combats == 0 && N.clearsImmediate == 0,
                 "engagement grants the exit time to complete without per-frame tasking");
+            N.*seated = false; N.exitingScenario = true;
+            Tick(2501); Tick(3501);
+            Check(N.clears == 1 && N.combats == 0 && N.draws == 0 && C.combatRequestMs == 1,
+                "an active stand-up exit receives time even after sitting/scenario flags retire");
+            N.exitingScenario = false; Tick(3502);
+            Check(!C.combatExitPending && N.combats == 1 && N.draws == 1,
+                "completed scenario exit starts the first combat task and draws exactly once");
+            N.taskStatus = 1; Tick(3503); Tick(7000);
+            Check(N.combats == 1 && N.draws == 1 && N.clears == 1 && N.immediateExits == 0,
+                "healthy standing combat never repeats exit completion or immediate operations");
         }
     }
 
     Reset(); N.usingScenario = true; N.combatExitSucceeds = false; C.damagedByPlayer = true;
     Tick(1);
-    Check(N.calls == std::vector<NativeCall>{ NativeCall::CombatExit, NativeCall::ImmediateExit, NativeCall::Combat },
-        "rejected combat exit falls back to an immediate exit hint before tasking");
-    Check(N.immediateExits == 1 && N.clearsImmediate == 0,
-        "first engagement fallback requests an exit without clearing tasks");
+    Check(N.calls == std::vector<NativeCall>{ NativeCall::CombatExit, NativeCall::NormalExit, NativeCall::Clear },
+        "rejected combat exit falls back to normal exit before an ordinary clear");
+    Check(N.normalExits == 1 && N.immediateExits == 0 && N.clearsImmediate == 0 && N.combats == 0 && N.draws == 0,
+        "fallback preserves a pending animation exit without immediate hints, clears, combat or drawing");
 
     Reset(); N.usingScenario = N.combat = true; Tick(0);
-    N.usingScenario = N.combat = false; Tick(200); Tick(1200);
+    N.usingScenario = N.combat = false; Tick(200); Tick(201); Tick(1201);
     Check(N.combats == 1 && C.ai.hasIssuedCombatTask,
         "a real task issued during seated adoption receives the full scripted retry interval");
-    Tick(3000);
+    Tick(3200);
     Check(N.combats == 2 && N.draws == 1,
         "dropped seated-adoption task recovers after three seconds without redrawing the weapon");
 }
@@ -268,20 +301,23 @@ static void SeatedCombatRecovery()
             Reset(); N.*seated = true; N.taskStatus = status; C.damagedByPlayer = true;
             Tick(1); C.damagedByPlayer = false; N.combat = true;
             Tick(2500);
-            Check(!C.ai.taskMissing && N.combats == 1, "seated combat gets the full 2.5-second settle window");
+            Check(!C.ai.taskMissing && N.combats == 0, "pending seated combat gets the full 2.5-second settle window");
             Tick(2501);
-            Check(C.ai.taskMissing && N.combats == 1,
+            Check(C.ai.taskMissing && N.combats == 0,
                 "a persistent seat makes even engine combat and performing status unhealthy after settling");
             Tick(3500);
-            Check(N.combats == 1, "stuck seated combat also receives the full missing-task grace");
+            Check(N.clears == 1 && N.combats == 0, "stuck seated combat also receives the full missing-task grace");
             Tick(3501);
-            Check(N.clearsImmediate == 1 && N.combats == 2 && N.draws == 1 && C.combatRequestMs == 3501,
-                "stuck recovery clears the failed scenario and reissues combat without another weapon draw");
-            Check(N.calls == std::vector<NativeCall>{ NativeCall::CombatExit, NativeCall::Combat,
-                NativeCall::ImmediateClear, NativeCall::Combat }, "recovery clears before assigning combat");
+            Check(N.clears == 2 && N.clearsImmediate == 0 && N.combats == 0 && N.draws == 0 && C.combatRequestMs == 3501,
+                "stuck recovery retries the ordinary exit without snapping, combat or weapon draw");
+            Check(N.calls == std::vector<NativeCall>{ NativeCall::CombatExit, NativeCall::Clear,
+                NativeCall::CombatExit, NativeCall::Clear }, "stuck recovery repeats the exit hint then ordinary clear");
+            Check(C.combatExitPending && !C.combatExitRecovery,
+                "gentle retry preserves the first engagement's deferred weapon draw");
             N.*seated = false; N.taskStatus = 1;
             Tick(3502); Tick(7000); Tick(10000);
-            Check(N.combats == 2 && !C.ai.taskMissing, "standing active combat ends recovery tasking");
+            Check(N.combats == 1 && N.draws == 1 && !C.ai.taskMissing && !C.combatExitPending,
+                "standing completion after gentle retries draws once and ends recovery tasking");
         }
     }
     for (Flag restrained : { &NativeState::ragdoll, &NativeState::gettingUp, &NativeState::hogtied,
@@ -290,14 +326,56 @@ static void SeatedCombatRecovery()
         Reset(); N.usingScenario = true; N.taskStatus = 0; C.damagedByPlayer = true;
         Tick(1); C.damagedByPlayer = false; Tick(2501);
         N.*restrained = true; Tick(3501); Tick(10000);
-        Check(N.clearsImmediate == 0 && N.combats == 1 && !C.ai.taskMissing,
+        Check(N.clears == 1 && N.clearsImmediate == 0 && N.combats == 0 && !C.ai.taskMissing,
             "a stuck seated target is never cleared or re-tasked during restraint or getting up");
         N.*restrained = false; Tick(10001); Tick(11000);
-        Check(N.clearsImmediate == 0, "release from restraint starts a new missing-task grace");
+        Check(N.clears == 1, "release from restraint starts a new missing-task grace");
         Tick(11001);
-        Check(N.clearsImmediate == 1 && N.combats == 2,
-            "seated recovery resumes only after restraint ends and the fresh grace expires");
+        Check(N.clears == 2 && N.clearsImmediate == 0 && N.combats == 0,
+            "gentle seated recovery resumes only after restraint ends and the fresh grace expires");
+        N.usingScenario = false; N.*restrained = true; Tick(11002);
+        Check(N.combats == 0 && C.combatExitPending, "pending combat cannot complete while target is restrained");
+        N.*restrained = false; Tick(11003);
+        Check(N.combats == 1 && N.draws == 1 && !C.combatExitPending,
+            "pending first engagement completes once the standing target can act");
     }
+
+    Reset(); C.damagedByPlayer = true; Tick(1); C.damagedByPlayer = false;
+    N.usingScenario = true; N.taskStatus = 0; Tick(2501); Tick(3501);
+    Check(C.combatExitPending && C.combatExitRecovery && N.combats == 1 && N.draws == 1,
+        "scenario recovery during an existing fight remembers that its weapon was already drawn");
+    N.usingScenario = false; N.taskStatus = 1; Tick(3502);
+    Check(N.combats == 2 && N.draws == 1 && !C.combatExitPending,
+        "exit completion repairs an existing fight without drawing its weapon again");
+}
+
+static void ExitingAnimationReceivesBoundedProtection()
+{
+    Reset(); N.exitingScenario = true; C.damagedByPlayer = true;
+    Tick(1); C.damagedByPlayer = false;
+    Check(C.combatExitPending && N.scenarioExits == 0 && N.clears == 0 && N.combats == 0 && N.draws == 0,
+        "first engagement leaves an already-running scenario exit intact");
+    Tick(2501); Tick(3501); Tick(8000);
+    Check(N.calls.empty() && !C.ai.taskMissing && C.combatRequestMs == 1,
+        "an active exit receives the eight-second allowance from one fixed request timestamp");
+    Tick(8001); Tick(9000);
+    Check(C.ai.taskMissing && N.clears == 0, "a forever-exiting flag gets missing-task grace after its allowance");
+    Tick(9001);
+    Check(N.scenarioExits == 1 && N.clears == 1 && N.combats == 0 && N.draws == 0 && C.combatRequestMs == 9001,
+        "a stuck exit is gently retried after its fixed allowance and grace");
+    Check(!C.combatExitRecovery && N.immediateExits == 0 && N.clearsImmediate == 0,
+        "bounded exit retry preserves the first draw and never requests immediate detachment");
+    N.exitingScenario = false; Tick(9002);
+    N.taskStatus = 1; Tick(9003); Tick(13000);
+    Check(N.combats == 1 && N.draws == 1 && !C.combatExitPending,
+        "the deferred fight starts exactly once after an initially active exit completes");
+
+    Reset(); N.usingScenario = true; C.damagedByPlayer = true; Tick(1); C.damagedByPlayer = false;
+    Tick(2501);
+    Check(C.ai.taskMissing && C.combatExitPending, "late-completion probe starts with an expired pending-exit grace");
+    N.usingScenario = false; Tick(20000);
+    Check(N.combats == 1 && N.draws == 1 && !C.combatExitPending && !C.ai.taskMissing && N.clears == 1,
+        "late exit completion retains its first draw instead of being mistaken for a failed fight recovery");
 }
 
 static void QueuedCombatRecovery()
@@ -324,21 +402,25 @@ static void SeatedSearchRequestsExit()
     {
         for (bool directedSucceeds : { false, true })
         {
-            Reset(); C.damagedByPlayer = true; Tick(1); C.damagedByPlayer = false;
-            N.*seated = true; N.directedExitSucceeds = directedSucceeds;
+            Reset(); N.*seated = true; C.damagedByPlayer = true; Tick(1); C.damagedByPlayer = false;
+            N.directedExitSucceeds = directedSucceeds;
             N.combat = true; N.los = false; playerPos = { 100.0f, 0, 0 }; N.calls.clear();
             Tick(8001);
             const std::vector<NativeCall> expected = directedSucceeds
                 ? std::vector<NativeCall>{ NativeCall::DirectedExit, NativeCall::Search }
-                : std::vector<NativeCall>{ NativeCall::DirectedExit, NativeCall::ImmediateExit, NativeCall::Search };
+                : std::vector<NativeCall>{ NativeCall::DirectedExit, NativeCall::NormalExit, NativeCall::Search };
             Check(N.calls == expected && N.directedExits == 1 && N.searches == 1,
-                "seated search requests a directed exit with immediate fallback before its search task");
+                "seated search requests a directed exit with normal fallback before its search task");
             Check(N.exitPoint.x == 10.0f && N.searchPoint.x == 10.0f,
                 "search and its exit both face the last seen position instead of the unseen player");
-            Check(!N.configFlags[233] && !N.combatAttributes[5] && N.clearsImmediate == 0,
-                "search retains hostile-flag handling and never clears the seated task");
+            Check(!N.configFlags[233] && !N.combatAttributes[5] && N.clears == 1 &&
+                N.clearsImmediate == 0 && N.immediateExits == 0 && !C.combatExitPending,
+                "search clears pending combat while retaining hostile flags and avoiding immediate exit operations");
             Tick(8002); Tick(10000);
             Check(N.directedExits == 1 && N.searches == 1, "seated search does not reissue its task or exit each frame");
+            N.*seated = false; Tick(10001);
+            Check(N.combats == 0 && N.draws == 0 && C.ai.state == TargetAI::State::Search,
+                "standing after search starts never completes the cancelled pending combat request");
         }
     }
 }
@@ -449,8 +531,9 @@ int main()
     CombatTaskStatusRecoveryAndSearch();
     SeatedEngagementRequestsExit();
     SeatedCombatRecovery();
+    ExitingAnimationReceivesBoundedProtection();
     QueuedCombatRecovery();
     SeatedSearchRequestsExit();
     RoutineYieldsToEncounterPriority();
-    std::puts("Target AI native bridge: 8 scenario groups passed.");
+    std::puts("Target AI native bridge: 9 scenario groups passed.");
 }

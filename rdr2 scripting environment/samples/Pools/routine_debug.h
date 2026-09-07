@@ -16,6 +16,7 @@ static const char* ObserveRoutineDebugActivity(RoutineDebugView::Snapshot& snaps
     if (PED::IS_PED_LASSOED(ped)) return "Lassoed";
     if (PED::IS_PED_RAGDOLL(ped)) return "Ragdoll";
     if (TASK::IS_PED_GETTING_UP(ped)) return "Getting up";
+    if (C.combatExitPending) return "Preparing to fight";
     if (C.ai.state == TargetAI::State::Engaged) return "Fighting";
     if (C.ai.state == TargetAI::State::Search) return "Searching for player";
     if (C.ai.pendingEngagement) return "Preparing to fight";
