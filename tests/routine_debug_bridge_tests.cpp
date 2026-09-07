@@ -53,7 +53,7 @@ struct RuntimeFixture
     Vector3 centre{};
     float wanderRadius = 22.0f;
     Routine::Controller controller;
-    bool selectPending = false, resumeRequested = false, destinationValid = true;
+    bool selectPending = false, resumeRequested = false, destinationValid = true, ambientFallback = false;
 } R;
 struct World
 {
@@ -66,7 +66,7 @@ struct World
     int combatStatus = 7, routineStatus = 0;
     Vector3 player{}, target{3, 4, 0};
     unsigned coordinates = 0, deathReads = 0, liveReads = 0, clockReads = 0;
-    unsigned combatTaskReads = 0, combatPlayerReads = 0, scenarioReads = 0, seatedReads = 0;
+    unsigned combatTaskReads = 0, combatPlayerReads = 0, scenarioReads = 0, seatedReads = 0, routineTaskReads = 0;
     unsigned markerUpdates = 0, markerClears = 0, drawCalls = 0, keySamples = 0;
     bool markerHasSpawn = false, markerHasDestination = false, releasedF8 = false;
 } w;
@@ -113,7 +113,7 @@ static bool IS_PED_GETTING_UP(Ped ped) { ReadLiving(ped); return w.gettingUp; }
 static int GET_SCRIPT_TASK_STATUS(Ped ped, Hash task, bool)
 {
     ReadLiving(ped);
-    if (task != Joaat("SCRIPT_TASK_COMBAT")) return w.routineStatus;
+    if (task != Joaat("SCRIPT_TASK_COMBAT")) { ++w.routineTaskReads; return w.routineStatus; }
     ++w.combatTaskReads; return w.combatStatus;
 }
 }
@@ -265,6 +265,57 @@ static void CombatEvidenceBeforePriority()
     Check(snapshot.combatTaskStatus == 7 && snapshot.seated && !snapshot.inScenario,
         "sitting without a reported scenario and a missing combat task remain observable");
 }
+static void AmbientRecoveryLabels()
+{
+    for (int status : {0, 1, 7})
+    {
+        Fixture(); R.ambientFallback = true; R.destinationValid = false; R.controller.state = Routine::State::Waiting;
+        R.selectPending = true; w.routineStatus = status;
+        const auto snapshot = ObserveRoutineDebug();
+        Check(snapshot.hasDestination && snapshot.fallback && !snapshot.destinationValid &&
+            std::strcmp(snapshot.destination, RoutineData::kLocations[R.destination].name) == 0,
+            "ambient recovery preserves and identifies its authored work stop as a fallback");
+        Check(snapshot.taskActive == (status != 7) && w.routineTaskReads == 1,
+            "waiting controller reads the actual fallback wander task instead of defaulting to inactive");
+        Check(std::strcmp(snapshot.doing, status == 7 ? "Wander task pending / recovery" : "Wandering while route recovers") == 0,
+            "pending route retry reports healthy ambient wandering or the real missing task");
+        const auto lines = RoutineDebugView::Format(snapshot);
+        Check(lines[3].find("Waiting for a usable destination") == std::string::npos &&
+            lines[4].find("[fallback]") != std::string::npos,
+            "rendered recovery names its fallback without advertising stationary waiting");
+        UpdateRoutineDebug();
+        Check(w.markerHasDestination,
+            "debug destination marker retains the cached authored fallback during route validation retries");
+    }
+    Fixture(); R.ambientFallback = true; R.controller.state = Routine::State::Waiting;
+    R.selectPending = true; w.routineStatus = 7;
+    w.usingScenario = Joaat("WORLD_HUMAN_SMOKE");
+    Check(Activity() == "Smoking (ambient)" && ObserveRoutineDebug().taskActive,
+        "a pending route retry leaves observed fallback smoking visible and healthy");
+    w.usingScenario = Joaat("WORLD_HUMAN_DRINKING");
+    Check(Activity() == "Drinking (ambient)", "fallback drinking retains its specific native scenario label");
+    w.usingScenario = Joaat("WORLD_HUMAN_STARE_STOIC");
+    Check(Activity() == "Ambient scenario", "another observed fallback scenario is not mislabeled as generic wandering");
+    C.ai.state = TargetAI::State::Engaged;
+    Check(Activity() == "Fighting", "combat priority wins over an ambient recovery retry");
+    w.hogtied = true;
+    Check(Activity() == "Hogtied", "physical restraint wins over stale ambient recovery and combat");
+    w.hogtied = false; C.ai.state = TargetAI::State::Wander; w.loaded = false;
+    Check(Activity() == "Paused: area not loaded", "unloaded target does not advertise active recovery wandering");
+    w.loaded = true; R.controller.state = Routine::State::Suspended;
+    Check(Activity() == "Routine paused", "suspended target does not advertise active recovery wandering");
+
+    Fixture(); R.ambientFallback = true; R.controller.state = Routine::State::Waiting; R.selectPending = true;
+    std::array<unsigned char, sizeof(R)> before{};
+    std::memcpy(before.data(), &R, sizeof(R));
+    const Vector3 target = w.target;
+    for (int repeat = 0; repeat < 5; ++repeat) ObserveRoutineDebug();
+    Check(std::memcmp(before.data(), &R, sizeof(R)) == 0 && DistSq(target, w.target) == 0 && w.markerUpdates == 0,
+        "fallback debug observations never select a route, alter task state, move the ped or update markers");
+    Fixture(); R.destinationValid = false;
+    UpdateRoutineDebug();
+    Check(!w.markerHasDestination, "a rejected uncached destination still cannot create a debug destination marker");
+}
 static void ScheduleAndReadOnlySnapshot()
 {
     struct Case { int minute, offset, nextMinute, nextPhase; };
@@ -319,7 +370,7 @@ static void SamplingRenderingAndEarlyToggle()
 }
 int main()
 {
-    ExistenceDeathAndFreshCoordinates(); PriorityAndScenarioLabels(); CombatEvidenceBeforePriority();
+    ExistenceDeathAndFreshCoordinates(); PriorityAndScenarioLabels(); CombatEvidenceBeforePriority(); AmbientRecoveryLabels();
     ScheduleAndReadOnlySnapshot(); SamplingRenderingAndEarlyToggle();
     std::printf("Routine debug bridge: %u checks passed.\n", checks);
 }

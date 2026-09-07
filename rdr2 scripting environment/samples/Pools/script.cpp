@@ -509,7 +509,7 @@ static void AddSearchBlip()
 static void UpdateSearchArea()
 {
 	if (g_state != CONTRACT_UNKNOWN || !C.def || !IsRoutine(*C.def) ||
-		R.destination < 0 || !R.destinationValid || !C.searchBlip || !MAP::DOES_BLIP_EXIST(C.searchBlip)) return;
+		R.destination < 0 || (!R.destinationValid && !R.ambientFallback) || !C.searchBlip || !MAP::DOES_BLIP_EXIST(C.searchBlip)) return;
 	// Follow changes of routine stop, not the ped's individual wandering steps.
 	// Keep the same circle/handle; an unchanged stop makes no map write.
 	if (DistSq(MAP::GET_BLIP_COORDS(C.searchBlip), R.centre) > .01f)

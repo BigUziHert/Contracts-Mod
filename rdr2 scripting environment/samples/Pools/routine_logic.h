@@ -91,7 +91,7 @@ inline int SelectDestination(const Candidate* candidates, std::size_t count, Pha
 }
 
 enum class State { Travelling, Wandering, Waiting, Suspended };
-enum class Action { None, Travel, Wander, Wait };
+enum class Action { None, Travel, Wander, WanderFallback };
 struct Config
 {
     float arrivalDistance = 4.0f;
@@ -114,6 +114,10 @@ struct Observation
     bool destinationOpen = true;
     float distance = 0.0f;
     bool taskActive = false;
+    // A fixed, previously accepted authored area supplied by the bridge. This
+    // activity is observed separately from the newly selected destination.
+    int fallbackDestinationId = -1;
+    bool fallbackTaskActive = false;
     // OR of combat, search, native combat/task, restraint/get-up/ragdoll,
     // unavailable player, unloaded navigation and any active interaction priority.
     bool blocked = false;
@@ -156,7 +160,7 @@ struct Controller
             state = State::Suspended;
             missingTask = false;
             selectionPending = false;
-            return {}; // Higher priority owns the ped; never even issue a wait task.
+            return {}; // Higher priority owns the ped; never submit routine tasks.
         }
         if (state == State::Suspended || clockChanged || observation.reevaluate)
         {
@@ -165,14 +169,37 @@ struct Controller
             selectionState = state;
             selectionDestination = destinationId;
             selectionPending = true;
-            if (state == State::Suspended) { state = State::Waiting; destinationId = -1; }
-            waiting = false;
-            missingTask = false;
+            if (state == State::Suspended)
+            {
+                state = State::Waiting;
+                destinationId = -1;
+                waiting = false;
+                missingTask = false;
+            }
+            else if (state != State::Waiting)
+            {
+                waiting = false;
+                missingTask = false;
+            }
+            // A failed recheck must not restart the fallback's absence grace
+            // or make every selection attempt submit another wander task.
             return {Action::None, true, -1};
         }
         if (observation.destinationId < 0 || !observation.destinationAvailable ||
             !observation.destinationOpen || IsCoolingDown(observation.destinationId, observation.nowMs))
-            return Wait(config, observation.nowMs);
+            return Wait(config, observation);
+
+        if (state == State::Waiting && observation.destinationId == observation.fallbackDestinationId &&
+            observation.fallbackTaskActive)
+        {
+            // This area already owns healthy native wandering or a scenario.
+            // Accept it as the regular stop without walking back to its centre.
+            state = State::Wandering;
+            destinationId = observation.destinationId;
+            selectionPending = waiting = missingTask = false;
+            retries = 0;
+            return {};
+        }
 
         if (selectionPending)
         {
@@ -204,17 +231,17 @@ struct Controller
         {
             if (observation.distance <= config.arrivalDistance) return Arrive(observation);
             if (Elapsed(observation.nowMs, startedAtMs) >= tripTimeoutMs)
-                return Fail(config, observation.nowMs);
+                return Fail(config, observation);
             if (observation.distance + config.progressDistance <= bestDistance)
             {
                 bestDistance = observation.distance;
                 progressAtMs = observation.nowMs;
             }
             const bool stalled = Elapsed(observation.nowMs, progressAtMs) >= config.noProgressMs;
-            const bool dropped = TaskMissing(config, observation);
+            const bool dropped = TaskMissing(config, observation.nowMs, observation.taskActive);
             if ((stalled || dropped) && Elapsed(observation.nowMs, lastTaskAtMs) >= config.retryMs)
             {
-                if (retries >= config.maxRetries) return Fail(config, observation.nowMs);
+                if (retries >= config.maxRetries) return Fail(config, observation);
                 ++retries;
                 progressAtMs = lastTaskAtMs = observation.nowMs;
                 bestDistance = observation.distance;
@@ -224,9 +251,10 @@ struct Controller
             return {};
         }
         if (observation.taskActive) retries = 0;
-        if (TaskMissing(config, observation) && Elapsed(observation.nowMs, lastTaskAtMs) >= config.retryMs)
+        if (TaskMissing(config, observation.nowMs, observation.taskActive) &&
+            Elapsed(observation.nowMs, lastTaskAtMs) >= config.retryMs)
         {
-            if (retries >= config.maxRetries) return Fail(config, observation.nowMs);
+            if (retries >= config.maxRetries) return Fail(config, observation);
             ++retries;
             // Recover a dropped area-wander task after the usual absence grace.
             state = State::Wandering;
@@ -253,11 +281,11 @@ private:
     State selectionState = State::Waiting;
     int selectionDestination = -1;
 
-    bool TaskMissing(const Config& config, const Observation& observation)
+    bool TaskMissing(const Config& config, std::uint64_t nowMs, bool taskActive)
     {
-        if (observation.taskActive) { missingTask = false; return false; }
-        if (!missingTask) { missingTask = true; missingSinceMs = observation.nowMs; }
-        return Elapsed(observation.nowMs, missingSinceMs) >= config.taskGraceMs;
+        if (taskActive) { missingTask = false; return false; }
+        if (!missingTask) { missingTask = true; missingSinceMs = nowMs; }
+        return Elapsed(nowMs, missingSinceMs) >= config.taskGraceMs;
     }
     Decision Arrive(const Observation& observation)
     {
@@ -267,24 +295,35 @@ private:
         retries = 0;
         return {Action::Wander, false, -1};
     }
-    Decision Wait(const Config& config, std::uint64_t nowMs)
+    Decision Wait(const Config& config, const Observation& observation)
     {
-        const bool needsTask = state != State::Waiting || !waiting;
+        const bool entering = state != State::Waiting || !waiting ||
+            destinationId != observation.fallbackDestinationId;
         state = State::Waiting;
-        destinationId = -1;
-        missingTask = false;
+        destinationId = observation.fallbackDestinationId;
         selectionPending = false;
-        const bool retry = !waiting || Elapsed(nowMs, lastSelectionMs) >= config.selectionRetryMs;
-        if (retry) lastSelectionMs = nowMs;
+        const bool retry = !waiting || Elapsed(observation.nowMs, lastSelectionMs) >= config.selectionRetryMs;
+        if (retry) lastSelectionMs = observation.nowMs;
         waiting = true;
-        return {needsTask ? Action::Wait : Action::None, retry, -1};
+        Action action = Action::None;
+        if (destinationId < 0 || observation.fallbackTaskActive) missingTask = false;
+        else if (entering || (TaskMissing(config, observation.nowMs, false) &&
+            Elapsed(observation.nowMs, lastTaskAtMs) >= config.retryMs))
+        {
+            // Selection failure cannot exhaust ambient recovery and leave a
+            // frozen ped. Missing tasks keep receiving throttled retries.
+            action = Action::WanderFallback;
+            lastTaskAtMs = observation.nowMs;
+            missingTask = false;
+        }
+        return {action, retry, -1};
     }
-    Decision Fail(const Config& config, std::uint64_t nowMs)
+    Decision Fail(const Config& config, const Observation& observation)
     {
         const int failed = destinationId;
-        cooldowns[nextCooldown] = {failed, nowMs + config.cooldownMs};
+        cooldowns[nextCooldown] = {failed, observation.nowMs + config.cooldownMs};
         nextCooldown = (nextCooldown + 1) % cooldowns.size();
-        Decision decision = Wait(config, nowMs);
+        Decision decision = Wait(config, observation);
         decision.reevaluate = true;
         decision.failedDestination = failed;
         return decision;

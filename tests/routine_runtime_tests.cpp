@@ -96,13 +96,14 @@ struct World
     Vector3 pedPosition{}, settledPosition{};
     Vector3 travelCentre{}, occupiedAt{};
     bool occupiedNear = false;
+    bool occupiedExact = false;
     float wanderRadius = 0, avoidRadius = 0;
     int wanderCalls = 0, keepCalls = 0, avoidCalls = 0, waterCalls = 0;
     int travelCalls = 0, standCalls = 0, statusCalls = 0;
     int activityCalls = 0, scenarioReads = 0, scenarioExits = 0, occupancyReads = 0;
     bool scenarioExitPending = false;
     int travelTimeout = 0;
-    Hash lastTaskHash = 0;
+    Hash lastTaskHash = 0, activeTaskHash = 0;
     Hash scenarioInUse = 0;
     bool mayEnterWater = true;
 } w;
@@ -162,7 +163,8 @@ static bool GET_GROUND_Z_AND_NORMAL_FOR_3D_COORD(Vector3 query, float* ground, V
 static bool IS_POSITION_OCCUPIED(Vector3 point, float, bool, bool, bool, bool, bool, Ped ignore, bool)
 {
     ++w.occupancyReads;
-    w.lastIgnored = ignore; return w.occupied || w.rejectPreparedCandidate || (w.occupiedNear && Within(point, w.occupiedAt, 20.0f));
+    w.lastIgnored = ignore; return w.occupied || w.rejectPreparedCandidate ||
+        (w.occupiedNear && Within(point, w.occupiedAt, 20.0f)) || (w.occupiedExact && Within(point, w.occupiedAt, .1f));
 }
 }
 namespace INTERIOR
@@ -196,10 +198,12 @@ static void SET_PED_PATH_MAY_ENTER_WATER(Ped, bool value) { ++w.waterCalls; w.ma
 static void TASK_WANDER_IN_AREA(Ped ped, Vector3 centre, float radius, float, float, int)
 {
     ++w.wanderCalls; w.wanderedPed = ped; w.wanderCentre = centre; w.wanderRadius = radius;
+    w.activeTaskHash = Joaat("SCRIPT_TASK_WANDER_IN_AREA");
 }
 static int GET_SCRIPT_TASK_STATUS(Ped, Hash hash, bool)
 {
-    ++w.statusCalls; w.lastTaskHash = hash; return w.taskStatus;
+    ++w.statusCalls; w.lastTaskHash = hash;
+    return hash == w.activeTaskHash ? w.taskStatus : 7;
 }
 static void TASK_FOLLOW_NAV_MESH_TO_COORD(Ped, Vector3 centre, float speed, int timeout, float range, int flags, float heading)
 {
@@ -211,8 +215,9 @@ static void TASK_FOLLOW_NAV_MESH_TO_COORD(Ped, Vector3 centre, float speed, int 
         w.scenarioExitPending = false;
     }
     ++w.travelCalls; w.travelCentre = centre; w.travelTimeout = timeout;
+    w.activeTaskHash = Joaat("SCRIPT_TASK_FOLLOW_NAV_MESH_TO_COORD");
 }
-static void TASK_STAND_STILL(Ped, int duration)
+[[maybe_unused]] static void TASK_STAND_STILL(Ped, int duration)
 {
     if (w.scenarioExitPending)
     {
@@ -290,6 +295,8 @@ static void TestPreparedDefinition()
     const auto& location = RoutineData::kLocations[prepared.destination];
     Check(Within(prepared.definition.spawn, prepared.centre, .001f), "definition spawn is the validated point");
     Check(prepared.wanderRadius == location.wanderRadius, "normal wander radius belongs to the selected destination");
+    Check(prepared.fallbackDestination == prepared.destination && Within(prepared.fallbackCentre, prepared.centre, .001f) &&
+        !prepared.ambientFallback, "accepted spawn caches its authored area for ambient continuation");
     Check(prepared.definition.searchRadius == prepared.wanderRadius && prepared.wanderRadius == RoutineData::kWanderRadius,
         "prepared investigation radius matches the uniform destination wander radius");
     Check(std::strcmp(prepared.definition.targetDesc, RoutinePlan::OccupationName(prepared.plan.occupation)) == 0,
@@ -548,7 +555,8 @@ static void SetDaytimeFixture()
     R.destination = R.plan.route[0];
     const auto& place = RoutineData::kLocations[R.destination];
     R.centre = place.anchor; R.wanderRadius = place.wanderRadius;
-    R.definition = {"Valentine", "Livestock hand", "Valentine", R.centre, Tune::kReAggroSightDist,
+    R.fallbackDestination = R.destination; R.fallbackCentre = R.centre;
+    R.definition = {"Valentine", "Livestock hand", "Valentine", R.centre, RoutineData::kWanderRadius,
         RoutineModels(2, RoutineData::LivestockHand), &kHumanTarget, nullptr, ResetRoutine};
     w.pedPosition = R.centre; w.pedPosition.x += 40;
 }
@@ -573,7 +581,7 @@ static void TestTravelAndClock()
     Check(Within(w.travelCentre, fixed, .001f) && w.travelTimeout == 300000 && !w.mayEnterWater,
         "travel targets fixed activity centre with finite deadline and water path policy");
     for (int frame = 0; frame < 20; ++frame) Tick();
-    Check(w.travelCalls == 1 && w.lastTaskHash == Joaat("SCRIPT_TASK_FOLLOW_NAV_MESH_TO_COORD"),
+    Check(w.travelCalls == 1 && w.activeTaskHash == Joaat("SCRIPT_TASK_FOLLOW_NAV_MESH_TO_COORD"),
         "active navmesh task is observed without per-frame reissue");
     w.taskStatus = 1;
     Tick(100);
@@ -585,7 +593,7 @@ static void TestTravelAndClock()
         "arrival switches once to wandering around the validated destination");
     w.pedPosition.x += 10;
     for (int frame = 0; frame < 20; ++frame) Tick();
-    Check(w.wanderCalls == 1 && Within(R.centre, fixed, .001f) && w.lastTaskHash == Joaat("SCRIPT_TASK_WANDER_IN_AREA"),
+    Check(w.wanderCalls == 1 && Within(R.centre, fixed, .001f) && w.activeTaskHash == Joaat("SCRIPT_TASK_WANDER_IN_AREA"),
         "wandering does not move the centre or repeat a running task");
     w.minute = 900;
     const int tasks = TaskCount();
@@ -675,16 +683,16 @@ static void TestTravelRecovery()
     Tick(100); Tick(4100);
     Check(w.travelCalls == 3, "missing nav task receives only the second bounded recovery");
     Tick(100); Tick(4100);
-    Check(w.travelCalls == 3 && R.selectPending && R.controller.IsCoolingDown(failed, w.now) && w.standCalls == 1,
-        "exhausted recovery waits once and cools down the failed location");
+    Check(w.travelCalls == 3 && R.selectPending && R.controller.IsCoolingDown(failed, w.now) && w.standCalls == 0 && w.wanderCalls == 1,
+        "exhausted recovery resumes ambient wandering and cools down the failed travel location");
     Tick();
     Check(R.destination == R.plan.route[3], "failed destination is excluded from immediate reselection");
 
     SetDaytimeFixture(); BeginTravel();
     const int expired = R.destination;
     Tick(300000);
-    Check(R.controller.IsCoolingDown(expired, w.now) && w.standCalls == 1 && w.travelCalls == 1,
-        "absolute travel deadline ends a stuck task even when native reports it active");
+    Check(R.controller.IsCoolingDown(expired, w.now) && w.standCalls == 0 && w.wanderCalls == 1 && w.travelCalls == 1,
+        "absolute travel deadline replaces a stuck travel task with cached-area wandering");
     ResetRoutine();
     Check(!R.controller.IsCoolingDown(expired, w.now) && !R.enabled && R.nextValidationMs == 0 && R.nextStreamRequestMs == 0,
         "cleanup resets cooldown, deferred selection and validation deadlines");
@@ -800,9 +808,9 @@ static void TestAmbientPriorityAndTravelRecovery()
 
     TravelToLeisure(28); Tick();
     w.scenarioInUse = Joaat("WORLD_HUMAN_SMOKE"); w.outside = false;
-    w.scenarioExitPending = true; Tick(1100);
-    Check(R.controller.state == Routine::State::Waiting && w.standCalls == 1 && w.scenarioExits == 1 && !w.scenarioExitPending,
-        "a held stop becoming invalid requests a normal scenario exit before waiting");
+    Tick(1100);
+    Check(R.controller.state == Routine::State::Wandering && w.standCalls == 0 && w.scenarioExits == 0 && w.wanderCalls == 1,
+        "a transient exterior query at a held area leaves healthy ambient behavior uninterrupted");
 
     TravelToLeisure(28); Tick();
     w.scenarioInUse = Joaat("WORLD_HUMAN_SMOKE"); Tick();
@@ -815,8 +823,9 @@ static void TestAmbientPriorityAndTravelRecovery()
     w.scenarioInUse = Joaat("WORLD_HUMAN_SMOKE"); w.taskStatus = 7;
     const int failed = R.destination;
     Tick(100); Tick(4100); Tick(100); Tick(4100); Tick(100); Tick(4100);
-    Check(w.travelCalls == 3 && w.standCalls == 1 && R.controller.IsCoolingDown(failed, w.now) && w.scenarioReads == 0,
-        "a scenario during travel cannot mask dropped nav tasks or their bounded failure cooldown");
+    Check(w.travelCalls == 3 && w.standCalls == 0 && w.wanderCalls == 1 && R.controller.IsCoolingDown(failed, w.now) &&
+        R.controller.state == Routine::State::Waiting && R.ambientFallback,
+        "an unrelated mid-travel scenario cannot mask dropped nav tasks or replace the cached-area wander fallback");
 }
 
 static void TestAmbientPropClearance()
@@ -853,8 +862,8 @@ static void TestAmbientPropClearance()
         w.interior = invalid == 1 ? 1 : 0;
         w.waterPresent = invalid == 2;
         Tick(1100);
-        Check(!R.destinationValid && R.controller.state == Routine::State::Waiting && w.standCalls == 1,
-            "held destinations still reject exterior, interior and water changes after arrival");
+        Check(R.destinationValid && R.controller.state == Routine::State::Wandering && w.standCalls == 0 && w.wanderCalls == 1,
+            "intermittent exterior, interior or water queries cannot cancel a healthy accepted wander area");
     }
 
     TravelToLeisure(29); Tick();
@@ -895,6 +904,125 @@ static void TestAmbientFallbackRecheck()
         "an unavailable preferred stop preserves the same fallback centre and healthy native wander task");
 }
 
+static void TestHealthyWanderKeepsAcceptedArea()
+{
+    SetDaytimeFixture(); BeginTravel();
+    w.pedPosition = R.centre; Tick();
+    const int destination = R.destination;
+    const Vector3 centre = R.centre;
+    Check(R.fallbackDestination == destination && Within(R.fallbackCentre, centre, .001f),
+        "normal arrival updates the cached authored ambient area");
+    w.pedPosition.x += 35.0f;
+    w.groundOk = false; w.safe = false; w.outside = false; w.interior = 1;
+    w.waterPresent = true; w.hit = true; w.occupied = true;
+    const int tasks = TaskCount(), probes = w.probes, safeCalls = w.safeCalls;
+    for (int frame = 0; frame < 12; ++frame) Tick(1100);
+    Check(R.destination == destination && R.destinationValid && R.controller.state == Routine::State::Wandering &&
+        !R.ambientFallback && Within(R.centre, centre, .001f) && R.wanderRadius == 35.0f,
+        "a target at its 35-metre boundary retains its authored stop despite transient point-query failures");
+    Check(TaskCount() == tasks && w.standCalls == 0 && w.probes == probes && w.safeCalls == safeCalls,
+        "healthy area wandering does not rerun spawn validation or receive replacement tasks");
+    w.scenarioInUse = Joaat("WORLD_HUMAN_SMOKE"); w.taskStatus = 7;
+    for (int frame = 0; frame < 12; ++frame) Tick(1100);
+    Check(TaskCount() == tasks && w.scenarioExits == 0 && R.destination == destination && R.destinationValid,
+        "native ambient scenarios retain the same accepted area when ground and projection queries are unavailable");
+}
+
+static void TestUnavailablePhaseContinuesAmbiently()
+{
+    for (const bool scenario : {false, true})
+    {
+        TravelToLeisure(29); Tick();
+        const int held = R.destination;
+        const Vector3 centre = R.centre;
+        const int tasks = TaskCount();
+        w.groundOk = false;
+        if (scenario) { w.scenarioInUse = Joaat("WORLD_HUMAN_DRINKING"); w.taskStatus = 7; }
+        w.minute = 60; Tick(); Tick();
+        Check(R.controller.state == Routine::State::Waiting && R.ambientFallback && R.destination == held &&
+            !R.destinationValid && Within(R.centre, centre, .001f) && R.wanderRadius == 35.0f,
+            "an unavailable new phase retains the last accepted authored area for ambient continuation");
+        Check(TaskCount() == tasks && w.standCalls == 0 && w.scenarioExits == 0,
+            "failure to find the next stop never clears or replaces healthy wandering or its native scenario");
+        Tick(); // Settle the controller's initial availability request before measuring repeated frames.
+        const int afterFailureSafeCalls = w.safeCalls;
+        for (int frame = 0; frame < 50; ++frame) Tick(16);
+        Check(TaskCount() == tasks && w.safeCalls == afterFailureSafeCalls,
+            "pending per-frame updates neither spam tasks nor repeatedly query failed destinations");
+        for (int retry = 0; retry < 3; ++retry) { Tick(5000); Tick(); }
+        Check(TaskCount() == tasks && w.safeCalls > afterFailureSafeCalls && w.scenarioExits == 0 &&
+            R.destination == held && Within(R.centre, centre, .001f),
+            "bounded availability retries continue without interrupting the cached ambient task");
+        const int beforePriority = TaskCount(), reads = w.statusCalls;
+        Tick(16, false); Tick(10000, false);
+        Check(TaskCount() == beforePriority && w.statusCalls == reads && R.controller.state == Routine::State::Suspended,
+            "combat or restraint priority blocks fallback tasking and status probes");
+        Tick(); Tick();
+        Check(TaskCount() == beforePriority && R.ambientFallback,
+            "returning from priority with no usable next stop preserves the running cached-area task");
+        w.groundOk = true; w.taskStatus = 0;
+        for (int frame = 0; frame < 3; ++frame) Tick(5000);
+        Check(R.destination == R.plan.route[3] && !R.ambientFallback &&
+            R.controller.state == Routine::State::Travelling && w.travelCalls == 2 && w.standCalls == 0,
+            "a newly available advertised destination resumes physical scheduled travel without freezing");
+        Check(w.scenarioExits == (scenario ? 1 : 0),
+            "native scenario exit is requested only when a valid replacement trip actually starts");
+    }
+}
+
+static void TestFailedTravelUsesCachedArea()
+{
+    SetDaytimeFixture(); BeginTravel();
+    const int fallback = R.fallbackDestination;
+    const Vector3 centre = R.fallbackCentre;
+    // First exhaust the native task recovery budget while destination geometry is
+    // sound. The next selection pass then sees every authored candidate blocked.
+    w.taskStatus = 7;
+    Tick(100); Tick(4100); Tick(100); Tick(4100); Tick(100); Tick(4100);
+    Check(w.travelCalls == 3 && w.wanderCalls == 1 && w.standCalls == 0 && R.ambientFallback &&
+        R.destination == fallback && Within(w.wanderCentre, centre, .001f) && w.wanderRadius == 35.0f,
+        "failed travel receives exactly one native wander task around its cached authored fallback");
+    w.groundOk = false; w.taskStatus = 0; Tick();
+    const int tasks = TaskCount();
+    for (int frame = 0; frame < 12; ++frame) Tick(1000);
+    Check(TaskCount() == tasks && R.controller.state == Routine::State::Waiting && R.ambientFallback &&
+        R.destination == fallback && Within(R.centre, centre, .001f),
+        "all-blocked follow-up selection leaves cached-area wandering active across repeated retries");
+    w.taskStatus = 7; Tick(); Tick(1400);
+    Check(TaskCount() == tasks, "a missing fallback wander task gets a grace period before recovery");
+    Tick(100);
+    Check(w.wanderCalls == 2 && w.standCalls == 0 && Within(w.wanderCentre, centre, .001f),
+        "an actually dropped fallback task is recovered at the same authored area");
+    const int afterRecovery = TaskCount();
+    for (int frame = 0; frame < 20; ++frame) Tick(16);
+    Check(TaskCount() == afterRecovery, "a persistently missing fallback task is not reissued every frame");
+    w.taskStatus = 0;
+    w.groundOk = true;
+    for (int frame = 0; frame < 3; ++frame) Tick(5000);
+    Check(!R.ambientFallback && R.destination == R.plan.route[3] && w.travelCalls == 4 && w.standCalls == 0,
+        "recovered availability moves from failed travel's ambient fallback to the alternative advertised stop");
+    ResetRoutine(); const int beforeDisabled = TaskCount(); Tick(10000);
+    Check(TaskCount() == beforeDisabled && R.fallbackDestination == -1 && !R.ambientFallback,
+        "cleanup clears fallback ownership and cannot revive a disabled routine");
+}
+
+static void TestRejectedSavedPointCanFindAnotherPoint()
+{
+    SetDaytimeFixture(); BeginTravel();
+    const int destination = R.destination;
+    const Vector3 oldCentre = R.centre;
+    w.occupiedExact = true; w.occupiedAt = oldCentre;
+    const int safeCalls = w.safeCalls;
+    StartRoutineWander(77, R.definition); Tick(); Tick();
+    Check(R.destination == destination && R.destinationValid && !R.ambientFallback &&
+        !Within(R.centre, oldCentre, .1f) && w.safeCalls > safeCalls,
+        "a rejected saved travel point permits a different validated candidate at the same authored stop");
+    Check(Within(R.centre, RoutineData::kLocations[destination].anchor,
+            RoutineData::kLocations[destination].candidateRadius) && w.standCalls == 0 &&
+        w.travelCalls == 2 && Within(w.travelCentre, R.centre, .001f),
+        "a replaced endpoint receives a fresh travel task to the new point within authored candidate bounds");
+}
+
 int main()
 {
     TestPreparedDefinition();
@@ -910,5 +1038,9 @@ int main()
     TestAmbientPriorityAndTravelRecovery();
     TestAmbientPropClearance();
     TestAmbientFallbackRecheck();
+    TestHealthyWanderKeepsAcceptedArea();
+    TestUnavailablePhaseContinuesAmbiently();
+    TestFailedTravelUsesCachedArea();
+    TestRejectedSavedPointCanFindAnotherPoint();
     std::printf("Routine runtime bridge: %u checks passed.\n", checks);
 }

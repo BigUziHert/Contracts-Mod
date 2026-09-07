@@ -13,6 +13,9 @@ struct RoutineRuntime
     int destination = -1;
     Vector3 centre{};
     float wanderRadius = RoutineData::kWanderRadius;
+    int fallbackDestination = -1;
+    Vector3 fallbackCentre{};
+    bool ambientFallback = false;
     Routine::Controller controller;
     bool selectPending = false;
     bool resumeRequested = false;
@@ -135,6 +138,8 @@ static bool PrepareRoutineContract(RoutineRuntime& prepared)
                 candidate.cardLines = RoutinePlan::CardLines(candidate.plan);
                 candidate.destination = id;
                 candidate.centre = point;
+                candidate.fallbackDestination = id;
+                candidate.fallbackCentre = point;
                 routineStartDiagnostic.expected = point;
                 candidate.wanderRadius = location.wanderRadius;
                 const auto& area = RoutineData::kTowns[town];
@@ -232,7 +237,7 @@ static int RoutineTravelMinutes(const Vector3& from, const Vector3& to)
     return static_cast<int>(estimate > Routine::kMinutesPerDay ? Routine::kMinutesPerDay : estimate);
 }
 
-static void SelectRoutineDestination(Ped ped, const Vector3& position, int minute, ULONGLONG now)
+static void SelectRoutineDestination(Ped ped, const Vector3& position, int minute, ULONGLONG now, bool ambientActive = false)
 {
     Routine::Candidate candidates[4];
     RoutinePlan::Candidates(R.plan, candidates);
@@ -244,8 +249,7 @@ static void SelectRoutineDestination(Ped ped, const Vector3& position, int minut
         candidate.travelMinutes = RoutineTravelMinutes(position, location.anchor);
     }
     const int previousDestination = R.destination;
-    R.destination = -1;
-    R.destinationValid = false;
+    bool accepted = false;
     // At most the authored phase and its all-day fallback. No waits or scene takeover
     // in the per-frame bridge; an unloaded preferred area receives a collision request.
     for (int attempt = 0; attempt < 2; ++attempt)
@@ -259,25 +263,33 @@ static void SelectRoutineDestination(Ped ped, const Vector3& position, int minut
             STREAMING::REQUEST_COLLISION_AT_COORD(location.anchor);
             PATH::ADD_NAVMESH_REQUIRED_REGION(location.anchor.x, location.anchor.y, 50.0f);
         }
-        if (id == previousDestination && RoutineSpawn::ValidatePoint(location.anchor, location.candidateRadius,
-            location.maxHeightDelta, R.centre, ped, R.controller.state != Routine::State::Wandering))
+        // An already running wander/scenario is stronger evidence that the visit
+        // can continue than another spawn-point query at its now-distant centre.
+        const bool heldAmbient = ambientActive && id == R.fallbackDestination &&
+            DistSq(R.centre, R.fallbackCentre) < .01f;
+        if (id == previousDestination && (heldAmbient || RoutineSpawn::ValidatePoint(location.anchor, location.candidateRadius,
+            location.maxHeightDelta, R.centre, ped, R.controller.state != Routine::State::Wandering)))
         {
-            R.destination = id;
-            R.destinationValid = true;
+            accepted = true;
             break; // Keep the exact centre/radius and the healthy task using them.
         }
         Vector3 point;
-        if (id != previousDestination &&
-            RoutineSpawn::Find(location.anchor, location.candidateRadius, location.maxHeightDelta, R.plan.seed, point, ped))
+        // A rejected endpoint does not condemn its entire authored area. Try the
+        // other bounded points even when this was the previous destination.
+        if (RoutineSpawn::Find(location.anchor, location.candidateRadius, location.maxHeightDelta, R.plan.seed, point, ped))
         {
             R.destination = id;
             R.centre = point;
             R.wanderRadius = location.wanderRadius;
-            R.destinationValid = true;
+            accepted = true;
             break;
         }
         for (auto& candidate : candidates) if (candidate.id == id) candidate.available = false;
     }
+    // Failed selection retains the authored location until the controller falls
+    // back to the last arrived area. Never publish Stop: None for a live routine.
+    R.destinationValid = accepted;
+    R.ambientFallback = !accepted;
     R.nextValidationMs = now + 1000;
     R.fallbackRecheckMs = now + 60000;
     R.selectPending = false;
@@ -287,7 +299,7 @@ static bool RoutineTaskActive(Ped ped)
 {
     // Area wandering can use world scenarios. That pause is healthy only after
     // arrival; an unrelated scenario must not hide failed travel indefinitely.
-    if (R.controller.state == Routine::State::Wandering && PED::IS_PED_USING_ANY_SCENARIO(ped)) return true;
+    if ((R.controller.state == Routine::State::Wandering || R.ambientFallback) && PED::IS_PED_USING_ANY_SCENARIO(ped)) return true;
     const Hash task = R.controller.state == Routine::State::Travelling
         ? joaat("SCRIPT_TASK_FOLLOW_NAV_MESH_TO_COORD") : joaat("SCRIPT_TASK_WANDER_IN_AREA");
     const int status = TASK::GET_SCRIPT_TASK_STATUS(ped, task, true);
@@ -314,21 +326,34 @@ static void UpdateRoutine(Ped ped, const ContractDef& def, bool mayAct)
     }
     if (!observation.blocked)
     {
-        ambientScenario = R.controller.state == Routine::State::Wandering && PED::IS_PED_USING_ANY_SCENARIO(ped);
-        if (R.selectPending) SelectRoutineDestination(ped, position, observation.minute, observation.nowMs);
+        ambientScenario = PED::IS_PED_USING_ANY_SCENARIO(ped);
+        const int wanderStatus = TASK::GET_SCRIPT_TASK_STATUS(ped, joaat("SCRIPT_TASK_WANDER_IN_AREA"), true);
+        const bool holdingArea = R.destination == R.fallbackDestination && R.fallbackDestination >= 0 &&
+            DistSq(R.centre, R.fallbackCentre) < .01f && (R.controller.state == Routine::State::Wandering ||
+                R.ambientFallback || R.controller.state == Routine::State::Suspended);
+        // A scenario encountered partway through travel does not prove arrival
+        // at the saved fallback. Only that area's owned ambient task is adopted.
+        const bool ambientActive = holdingArea && (ambientScenario || wanderStatus == 0 || wanderStatus == 1);
+        observation.fallbackTaskActive = ambientActive;
+        const Vector3 previousCentre = R.centre;
+        if (R.selectPending) SelectRoutineDestination(ped, position, observation.minute, observation.nowMs, ambientActive);
+        const bool centreChanged = DistSq(previousCentre, R.centre) >= .01f;
+        if (centreChanged) observation.fallbackTaskActive = false;
         observation.reevaluate = R.resumeRequested || R.pauseSnapshotMs != pausedDurationMs;
         R.pauseSnapshotMs = pausedDurationMs;
         R.resumeRequested = false;
         if (R.destination >= 0)
         {
             const auto& location = RoutineData::kLocations[R.destination];
-            if (observation.nowMs >= R.nextValidationMs)
+            if (!R.ambientFallback && observation.nowMs >= R.nextValidationMs)
             {
-                // Once arrived, temporary bystanders or scenario props at the fixed
-                // centre cannot cancel this stop. Residency and geometry still apply.
-                R.destinationValid = location.enabled && RoutineSpawn::ValidatePoint(location.anchor,
-                    location.candidateRadius, location.maxHeightDelta, R.centre, ped,
-                    R.controller.state != Routine::State::Wandering);
+                // The centre was validated before deployment/arrival. Once this
+                // area's native wandering runs, don't stop it over a fresh query
+                // of ground or collision at a point the ped has already left.
+                const bool arrivedArea = R.destination == R.fallbackDestination &&
+                    DistSq(R.centre, R.fallbackCentre) < .01f && R.controller.state == Routine::State::Wandering;
+                R.destinationValid = location.enabled && (arrivedArea || RoutineSpawn::ValidatePoint(location.anchor,
+                    location.candidateRadius, location.maxHeightDelta, R.centre, ped));
                 R.nextValidationMs = observation.nowMs + 1000;
             }
             observation.destinationOpen = Routine::CanArriveAndStay({location.openMinute, location.closeMinute},
@@ -336,21 +361,34 @@ static void UpdateRoutine(Ped ped, const ContractDef& def, bool mayAct)
             const int preferred = R.plan.route[static_cast<int>(Routine::PhaseAt(observation.minute, R.plan.offsetMinutes))];
             // Optional availability retries can wait for a native ambient pause to
             // end. Real schedule changes, closed hours and priority still win.
-            if (R.destination != preferred && R.controller.state != Routine::State::Travelling && !ambientScenario &&
+            if (!R.ambientFallback && R.destination != preferred && R.controller.state != Routine::State::Travelling && !ambientScenario &&
                 observation.nowMs >= R.fallbackRecheckMs)
             {
                 observation.reevaluate = true;
                 R.fallbackRecheckMs = observation.nowMs + 60000;
             }
         }
-        observation.taskActive = RoutineTaskActive(ped);
+        // A new point inside the same authored area still needs a new movement
+        // endpoint; an active task aimed at the rejected old point cannot be kept.
+        observation.taskActive = !centreChanged && RoutineTaskActive(ped);
     }
+    observation.fallbackDestinationId = R.fallbackDestination;
     observation.destinationId = R.destination;
-    observation.destinationAvailable = R.destinationValid;
+    observation.destinationAvailable = R.destinationValid && !R.ambientFallback;
     observation.distance = std::sqrt(DistSq(position, R.centre));
     const Routine::Decision decision = R.controller.Tick(config, observation);
     if (decision.reevaluate) R.selectPending = true;
-    if (ambientScenario && (decision.action == Routine::Action::Travel || decision.action == Routine::Action::Wait))
+    if (R.controller.state == Routine::State::Waiting && R.fallbackDestination >= 0)
+    {
+        // This is an accepted spawn/arrived area, never the ped's moving position
+        // or a rejected travel endpoint. Native navigation still avoids water.
+        R.destination = R.fallbackDestination;
+        R.centre = R.fallbackCentre;
+        R.wanderRadius = RoutineData::kLocations[R.destination].wanderRadius;
+        R.destinationValid = false; // A route check is pending; this is cached area wandering.
+        R.ambientFallback = true;
+    }
+    if (ambientScenario && decision.action == Routine::Action::Travel)
         PED::SET_PED_SHOULD_PLAY_NORMAL_SCENARIO_EXIT(ped);
     switch (decision.action)
     {
@@ -364,6 +402,11 @@ static void UpdateRoutine(Ped ped, const ContractDef& def, bool mayAct)
         PED::SET_PED_KEEP_TASK(ped, true);
         break;
     case Routine::Action::Wander:
+        R.fallbackDestination = R.destination;
+        R.fallbackCentre = R.centre;
+        R.ambientFallback = false;
+        [[fallthrough]];
+    case Routine::Action::WanderFallback:
         TASK::SET_PED_PATH_PREFER_TO_AVOID_WATER(ped, true, R.wanderRadius);
         TASK::SET_PED_PATH_MAY_ENTER_WATER(ped, false);
         // Native area wandering decides its own pauses and ambient opportunities;
@@ -371,9 +414,6 @@ static void UpdateRoutine(Ped ped, const ContractDef& def, bool mayAct)
         // beat_public_hanging.c:16270 retains this 0/0/1 tail after navmesh travel.
         TASK::TASK_WANDER_IN_AREA(ped, R.centre, R.wanderRadius, 0.0f, 0.0f, 1);
         PED::SET_PED_KEEP_TASK(ped, true);
-        break;
-    case Routine::Action::Wait:
-        TASK::TASK_STAND_STILL(ped, -1); // act_hunting_2.c:9931; replaced by the next valid routine task
         break;
     case Routine::Action::None: break;
     }

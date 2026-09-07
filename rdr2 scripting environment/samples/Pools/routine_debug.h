@@ -27,16 +27,16 @@ static const char* ObserveRoutineDebugActivity(RoutineDebugView::Snapshot& snaps
     if (PED::IS_PED_IN_ANY_VEHICLE(ped, false)) return "In a vehicle";
     if (!snapshot.loaded) return "Paused: area not loaded";
     if (R.controller.state == Routine::State::Suspended) return "Routine paused";
-    if (R.selectPending || R.resumeRequested) return "Choosing destination";
+    if ((R.selectPending || R.resumeRequested) && !R.ambientFallback) return "Choosing destination";
+    snapshot.taskActive = RoutineTaskActive(ped);
     if (snapshot.inScenario)
     {
-        snapshot.taskActive = RoutineTaskActive(ped);
         if (PED::IS_PED_USING_SCENARIO_HASH(ped, Joaat("WORLD_HUMAN_SMOKE"))) return "Smoking (ambient)";
         if (PED::IS_PED_USING_SCENARIO_HASH(ped, Joaat("WORLD_HUMAN_DRINKING"))) return "Drinking (ambient)";
         return "Ambient scenario";
     }
-    if (R.controller.state == Routine::State::Waiting) return "Waiting for a usable destination";
-    snapshot.taskActive = RoutineTaskActive(ped);
+    if (R.ambientFallback || R.controller.state == Routine::State::Waiting)
+        return snapshot.taskActive ? "Wandering while route recovers" : "Wander task pending / recovery";
     if (R.controller.state == Routine::State::Travelling)
         return snapshot.taskActive ? "Walking to destination" : "Travel task pending / recovery";
     return snapshot.taskActive ? "Wandering near destination" : "Wander task pending / recovery";
@@ -86,7 +86,8 @@ static RoutineDebugView::Snapshot ObserveRoutineDebug()
         snapshot.destinationDistance = std::sqrt(DistSq(target, R.centre));
         snapshot.destinationValid = R.destinationValid;
         snapshot.destinationOpen = Routine::IsOpen({location.openMinute, location.closeMinute}, snapshot.minute);
-        snapshot.fallback = location.kind == RoutineData::PlaceKind::Rest && phase != static_cast<int>(Routine::Phase::Rest);
+        snapshot.fallback = R.ambientFallback ||
+            (location.kind == RoutineData::PlaceKind::Rest && phase != static_cast<int>(Routine::Phase::Rest));
     }
     snapshot.doing = ObserveRoutineDebugActivity(snapshot);
     return snapshot;
@@ -104,7 +105,8 @@ static void UpdateRoutineDebug()
     if (!routineDebugEnabled) return;
     const bool routine = ContractActive() && C.def && IsRoutine(*C.def);
     const Vector3* spawn = routine ? &C.def->spawn : nullptr;
-    const Vector3* destination = routine && R.destination >= 0 && R.destination < RoutineData::kLocationCount && R.destinationValid
+    const Vector3* destination = routine && R.destination >= 0 && R.destination < RoutineData::kLocationCount &&
+        (R.destinationValid || R.ambientFallback)
         ? &R.centre : nullptr;
     RoutineDebugBlips::Update(true, spawn, destination);
     const ULONGLONG now = GetTickCount64();

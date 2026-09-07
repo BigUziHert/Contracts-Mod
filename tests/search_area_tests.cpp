@@ -32,6 +32,7 @@ static struct Routine
     float wanderRadius = RoutineData::kWanderRadius;
     int destination = 0;
     bool destinationValid = true;
+    bool ambientFallback = false;
 } R;
 static constexpr Hash BLIP_STYLE_MP_MISSION_GIVER = 1234;
 static struct World
@@ -152,6 +153,26 @@ static void LegacySearchKeepsItsDefinition()
     Check(SamePoint(w.centre, definition.spawn) && w.moves == 0 && w.creates == 1 && w.coordinateReads == 0,
         "routine and target movement cannot alter a legacy search circle");
 }
+static void CachedFallbackKeepsItsAuthoredCircle()
+{
+    Reset(); AddSearchBlip();
+    const Blip original = C.searchBlip;
+    R.centre = {2822, -1415, 45.5f};
+    R.ambientFallback = true; R.destinationValid = false;
+    UpdateSearchArea();
+    Check(C.searchBlip == original && w.moves == 1 && w.creates == 1 &&
+        SamePoint(w.centre, R.centre) && w.radius == 35.0f,
+        "route recovery keeps the same 35 metre search circle at the cached authored fallback");
+    for (int frame = 0; frame < 4; ++frame)
+    {
+        C.targetPos.x += 10;
+        UpdateSearchArea();
+    }
+    Check(w.moves == 1, "fallback wandering never makes the circle chase individual footsteps");
+    R.destination = -1; R.centre = {0, 0, 0};
+    UpdateSearchArea();
+    Check(w.moves == 1, "fallback cannot move the search circle without a known authored destination");
+}
 static void MainUpdatesSearchBeforeItsProtectedTail()
 {
     Reset(); AddSearchBlip(); w.events.clear();
@@ -169,6 +190,7 @@ int main()
     NewStopMovesTheSameCircleOnce();
     InvalidAndInactiveSearchesDoNotMove();
     LegacySearchKeepsItsDefinition();
+    CachedFallbackKeepsItsAuthoredCircle();
     MainUpdatesSearchBeforeItsProtectedTail();
     std::printf("Search area native bridge: %u checks passed.\n", checks);
 }

@@ -127,15 +127,15 @@ static void TravelArrivalAndWandering()
 
     observation.taskActive = true; // The bridge also supplies this for an observed native scenario.
     observation.destinationOpen = false;
-    Check(controller.Tick(config, observation).action == Action::Wait && controller.state == State::Waiting,
-        "closing hours override a healthy ambient pause after arrival");
+    Check(controller.Tick(config, observation).action == Action::None && controller.state == State::Waiting,
+        "closing hours stop accepting the destination without inventing an unauthored movement task");
     controller.Reset();
     observation = Observe(0, 2.0f);
     controller.Tick(config, observation);
     observation.taskActive = true;
     observation.destinationAvailable = false;
-    Check(controller.Tick(config, observation).action == Action::Wait,
-        "an unavailable destination overrides a healthy ambient pause after arrival");
+    Check(controller.Tick(config, observation).action == Action::None && controller.state == State::Waiting,
+        "an unavailable destination is rejected without an artificial standing task");
 }
 static void BoundedFailureAndCooldown()
 {
@@ -156,7 +156,8 @@ static void BoundedFailureAndCooldown()
     }
     observation.nowMs = 12000;
     const Decision failure = controller.Tick(config, observation);
-    Check(failure.action == Action::Wait && failure.reevaluate && failure.failedDestination == 7, "exhausted travel requests fallback once");
+    Check(failure.action == Action::None && failure.reevaluate && failure.failedDestination == 7,
+        "exhausted travel requests selection without inventing an unauthored fallback");
     Check(controller.IsCoolingDown(7, 12000) && !controller.IsCoolingDown(7, 72000), "failed destination cooldown expires exactly at deadline");
     observation.nowMs = 12001;
     Check(controller.Tick(config, observation).action == Action::None, "cooled destination cannot immediately restart");
@@ -305,7 +306,7 @@ static void PriorityResumeClockAndClosure()
     controller.Tick(config, observation);
     observation.destinationOpen = false;
     const Decision closed = controller.Tick(config, observation);
-    Check(closed.action == Action::Wait && closed.reevaluate, "venue closing during travel stops stale route and reselects");
+    Check(closed.action == Action::None && closed.reevaluate, "venue closing during travel stops accepting the stale route and reselects");
     observation.nowMs++;
     Check(!controller.Tick(config, observation).reevaluate, "unavailable destination does not spin selection every frame");
     observation.nowMs += config.selectionRetryMs;
@@ -321,6 +322,151 @@ static void PriorityResumeClockAndClosure()
     observation.minute = 1;
     Check(!controller.Tick(config, observation).reevaluate, "ordinary clock advancement does not reissue routine");
 }
+static void AmbientFallbackSelectionAndPromotion()
+{
+    const Config config;
+    for (int unavailableCase = 0; unavailableCase < 3; ++unavailableCase)
+    {
+        Controller controller;
+        auto observation = Observe(0, 2.0f);
+        controller.Tick(config, observation);
+        observation.fallbackDestinationId = 7;
+        observation.taskActive = observation.fallbackTaskActive = true;
+        observation.nowMs = 100;
+        if (unavailableCase == 0) observation.destinationId = -1;
+        else if (unavailableCase == 1) observation.destinationAvailable = false;
+        else observation.destinationOpen = false;
+        Decision decision = controller.Tick(config, observation);
+        Check(decision.action == Action::None && decision.reevaluate &&
+            controller.state == State::Waiting && controller.destinationId == 7,
+            "failed destination selection retains the accepted ambient area and its healthy task");
+        for (std::uint64_t now = 101; now <= 20101; now += 1000)
+        {
+            observation.nowMs = now;
+            decision = controller.Tick(config, observation);
+            Check(decision.action == Action::None && controller.destinationId == 7,
+                "repeated failed selections leave healthy fallback wandering or a scenario uninterrupted");
+        }
+        observation.reevaluate = true;
+        Check(controller.Tick(config, observation).action == Action::None,
+            "explicit fallback recheck also preserves its healthy activity");
+        observation.reevaluate = false;
+        observation.destinationId = 7;
+        observation.destinationAvailable = observation.destinationOpen = true;
+        observation.distance = 30.0f;
+        Check(controller.Tick(config, observation).action == Action::None &&
+            controller.state == State::Wandering && controller.destinationId == 7,
+            "accepting the active fallback promotes wandering without returning to its centre");
+    }
+
+    Controller controller;
+    auto observation = Observe(0);
+    observation.destinationOpen = false;
+    observation.taskActive = true; // The closed destination's task is not healthy fallback evidence.
+    observation.fallbackDestinationId = 12;
+    const Decision closed = controller.Tick(config, observation);
+    Check(closed.action == Action::WanderFallback && closed.reevaluate && controller.destinationId == 12,
+        "closed destination selects an independent authored fallback rather than trusting its stale task");
+    observation.nowMs = 1;
+    Check(controller.Tick(config, observation).action == Action::None,
+        "new fallback is issued once while the native task starts");
+    observation.fallbackTaskActive = true;
+    observation.nowMs = config.selectionRetryMs;
+    const Decision retry = controller.Tick(config, observation);
+    Check(retry.action == Action::None && retry.reevaluate,
+        "healthy ambient fallback continues while destination selection retries after five seconds");
+
+    controller.Reset();
+    observation = Observe(0);
+    observation.destinationId = -1;
+    Check(controller.Tick(config, observation).action == Action::None && controller.destinationId == -1,
+        "missing authored fallback never issues arbitrary wandering or a standing task");
+    observation.nowMs = config.selectionRetryMs - 1;
+    Check(!controller.Tick(config, observation).reevaluate, "fallback-free selection respects its retry deadline");
+    ++observation.nowMs;
+    Check(controller.Tick(config, observation).reevaluate, "fallback-free selection still retries at the deadline");
+}
+static void AmbientFallbackRecoveryAndPriority()
+{
+    const Config config;
+    Controller controller;
+    auto observation = Observe(0);
+    observation.destinationId = -1;
+    observation.fallbackDestinationId = 12;
+    Check(controller.Tick(config, observation).action == Action::WanderFallback,
+        "no usable destination immediately starts authored fallback wandering");
+    for (unsigned retry = 1; retry <= 8; ++retry)
+    {
+        observation.nowMs = (retry - 1) * config.retryMs + 1;
+        Check(controller.Tick(config, observation).action == Action::None, "fallback task absence starts a fresh grace interval");
+        observation.nowMs += config.taskGraceMs;
+        Check(controller.Tick(config, observation).action == Action::None, "fallback recovery observes the four-second issue throttle");
+        observation.nowMs = retry * config.retryMs - 1;
+        observation.reevaluate = true;
+        Check(controller.Tick(config, observation).action == Action::None,
+            "failed selection recheck does not issue its own movement task");
+        observation.reevaluate = false;
+        ++observation.nowMs;
+        Check(controller.Tick(config, observation).action == Action::WanderFallback,
+            "missing fallback task keeps recovering beyond the ordinary destination retry budget");
+        Check(controller.destinationId == 12 && !controller.IsCoolingDown(12, observation.nowMs),
+            "ambient recovery never exhausts or cools down its fallback area");
+    }
+
+    observation.fallbackTaskActive = true;
+    observation.nowMs = 33000;
+    controller.Tick(config, observation);
+    observation.fallbackTaskActive = false;
+    observation.nowMs = 36000;
+    Check(controller.Tick(config, observation).action == Action::None, "a newly lost healthy fallback task gets absence grace");
+    observation.nowMs = 37000;
+    observation.reevaluate = true;
+    controller.Tick(config, observation);
+    observation.reevaluate = false;
+    observation.nowMs = 37499;
+    Check(controller.Tick(config, observation).action == Action::None, "fallback absence grace lasts the full 1500 milliseconds");
+    ++observation.nowMs;
+    Check(controller.Tick(config, observation).action == Action::WanderFallback,
+        "failed selection preserves the original fallback absence timer instead of delaying recovery");
+
+    observation.blocked = true;
+    observation.nowMs = 100000;
+    const Decision blocked = controller.Tick(config, observation);
+    Check(blocked.action == Action::None && !blocked.reevaluate && controller.state == State::Suspended,
+        "higher-priority activity suppresses fallback movement and selection");
+    observation.blocked = false;
+    ++observation.nowMs;
+    const Decision resumed = controller.Tick(config, observation);
+    Check(resumed.action == Action::None && resumed.reevaluate, "priority release requests a fresh selection before ambient recovery");
+    ++observation.nowMs;
+    Check(controller.Tick(config, observation).action == Action::WanderFallback && controller.destinationId == 12,
+        "failed selection after priority release restarts authored ambient wandering");
+}
+static void FailedTravelUsesAmbientFallback()
+{
+    Config config;
+    config.noProgressMs = config.travelTimeoutMs + 1;
+    Controller controller;
+    auto observation = Observe(0);
+    observation.taskActive = true;
+    observation.fallbackDestinationId = 12;
+    controller.Tick(config, observation);
+    observation.nowMs = config.travelTimeoutMs;
+    const Decision failed = controller.Tick(config, observation);
+    Check(failed.action == Action::WanderFallback && failed.reevaluate && failed.failedDestination == 7 &&
+        controller.state == State::Waiting && controller.destinationId == 12,
+        "failed travel immediately returns to ambient fallback instead of standing still");
+    Check(controller.IsCoolingDown(7, observation.nowMs) && !controller.IsCoolingDown(12, observation.nowMs),
+        "failed travel cools down only the failed destination, preserving fallback availability");
+    observation.fallbackTaskActive = true;
+    observation.nowMs += config.selectionRetryMs;
+    Check(controller.Tick(config, observation).action == Action::None && controller.destinationId == 12,
+        "cooling-down destination cannot interrupt an active ambient fallback");
+    observation.destinationId = 12;
+    observation.distance = 30.0f;
+    Check(controller.Tick(config, observation).action == Action::None && controller.state == State::Wandering,
+        "reselection of the active fallback after travel failure does not restart travel");
+}
 int main()
 {
     OpeningWindowsAndArrival();
@@ -329,5 +475,8 @@ int main()
     BoundedFailureAndCooldown();
     UnchangedDestinationReevaluation();
     PriorityResumeClockAndClosure();
+    AmbientFallbackSelectionAndPromotion();
+    AmbientFallbackRecoveryAndPriority();
+    FailedTravelUsesAmbientFallback();
     std::printf("routine_logic: %u checks passed\n", checks);
 }
