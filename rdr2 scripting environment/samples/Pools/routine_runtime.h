@@ -8,6 +8,7 @@ struct RoutineRuntime
 {
     bool enabled = false;
     RoutinePlan::Plan plan;
+    std::array<std::string, 6> cardLines{};
     ContractDef definition{};
     int destination = -1;
     Vector3 centre{};
@@ -69,6 +70,7 @@ static bool PrepareRoutineContract(RoutineRuntime& prepared)
             Routine::CanArriveAndStay({location.openMinute, location.closeMinute}, RoutineMinute(), 0, 15))
         {
             prepared.enabled = true;
+            prepared.cardLines = RoutinePlan::CardLines(prepared.plan);
             prepared.destination = id;
             prepared.centre = point;
             prepared.wanderRadius = location.wanderRadius;

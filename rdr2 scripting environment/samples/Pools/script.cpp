@@ -1148,7 +1148,9 @@ static void RefreshCardTextureAfterTransition()
 	ApplyCardCustomTexture();
 }
 
-// The "back" of the card: a screen-space panel with the portrait, who the target is, where he is, and the pay.
+#include "routine_card.h"
+
+// The "back" of the card: a screen-space panel with the portrait, usual haunts, and the pay.
 static void DrawCardBackPanel()
 {
 #ifdef BOUNTY_PHOTO_SELF_TEST
@@ -1168,8 +1170,12 @@ static void DrawCardBackPanel()
 	FormatMoney(lo, sizeof lo, Tune::kPayoutMinCents);
 	FormatMoney(hi, sizeof hi, Tune::kPayoutMaxCents);
 	sprintf_s(reward, "%s - %s", lo, hi);
-	DrawTextToScreen(C.def->targetDesc, 0.49f, 0.37f, 0.36f, 255, 255, 255, 255);
-	DrawTextToScreen(C.def->hint,       0.49f, 0.43f, 0.36f, 255, 255, 255, 255);
+	if (IsRoutine(*C.def)) RoutineCard::Draw(R.cardLines);
+	else
+	{
+		DrawTextToScreen(C.def->targetDesc, 0.49f, 0.37f, 0.36f, 255, 255, 255, 255);
+		DrawTextToScreen(C.def->hint,       0.49f, 0.43f, 0.36f, 255, 255, 255, 255);
+	}
 	DrawTextToScreen(reward,            0.52f, 0.57f, 0.72f, 255, 255, 255, 255);
 }
 

@@ -119,3 +119,18 @@ the outer loop skipped all routine updates during the pause/fade.
 A target can enter an interior through normal AI, including during combat. The outdoor
 test applies to authored spawn/arrival points, not to combat position. Routine venues are
 still exterior visits; no doors, interior globals or mission actors are changed.
+
+## Stage 3: habit clues on the existing card
+
+The existing back panel retains its portrait, dimensions and reward. Its text now lists
+occupation, town and four selected destinations under **USUAL HAUNTS**. Cached strings
+come from the same immutable route IDs the controller visits. **Visits may vary** signals
+the real availability/fallback policy; these are investigative habits, not live tracking.
+Exterior names such as Store frontage and Slum saloon street do not claim a transaction,
+game or show. The longest line is 32 characters; six separately placed lines avoid the
+old unwrapped paragraphs. Pixel readability across resolutions remains an in-game check.
+
+Only the information draw changes. The portrait capture, download handles, 32-slot policy,
+card material retries, prop/item states, handoff, flip/zoom/put-away, final draw order,
+corpse photography and payment functions were independently compared against `733eb83`;
+all 18 checked protected functions and the complete Card constants block were identical.
