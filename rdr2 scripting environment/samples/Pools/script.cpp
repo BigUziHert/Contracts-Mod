@@ -59,6 +59,7 @@ struct ActiveContract
 	bool       corpseBlipPlaced = false;
 	bool       trailsActive = false;
 	TargetAI::Memory ai;
+	ULONGLONG  combatRequestMs = 0;     // most recent scripted or adopted engagement request
 	Vector3    lastKnownPlayerPos;
 	Hash       weapon = 0;             // one loadout per target, retained across encounters
 	bool       damagedByPlayer = false; // current tick's consumed damage event
@@ -1433,16 +1434,27 @@ static void SetupHumanTarget(Ped ped, const ContractDef& def)
 }
 
 // ===== [ HUMAN TARGET: COMBAT ] =====
-// Preserve native combat when it has already started. Recovery only reissues the task;
-// it never forces another weapon draw or clears an animation while the ped is getting up.
+// Standing native combat keeps its task. Scenario combat first requests an exit,
+// then escalates on recovery; the caller protects restraint and getting-up states.
 static void EnterCombat(Ped ped, bool adoptNativeCombat, bool taskRecovery)
 {
+	const bool seated = PED::IS_PED_USING_ANY_SCENARIO(ped) || PED::IS_PED_SITTING(ped);
+	C.combatRequestMs = RuntimeNowMs();
+	if (seated)
+	{
+		if (taskRecovery) TASK::CLEAR_PED_TASKS_IMMEDIATELY(ped, false, true);
+		else if (!PED::SET_PED_SHOULD_PLAY_COMBAT_SCENARIO_EXIT(ped, playerPos, 3))
+			PED::SET_PED_SHOULD_PLAY_IMMEDIATE_SCENARIO_EXIT(ped);
+	}
 	PED::SET_PED_CONFIG_FLAG(ped, 233, true);     // PedIsEnemyToPlayer — so his own AI presses the attack
 	PED::SET_PED_COMBAT_ATTRIBUTES(ped, 5, true); // CA_ALWAYS_FIGHT
-	if (!adoptNativeCombat)
+	if (!adoptNativeCombat || seated)
 	{
 		if (!taskRecovery) WEAPON::SET_CURRENT_PED_WEAPON(ped, C.weapon, false, WEAPON_ATTACH_POINT_HAND_PRIMARY, false, false);
 		TASK::TASK_COMBAT_PED(ped, pedMe, 0, 0);
+		// Seated adoption also issued a real task and must respect its retry interval.
+		C.ai.lastTaskIssuedMs = C.combatRequestMs;
+		C.ai.hasIssuedCombatTask = true;
 	}
 	PED::SET_PED_KEEP_TASK(ped, true); // the combat task sticks so he can't drop into flee / cower
 }
@@ -1473,7 +1485,10 @@ static void UpdateHumanTarget(Ped ped, const ContractDef& def)
 	observation.provoked = C.damagedByPlayer || PlayerProvoked(ped);
 	observation.nativeInCombat = PED::IS_PED_IN_COMBAT(ped, pedMe) != 0;
 	int taskStatus = TASK::GET_SCRIPT_TASK_STATUS(ped, joaat("SCRIPT_TASK_COMBAT"), true);
-	observation.combatTaskActive = observation.nativeInCombat || taskStatus == 0 || taskStatus == 1;
+	const bool inScenario = PED::IS_PED_USING_ANY_SCENARIO(ped) || PED::IS_PED_SITTING(ped);
+	const bool stuck = (inScenario || taskStatus == 0) &&
+		TargetAI::Elapsed(observation.nowMs, C.combatRequestMs) >= Tune::kCombatSettleMs;
+	observation.combatTaskActive = !stuck && (observation.nativeInCombat || taskStatus == 0 || taskStatus == 1);
 	observation.canAct = !PED::IS_PED_RAGDOLL(ped) && !TASK::IS_PED_GETTING_UP(ped) &&
 		!PED::IS_PED_HOGTIED(ped) && !PED::IS_PED_BEING_HOGTIED(ped) && !PED::IS_PED_LASSOED(ped);
 	TargetAI::Decision decision = TargetAI::Step(C.ai, config, observation);
@@ -1485,6 +1500,8 @@ static void UpdateHumanTarget(Ped ped, const ContractDef& def)
 	case TargetAI::Action::Search:
 		PED::SET_PED_CONFIG_FLAG(ped, 233, false);
 		PED::SET_PED_COMBAT_ATTRIBUTES(ped, 5, false);
+		if (inScenario && !PED::SET_PED_SHOULD_PLAY_DIRECTED_NORMAL_SCENARIO_EXIT(ped, C.lastKnownPlayerPos))
+			PED::SET_PED_SHOULD_PLAY_IMMEDIATE_SCENARIO_EXIT(ped);
 		TASK::TASK_GO_TO_COORD_ANY_MEANS(ped, C.lastKnownPlayerPos, 1.5f, 0, false, 0, 0.0f);
 		break;
 	case TargetAI::Action::Wander: StartWander(ped, def); break;

@@ -19,16 +19,15 @@ static const char* ObserveRoutineDebugActivity(RoutineDebugView::Snapshot& snaps
     if (C.ai.state == TargetAI::State::Engaged) return "Fighting";
     if (C.ai.state == TargetAI::State::Search) return "Searching for player";
     if (C.ai.pendingEngagement) return "Preparing to fight";
-    const int combat = TASK::GET_SCRIPT_TASK_STATUS(ped, joaat("SCRIPT_TASK_COMBAT"), true);
-    if (combat == 0 || combat == 1) return "Fighting";
+    if (snapshot.combatTaskStatus == 0 || snapshot.combatTaskStatus == 1) return "Fighting";
     // Mirror the AI bridge: the player's stale native combat flag alone does not
     // undo a completed search or prove that the target is currently fighting.
-    if (PED::IS_PED_IN_COMBAT(ped, 0) && !PED::IS_PED_IN_COMBAT(ped, pedMe)) return "Fighting another actor";
+    if (PED::IS_PED_IN_COMBAT(ped, 0) && !snapshot.nativeCombat) return "Fighting another actor";
     if (PED::IS_PED_IN_ANY_VEHICLE(ped, false)) return "In a vehicle";
     if (!snapshot.loaded) return "Paused: area not loaded";
     if (R.controller.state == Routine::State::Suspended) return "Routine paused";
     if (R.selectPending || R.resumeRequested) return "Choosing destination";
-    if (PED::IS_PED_USING_ANY_SCENARIO(ped))
+    if (snapshot.inScenario)
     {
         snapshot.taskActive = RoutineTaskActive(ped);
         if (PED::IS_PED_USING_SCENARIO_HASH(ped, Joaat("WORLD_HUMAN_SMOKE"))) return "Smoking (ambient)";
@@ -63,6 +62,12 @@ static RoutineDebugView::Snapshot ObserveRoutineDebug()
     snapshot.x = target.x; snapshot.y = target.y; snapshot.z = target.z;
     snapshot.targetDead = snapshot.targetDead || PED::IS_PED_DEAD_OR_DYING(C.target, true) != 0;
     if (snapshot.targetDead) return snapshot;
+    // Sample evidence before priority labels can return: policy engagement alone
+    // does not prove that combat is performing or that a seated target stood up.
+    snapshot.combatTaskStatus = TASK::GET_SCRIPT_TASK_STATUS(C.target, joaat("SCRIPT_TASK_COMBAT"), true);
+    snapshot.nativeCombat = PED::IS_PED_IN_COMBAT(C.target, pedMe) != 0;
+    snapshot.inScenario = PED::IS_PED_USING_ANY_SCENARIO(C.target) != 0;
+    snapshot.seated = PED::IS_PED_SITTING(C.target) != 0;
     if (!routine) { snapshot.doing = "No town routine"; return snapshot; }
     snapshot.loaded = RoutineSpawn::Loaded(target);
     snapshot.inside = INTERIOR::GET_INTERIOR_FROM_COLLISION(target) != 0 || !INTERIOR::IS_COLLISION_MARKED_OUTSIDE(target);

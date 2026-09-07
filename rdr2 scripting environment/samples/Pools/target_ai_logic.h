@@ -40,6 +40,7 @@ struct Memory
     std::uint64_t lastContactMs = 0;
     std::uint64_t stateSinceMs = 0;
     std::uint64_t lastTaskIssuedMs = 0;
+    bool hasIssuedCombatTask = false;
     std::uint64_t taskMissingSinceMs = 0;
     bool taskMissing = false;
     bool previousNativeCombat = false;
@@ -86,9 +87,15 @@ inline Decision Step(Memory& memory, const Config& config, const Observation& ob
             memory.pendingEngagement = false;
             memory.lastContactMs = observation.nowMs;
             memory.stateSinceMs = observation.nowMs;
-            memory.lastTaskIssuedMs = observation.nowMs;
             memory.taskMissing = false;
-            decision.action = observation.nativeInCombat ? Action::AdoptCombat : Action::Engage;
+            // Adoption trusts an engine task for a standing ped; the bridge issues
+            // combat itself when the ped is still sitting or using a scenario.
+            decision.action = nativeCombatStarted ? Action::AdoptCombat : Action::Engage;
+            if (decision.action == Action::Engage)
+            {
+                memory.lastTaskIssuedMs = observation.nowMs;
+                memory.hasIssuedCombatTask = true;
+            }
             return decision;
         }
 
@@ -130,9 +137,10 @@ inline Decision Step(Memory& memory, const Config& config, const Observation& ob
         memory.taskMissingSinceMs = observation.nowMs;
     }
     if (Elapsed(observation.nowMs, memory.taskMissingSinceMs) >= config.taskDropGraceMs &&
-        Elapsed(observation.nowMs, memory.lastTaskIssuedMs) >= config.taskRetryMs)
+        (!memory.hasIssuedCombatTask || Elapsed(observation.nowMs, memory.lastTaskIssuedMs) >= config.taskRetryMs))
     {
         memory.lastTaskIssuedMs = observation.nowMs;
+        memory.hasIssuedCombatTask = true;
         memory.taskMissing = false;
         decision.action = Action::Engage;
         decision.taskRecovery = true;

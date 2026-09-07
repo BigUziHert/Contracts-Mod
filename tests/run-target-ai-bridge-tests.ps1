@@ -13,7 +13,7 @@ New-Item -ItemType Directory -Path $bountyOutput -Force | Out-Null
 $bountySource = [IO.File]::ReadAllText($bountySourcePath)
 $bountyData = [IO.File]::ReadAllText($bountyDataPath)
 $bountyHeader = @('#pragma once', '// Generated from production source; do not edit.', 'namespace Tune {')
-foreach ($bountyConstant in @('kArmedChancePct', 'kGunVsKnifePct', 'kReAggroSightDist', 'kRetainSightDist', 'kDeAggroGraceMs', 'kTargetSearchMs')) {
+foreach ($bountyConstant in @('kArmedChancePct', 'kGunVsKnifePct', 'kReAggroSightDist', 'kRetainSightDist', 'kDeAggroGraceMs', 'kTargetSearchMs', 'kCombatSettleMs')) {
     $bountyMatches = [regex]::Matches($bountyData, ('constexpr\s+\w+\s+' + $bountyConstant + '\s*=[^;]+;'))
     if ($bountyMatches.Count -ne 1) { throw "Expected exactly one production constant: $bountyConstant" }
     $bountyHeader += $bountyMatches[0].Value

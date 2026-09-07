@@ -61,11 +61,12 @@ struct World
     int minute = 600;
     bool exists = true, dead = false, loaded = true, inside = false;
     bool hogtied = false, hogtying = false, lassoed = false, ragdoll = false, gettingUp = false;
-    bool combatAnyone = false, combatPlayer = false, vehicle = false;
+    bool combatAnyone = false, combatPlayer = false, vehicle = false, sitting = false;
     Hash usingScenario = 0;
     int combatStatus = 7, routineStatus = 0;
     Vector3 player{}, target{3, 4, 0};
     unsigned coordinates = 0, deathReads = 0, liveReads = 0, clockReads = 0;
+    unsigned combatTaskReads = 0, combatPlayerReads = 0, scenarioReads = 0, seatedReads = 0;
     unsigned markerUpdates = 0, markerClears = 0, drawCalls = 0, keySamples = 0;
     bool markerHasSpawn = false, markerHasDestination = false, releasedF8 = false;
 } w;
@@ -94,10 +95,17 @@ static bool IS_PED_HOGTIED(Ped ped) { ReadLiving(ped); return w.hogtied; }
 static bool IS_PED_BEING_HOGTIED(Ped ped) { ReadLiving(ped); return w.hogtying; }
 static bool IS_PED_LASSOED(Ped ped) { ReadLiving(ped); return w.lassoed; }
 static bool IS_PED_RAGDOLL(Ped ped) { ReadLiving(ped); return w.ragdoll; }
-static bool IS_PED_IN_COMBAT(Ped ped, Ped other) { ReadLiving(ped); return other == 0 ? w.combatAnyone : w.combatPlayer; }
+static bool IS_PED_IN_COMBAT(Ped ped, Ped other)
+{
+    ReadLiving(ped);
+    if (other == 0) return w.combatAnyone;
+    Check(other == pedMe, "combat evidence queries the current player");
+    ++w.combatPlayerReads; return w.combatPlayer;
+}
 static bool IS_PED_IN_ANY_VEHICLE(Ped ped, bool) { ReadLiving(ped); return w.vehicle; }
 static bool IS_PED_USING_SCENARIO_HASH(Ped ped, Hash hash) { ReadLiving(ped); return hash != 0 && w.usingScenario == hash; }
-static bool IS_PED_USING_ANY_SCENARIO(Ped ped) { ReadLiving(ped); return w.usingScenario != 0; }
+static bool IS_PED_USING_ANY_SCENARIO(Ped ped) { ReadLiving(ped); ++w.scenarioReads; return w.usingScenario != 0; }
+static bool IS_PED_SITTING(Ped ped) { ReadLiving(ped); ++w.seatedReads; return w.sitting; }
 }
 namespace TASK
 {
@@ -105,7 +113,8 @@ static bool IS_PED_GETTING_UP(Ped ped) { ReadLiving(ped); return w.gettingUp; }
 static int GET_SCRIPT_TASK_STATUS(Ped ped, Hash task, bool)
 {
     ReadLiving(ped);
-    return task == Joaat("SCRIPT_TASK_COMBAT") ? w.combatStatus : w.routineStatus;
+    if (task != Joaat("SCRIPT_TASK_COMBAT")) return w.routineStatus;
+    ++w.combatTaskReads; return w.combatStatus;
 }
 }
 namespace RoutineSpawn { static bool Loaded(Vector3) { ReadLiving(C.target); return w.loaded; } }
@@ -214,6 +223,43 @@ static void PriorityAndScenarioLabels()
     Check(Activity() == "Wander task pending / recovery", "missing wander task is visible");
     w.routineStatus = 1; Check(Activity() == "Wandering near destination", "active wander task has the correct label");
 }
+static void CombatEvidenceBeforePriority()
+{
+    struct Priority { TargetAI::State state; bool pending, hogtied, routine; const char* label; };
+    for (const auto& priority : std::array<Priority, 5>{{
+        {TargetAI::State::Engaged, false, false, true, "Fighting"},
+        {TargetAI::State::Search, false, false, true, "Searching for player"},
+        {TargetAI::State::Wander, true, false, true, "Preparing to fight"},
+        {TargetAI::State::Engaged, false, true, true, "Hogtied"},
+        {TargetAI::State::Engaged, false, false, false, "No town routine"}}})
+    {
+        Fixture(); C.ai.state = priority.state; C.ai.pendingEngagement = priority.pending;
+        w.hogtied = priority.hogtied; R.enabled = priority.routine;
+        w.combatStatus = 0; w.combatPlayer = true;
+        w.usingScenario = Joaat("WORLD_HUMAN_STARE_STOIC"); w.sitting = true;
+        const auto snapshot = ObserveRoutineDebug();
+        Check(std::strcmp(snapshot.doing, priority.label) == 0, "combat evidence preserves the existing activity priority");
+        Check(snapshot.combatTaskStatus == 0 && snapshot.nativeCombat && snapshot.inScenario && snapshot.seated,
+            "queued combat and both physical-state flags are captured before priority returns");
+        Check(w.combatTaskReads == 1 && w.combatPlayerReads == 1 && w.scenarioReads == 1 && w.seatedReads == 1,
+            "priority snapshot samples each combat evidence source exactly once");
+        const auto lines = RoutineDebugView::Format(snapshot);
+        if (priority.routine && !priority.hogtied)
+            Check(lines[3].find("[task 0, engine Y, SCENARIO, SEATED]") != std::string::npos,
+                "priority display exposes queued combat despite an engine combat flag and a seated target");
+        else Check(lines[3].find("[task") == std::string::npos, "restraint and absent-routine labels keep their own meaning");
+    }
+    Fixture(); C.ai.state = TargetAI::State::Engaged; w.combatStatus = 1;
+    auto snapshot = ObserveRoutineDebug();
+    Check(snapshot.combatTaskStatus == 1 && !snapshot.nativeCombat && !snapshot.inScenario && !snapshot.seated,
+        "standing active-task evidence remains independent of the engine combat flag");
+    Check(RoutineDebugView::Format(snapshot)[3] == "Doing: Fighting [task 1, engine N]",
+        "standing combat omits inactive scenario and seated flags");
+    w.combatStatus = 7; w.sitting = true;
+    snapshot = ObserveRoutineDebug();
+    Check(snapshot.combatTaskStatus == 7 && snapshot.seated && !snapshot.inScenario,
+        "sitting without a reported scenario and a missing combat task remain observable");
+}
 static void ScheduleAndReadOnlySnapshot()
 {
     struct Case { int minute, offset, nextMinute, nextPhase; };
@@ -268,6 +314,7 @@ static void SamplingRenderingAndEarlyToggle()
 }
 int main()
 {
-    ExistenceDeathAndFreshCoordinates(); PriorityAndScenarioLabels(); ScheduleAndReadOnlySnapshot(); SamplingRenderingAndEarlyToggle();
+    ExistenceDeathAndFreshCoordinates(); PriorityAndScenarioLabels(); CombatEvidenceBeforePriority();
+    ScheduleAndReadOnlySnapshot(); SamplingRenderingAndEarlyToggle();
     std::printf("Routine debug bridge: %u checks passed.\n", checks);
 }

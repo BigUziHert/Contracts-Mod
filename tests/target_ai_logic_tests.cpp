@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <initializer_list>
 
 using namespace TargetAI;
 
@@ -186,6 +187,59 @@ static void ContactResetsLossGraceAndSearchReacquires()
         "clock rollback cannot underflow into immediate disengagement");
 }
 
+static void AdoptionDoesNotDelayFirstScriptedRecovery()
+{
+    const Config config;
+    Memory memory;
+    Observation observation = Observe(0, 10.0f, true);
+    observation.nativeInCombat = observation.combatTaskActive = true;
+    Check(Step(memory, config, observation).action == Action::AdoptCombat,
+        "a fresh engine combat edge at clock zero is adopted");
+    Check(!memory.hasIssuedCombatTask && memory.lastTaskIssuedMs == 0,
+        "adoption never records a scripted task that was not issued");
+    observation.nowMs = 200;
+    observation.nativeInCombat = observation.combatTaskActive = false;
+    Check(Step(memory, config, observation).action == Action::None, "dropped native adoption starts absence grace");
+    observation.nowMs = 1199;
+    Check(Step(memory, config, observation).action == Action::None, "adopted combat still receives full absence grace");
+    observation.nowMs = 1200;
+    Decision decision = Step(memory, config, observation);
+    Check(decision.action == Action::Engage && decision.taskRecovery && memory.lastTaskIssuedMs == 1200,
+        "first real recovery follows the one-second grace without a fictitious previous-task delay");
+    observation.nowMs = 1201;
+    Step(memory, config, observation);
+    observation.nowMs = 4199;
+    Check(Step(memory, config, observation).action == Action::None, "actual recovery starts the full retry interval");
+    observation.nowMs = 4200;
+    Check(Step(memory, config, observation).taskRecovery, "later recovery remains limited to one task per three seconds");
+}
+
+static void ReacquisitionUsesOnlyFreshNativeCombatEdges()
+{
+    const Config config;
+    for (bool fresh : { false, true })
+    {
+        Memory memory;
+        memory.remembersPlayer = true;
+        memory.previousNativeCombat = !fresh;
+        memory.lastTaskIssuedMs = 17;
+        Observation observation = Observe(500, 10.0f, true);
+        observation.nativeInCombat = observation.combatTaskActive = true;
+        const Decision decision = Step(memory, config, observation);
+        Check(decision.action == (fresh ? Action::AdoptCombat : Action::Engage),
+            "remembered sight issues combat for a stale flag and adopts only a fresh native edge");
+        Check(memory.lastTaskIssuedMs == (fresh ? 17u : 500u),
+            "only a scripted engagement changes the actual task timestamp");
+    }
+
+    Memory memory;
+    memory.previousNativeCombat = true;
+    Observation observation = Observe(500, 70.0f);
+    observation.nativeInCombat = observation.provoked = true;
+    Check(Step(memory, config, observation).action == Action::Engage,
+        "fresh provocation with a stale combat flag issues a real task even without sight");
+}
+
 int main()
 {
     NormalEncounterAndEscape();
@@ -193,5 +247,7 @@ int main()
     TaskRecoveryIsDebouncedAndThrottled();
     TemporaryIncapacitationAndNativeCombat();
     ContactResetsLossGraceAndSearchReacquires();
-    std::puts("Target AI policy: 5 scenario groups passed.");
+    AdoptionDoesNotDelayFirstScriptedRecovery();
+    ReacquisitionUsesOnlyFreshNativeCombatEdges();
+    std::puts("Target AI policy: 7 scenario groups passed.");
 }

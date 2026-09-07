@@ -14,6 +14,8 @@ struct Snapshot
     bool active = false, targetExists = false, targetDead = false;
     bool hasDestination = false, fallback = false, destinationOpen = false, destinationValid = false;
     bool loaded = false, taskActive = false, inside = false;
+    bool nativeCombat = false, inScenario = false, seated = false;
+    int combatTaskStatus = 7;
     int minute = 0, nextMinute = -1;
     float playerDistance = 0, destinationDistance = 0, wanderRadius = 0;
     float x = 0, y = 0, z = 0;
@@ -84,7 +86,17 @@ inline Lines Format(const Snapshot& snapshot)
         return lines;
     }
     lines[2] = "Target: " + Number(snapshot.playerDistance) + " m away";
-    lines[3] = "Doing: " + Label(snapshot.doing, 36, "Waiting");
+    const std::string doing = Label(snapshot.doing, 36, "Waiting");
+    lines[3] = "Doing: " + doing;
+    if (doing == "Fighting" || doing == "Searching for player" || doing == "Preparing to fight")
+    {
+        // Keep raw native status visible (0 queued, 1 running, 7 absent) while
+        // bounding unexpected values and preserving both physical-state flags.
+        const std::string task = snapshot.combatTaskStatus >= 0 && snapshot.combatTaskStatus <= 7
+            ? std::to_string(snapshot.combatTaskStatus) : "?";
+        lines[3] += " [task " + task + ", engine " + (snapshot.nativeCombat ? "Y" : "N") +
+            (snapshot.inScenario ? ", SCENARIO" : "") + (snapshot.seated ? ", SEATED" : "") + "]";
+    }
     lines[4] = snapshot.hasDestination
         ? "Stop: " + Label(snapshot.destination, 24, "None") + (snapshot.fallback ? " [fallback]" : "") +
             " | " + Number(snapshot.destinationDistance) + " m"

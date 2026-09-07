@@ -49,6 +49,35 @@ int main()
     Check(lines[7] == "Wander: 26.0 m | Outdoors", "wander radius is separate from interior status");
     Check(lines[8] == "Loaded Y | Routine Y | Open Y | Valid Y", "native and destination validity states stay distinct");
     Check(lines[9] == "XYZ: -269.8, 785.4, 118.5", "coordinates preserve signs and bounded readable precision");
+    Check(snapshot.combatTaskStatus == 7 && !snapshot.nativeCombat && !snapshot.inScenario && !snapshot.seated,
+        "unobserved combat evidence defaults to no task or active native state");
+    for (const char* doing : {"Fighting", "Searching for player", "Preparing to fight"})
+    {
+        snapshot = Live(); snapshot.doing = doing; snapshot.combatTaskStatus = 0;
+        snapshot.nativeCombat = snapshot.inScenario = snapshot.seated = true;
+        lines = Format(snapshot);
+        Check(lines[3] == std::string("Doing: ") + doing + " [task 0, engine Y, SCENARIO, SEATED]",
+            "combat priorities display queued task, engine flag, scenario and seated evidence together");
+        Check(lines[3].size() <= 64, "longest combat evidence label stays within a readable bounded row");
+        snapshot.combatTaskStatus = 1; snapshot.inScenario = snapshot.seated = false;
+        Check(Format(snapshot)[3] == std::string("Doing: ") + doing + " [task 1, engine Y]",
+            "running combat evidence omits inactive physical-state flags");
+        snapshot.combatTaskStatus = 7; snapshot.nativeCombat = false; snapshot.inScenario = true;
+        Check(Format(snapshot)[3] == std::string("Doing: ") + doing + " [task 7, engine N, SCENARIO]",
+            "scenario without a seat or combat task remains visible");
+        snapshot.inScenario = false; snapshot.seated = true;
+        Check(Format(snapshot)[3] == std::string("Doing: ") + doing + " [task 7, engine N, SEATED]",
+            "sitting without a scenario remains independently visible");
+        for (int invalid : {INT_MIN, -1, 8, INT_MAX})
+        {
+            snapshot.combatTaskStatus = invalid;
+            Check(Format(snapshot)[3] == std::string("Doing: ") + doing + " [task ?, engine N, SEATED]",
+                "unexpected task status remains explicit and cannot expand the compact row");
+        }
+    }
+    snapshot = Live(); snapshot.combatTaskStatus = 0; snapshot.nativeCombat = snapshot.inScenario = snapshot.seated = true;
+    Check(Format(snapshot)[3] == "Doing: Walking", "routine labels do not append irrelevant combat evidence");
+    snapshot = Live();
     snapshot.fallback = true; snapshot.inside = true;
     lines = Format(snapshot);
     Check(Contains(lines, "[fallback]") && Contains(lines, "Indoors"), "fallback and indoor location are labelled explicitly");
