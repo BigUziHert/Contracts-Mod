@@ -93,6 +93,7 @@ static void CollectStartupTrace(const StartupTrace::Event& event)
 }
 
 static ULONGLONG GetTickCount64() { return world.nowMs; }
+static void MaintainCardInspectionCamera() {} // Its production bridge has a dedicated native-shim suite.
 static void MaintainPortraitAndCard() { ++world.maintenance; }
 static void WAIT(DWORD delay)
 {

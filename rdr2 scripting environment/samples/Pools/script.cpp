@@ -394,6 +394,7 @@ static void ResetPrompt(Prompt prompt)
 	HUD::_UI_PROMPT_RESTART_MODES(prompt);
 }
 
+static void MaintainCardInspectionCamera();
 static void MaintainPortraitAndCard();
 static void ApplyCardCustomTexture();
 static void RefreshCardTextureAfterTransition();
@@ -407,6 +408,7 @@ template<typename Pred> static bool WaitUntil(DWORD timeoutMs, Pred pred)
 		MaintainOwnedPedCleanup();
 		SetRuntimePaused(!PlayerAvailable() || HUD::IS_PAUSE_MENU_ACTIVE() || CAMERA::IS_SCREEN_FADED_OUT());
 		if (!PlayerAvailable()) return false;
+		MaintainCardInspectionCamera();
 		MaintainPortraitAndCard();
 		if (pred()) return true;
 		if (GetTickCount64() >= deadline) return false;
@@ -1022,6 +1024,22 @@ static bool OwnCardTaskRunning()
 	return Cd.inspectingPed && ENTITY::DOES_ENTITY_EXIST(Cd.inspectingPed) && Cd.obj &&
 		TASK::IS_PED_RUNNING_TASK_ITEM_INTERACTION(Cd.inspectingPed) &&
 		TASK::_GET_ITEM_INTERACTION_ENTITY_FROM_PED(Cd.inspectingPed, Card::kPrimaryItem) == Cd.obj;
+}
+
+// Camera framing candidate: borrowed-document inspections exclude their prop from
+// gameplay-camera collision (beat_murder_campfire.c:1245). Preserve native posing;
+// this only protects our pending owned prop or the current matching inspection.
+static void MaintainCardInspectionCamera()
+{
+	if (!Cd.obj || !Cd.inspectingPed || Cd.inspectingPed != pedMe || !PlayerAvailable() ||
+		!ENTITY::DOES_ENTITY_EXIST(Cd.obj)) return;
+	if (TASK::IS_PED_RUNNING_TASK_ITEM_INTERACTION(pedMe))
+	{
+		if (!OwnCardTaskRunning()) return;
+	}
+	else if (!Cd.ownsObj || Cd.examining) return;
+	ENTITY::SET_ENTITY_COLLISION(Cd.obj, false, false);
+	CAMERA::SET_GAMEPLAY_CAM_IGNORE_ENTITY_COLLISION_THIS_UPDATE(Cd.obj);
 }
 
 static void DestroyCardObject(bool cancelInspection = false)
@@ -2283,6 +2301,7 @@ void ScriptMain()
 		// re-triggering aggression through walls for the rest of the contract.
 		if (C.damagedByPlayer && TargetExists()) ENTITY::CLEAR_ENTITY_LAST_DAMAGE_ENTITY(C.target);
 		C.damagedByPlayer = false;
+		MaintainCardInspectionCamera();
 		UpdateRoutineDebug();
 		UpdateCard(); // render-target drawing must remain last
 		WAIT(0);

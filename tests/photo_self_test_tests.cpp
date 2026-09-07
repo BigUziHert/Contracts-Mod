@@ -69,6 +69,7 @@ namespace HUD { static bool IS_PAUSE_MENU_ACTIVE() { return false; } }
 namespace CAMERA { static bool IS_SCREEN_FADED_OUT() { return false; } }
 static bool PlayerAvailable() { return world.playerAvailable; }
 static void MaintainOwnedPedCleanup() {}
+static void MaintainCardInspectionCamera() {} // Its production bridge has a dedicated native-shim suite.
 static void MaintainPortraitAndCard()
 {
     Check(!C.photoTexture[0], "reopen waits do not expose an accepted name to normal handle maintenance");

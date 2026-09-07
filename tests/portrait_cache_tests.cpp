@@ -356,6 +356,7 @@ static void SET_CUSTOM_TEXTURES_ON_OBJECT(Object obj, Hash texture, int p2, int 
 }
 }
 
+static void MaintainCardInspectionCamera() {} // Its production bridge has a dedicated native-shim suite.
 static void MaintainPortraitAndCard();
 static void ApplyCardCustomTexture();
 static void RefreshCardTextureAfterTransition();

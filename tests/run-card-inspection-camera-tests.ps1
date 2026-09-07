@@ -1,0 +1,59 @@
+param(
+    [string]$VisualStudio = 'C:\Program Files\Microsoft Visual Studio\2022\Community'
+)
+
+$ErrorActionPreference = 'Stop'
+$bountyRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$bountyOutput = Join-Path $bountyRoot 'tmp\tests'
+$bountyVcVars = Join-Path $VisualStudio 'VC\Auxiliary\Build\vcvars64.bat'
+if (-not (Test-Path -LiteralPath $bountyVcVars)) { throw 'Visual Studio C++ tools not found.' }
+New-Item -ItemType Directory -Path $bountyOutput -Force | Out-Null
+$bountySourcePath = Join-Path $bountyRoot 'rdr2 scripting environment\samples\Pools\script.cpp'
+$bountyDataPath = Join-Path $bountyRoot 'rdr2 scripting environment\samples\Pools\contract_data.h'
+$bountySource = [IO.File]::ReadAllText($bountySourcePath)
+$bountyData = [IO.File]::ReadAllText($bountyDataPath)
+$bountyHeader = @('#pragma once', '// Extracted production card collision/camera maintenance; do not edit.', 'namespace Card {')
+$bountyMatches = [regex]::Matches($bountyData, 'constexpr\s+Hash\s+kPrimaryItem\s*=[^;]+;')
+if ($bountyMatches.Count -ne 1) { throw 'Expected exactly one production primary-item constant.' }
+$bountyHeader += $bountyMatches[0].Value
+$bountyHeader += '}'
+foreach ($bountyPattern in @(
+    '(?ms)^struct CardRuntime\s*\{.*?^\};',
+    '(?m)^static CardRuntime\s+Cd;',
+    '(?m)^static bool LivingPed\(Ped ped\)[^\r\n]+',
+    '(?m)^static bool PlayerAvailable\(\)[^\r\n]+',
+    '(?ms)^static bool OwnCardTaskRunning\(\)\s*\{.*?^\}',
+    '(?ms)^static void MaintainCardInspectionCamera\(\)\s*\{.*?^\}',
+    '(?ms)^template<typename Pred> static bool WaitUntil\(DWORD timeoutMs, Pred pred\)\s*\{.*?^\}'
+)) {
+    $bountyMatches = [regex]::Matches($bountySource, $bountyPattern)
+    if ($bountyMatches.Count -ne 1) { throw "Expected exactly one production card declaration matching: $bountyPattern" }
+    $bountyLine = 1 + ([regex]::Matches($bountySource.Substring(0, $bountyMatches[0].Index), '\n')).Count
+    $bountyHeader += '#line {0} "{1}"' -f $bountyLine, $bountySourcePath.Replace('\', '/')
+    $bountyHeader += $bountyMatches[0].Value
+}
+$bountyWait = [regex]::Matches($bountySource, '(?ms)^template<typename Pred> static bool WaitUntil\(DWORD timeoutMs, Pred pred\)\s*\{.*?^\}')
+if ([regex]::Matches($bountyWait[0].Value, 'MaintainCardInspectionCamera\(\);\s*MaintainPortraitAndCard\(\);').Count -ne 1) {
+    throw 'Startup wait must protect card collision before portrait maintenance.'
+}
+$bountyMain = [regex]::Matches($bountySource, '(?ms)^void ScriptMain\(\)\s*\{.*?^\}')
+if ($bountyMain.Count -ne 1) { throw 'Expected exactly one ScriptMain for card camera integration.' }
+$bountyTail = [regex]::Matches($bountyMain[0].Value,
+    '(?s)(?<calls>MaintainCardInspectionCamera\(\);\s*UpdateRoutineDebug\(\);\s*UpdateCard\(\);[^\r\n]*\s*WAIT\(0\);)\s*\}\s*\}$')
+if ($bountyTail.Count -ne 1) { throw 'Card camera maintenance must preserve the final protected debug/card/WAIT tail.' }
+$bountyHeader += 'static void RunProductionCardFrameTail() {'
+$bountyHeader += $bountyTail[0].Groups['calls'].Value
+$bountyHeader += '}'
+[IO.File]::WriteAllText((Join-Path $bountyOutput 'card_inspection_camera_under_test.h'), ($bountyHeader -join "`r`n"))
+$bountyCommands = @('@echo off', ('call "{0}" >nul' -f $bountyVcVars), 'if errorlevel 1 exit /b 1')
+$bountyCommands += 'cl /nologo /std:c++20 /EHsc /W4 /WX /MT /Od /I"{0}" /Fo"{1}" /Fe"{2}" "{3}"' -f `
+    $bountyOutput, (Join-Path $bountyOutput 'card_inspection_camera_tests.obj'), (Join-Path $bountyOutput 'card_inspection_camera_tests.exe'), `
+    (Join-Path $PSScriptRoot 'card_inspection_camera_tests.cpp')
+$bountyCommands += 'if errorlevel 1 exit /b 1'
+$bountyCommands += '"' + (Join-Path $bountyOutput 'card_inspection_camera_tests.exe') + '"'
+$bountyCommands += 'if errorlevel 1 exit /b 1'
+$bountyCommands += 'exit /b 0'
+$bountyCommandFile = Join-Path $bountyOutput 'run-card-inspection-camera-tests.cmd'
+[IO.File]::WriteAllLines($bountyCommandFile, $bountyCommands, [Text.Encoding]::Default)
+& $env:ComSpec /d /c $bountyCommandFile
+if ($LASTEXITCODE -ne 0) { throw 'Card inspection camera regression tests failed.' }

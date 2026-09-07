@@ -234,6 +234,7 @@ static bool IS_PED_RUNNING_TASK_ITEM_INTERACTION(Ped ped)
 }
 // This suite exercises the real probe's polling and retirement conditions. OpenCard/UpdateCard
 // are boundary stubs so material maintenance remains covered without reproducing native tasks.
+static void MaintainCardInspectionCamera() {} // Its production bridge has a dedicated native-shim suite.
 static void RefreshCardTextureAfterTransition();
 static unsigned photoSlotMarks = 0;
 static void MarkPhotoSlotBound() { ++photoSlotMarks; } // the portrait cache suite covers the real slot bookkeeping
