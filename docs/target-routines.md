@@ -24,17 +24,22 @@ sphere loading; `rcm_beau_and_penelope21.c:38953,38978` for nav-region requests.
 Every called native exists in the bundled `inc/natives.h`.
 
 Initial preparation tries five small offsets per location, with a three-second collision/
-navigation budget. It tries the current phase's selected site, then its authored all-day
-fallback. It never starts a scene request over an already active one and stops a request
+navigation budget. It tries the current phase's selected site, its authored all-day
+fallback, other compatible current-phase/Rest sites in the town, then other towns.
+A pass tries at most eight distinct sites and stops starting new attempts after six
+seconds; a streaming wait already underway can finish its bounded three-second wait.
+An accepted alternate replaces the corresponding route entry before the card is prepared.
+It never starts a scene request over an already active one and stops a request
 only if its own start succeeded. The API has no ownership handle: replacement by another
 script during a yield cannot be distinguished, and remains an engine integration risk.
 Navigation-region requests have no removal handle in this SDK.
 
 Preparation happens before replacing the current hunt. Failure there preserves that hunt.
 After successful portrait capture, the prepared point is checked again before the hidden
-provisional target is deployed and revealed. Failure cleans up its ped and portrait and
-issues no card. That later failure can leave no active hunt, as with existing portrait
-failure. Revalidation checks the saved point directly instead of selecting another nav
+provisional target is deployed and revealed. Rejection cleans up its ped and portrait;
+the request remains pending and automatically retries after cleanup, rather than asking
+the player to request a contract again. That later rejection can temporarily leave no
+active hunt while the replacement is prepared. Revalidation checks the saved point directly instead of selecting another nav
 coordinate and requiring the two answers to match. Already loaded destinations do not
 start another scene request. The hidden ped regains collision and physics before a
 bounded 1.5-second placement wait, with at most one ground-placement attempt per 100 ms.
@@ -48,20 +53,23 @@ line identifying the stage, location, failed check and expected/actual coordinat
 See [the placement fix report](routine-spawn-fix-2026-09-06.md) for the regression evidence.
 
 The generated definition lives in stable runtime storage; the existing cleanup hook resets
-its plan and controller. Portrait generation, download ownership, slot rotation and all
-clerk/payment paths retain their existing implementation.
+its plan and controller. Portrait generation, download ownership, slot rotation and the
+card/handoff/payment implementations are retained. Clerk and remote requests share a
+single pending-request handler, which delivers through the existing handoff/card flow
+after success. See [retry behavior and engine limits](routine-radius-and-startup-2026-09-07.md).
 
-## Separate areas
+## Search, wander and spawn areas
 
-- Town search: a fixed 180–310 m investigation circle covering the curated sites and their
-  wandering areas. It does not follow the target or disclose its selected destination.
+- Search: a 35 m circle around the current validated routine destination. It moves when
+  a new valid stop is assigned, using the same blip; it does not follow individual steps.
 - Candidate radius: 4–12 m around a sourced coordinate, used only for validation.
-- Wander radius: 12–26 m around a fixed validated destination point.
-- Discovery: 45 m plus existing aim/LOS rules; direct interaction, damage or combat still
-  discovers the target. Broadening the search circle does not broaden aim discovery.
+- Wander radius: 35 m around that same fixed validated destination point, from the shared
+  `RoutineData::kWanderRadius` constant. Travel between stops can extend outside the circle.
+- Aim discovery: 35 m from the target plus LOS; direct interaction, damage or combat still
+  discovers the target. Combat's 45 m reacquisition and 55 m retention ranges are unchanged.
 
-`ContractDef::searchRadius` remains a legacy field; generated definitions use it for
-the 45 m discovery threshold. Routine search and wander do not consume it.
+Generated definitions set `ContractDef::searchRadius` to the same 35 m radius. The native
+wander task and map circle use the accepted destination's matching value.
 
 ## Availability policy
 
@@ -73,13 +81,14 @@ venue activities require separately verified opening, active event and seat avai
 
 ## Extension points
 
-Add a town's search centre/radius and sourced `Location` rows, each with a unique id,
-occupation mask, phase, bounded candidate/height/wander dimensions and a source reference.
+Add a town's reference anchor and sourced `Location` rows, each with a unique id,
+occupation mask, phase, bounded candidate/height dimensions and a source reference.
+Use the shared 35 m wander/search radius for each row.
 Every supported occupation needs one compatible site per phase and an all-day Rest
 fallback. Add matching archetypes in `RoutineModels`; reject unsupported town/role pairs.
 Update `GeneratedOccupation` too: every enabled location must be reachable by an actual
 generated occupation, not merely by a profile that only tests construct. Saint Denis
-generates laborers as well as dock workers so its market/stable day areas are reachable.
+generates laborers as well as dock workers so its market and dock day areas are reachable.
 Never enable construction or interiors merely because a marker exists. Record the world
 state/venue checks first, then add tests and validate the accepted points in game.
 

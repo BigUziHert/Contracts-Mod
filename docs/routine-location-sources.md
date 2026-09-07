@@ -1,8 +1,21 @@
 # Routine location catalog and source evidence
 
-The catalog now contains **63 candidate areas across seven towns**, expanded from the original 27 areas listed below. New source details are in [the existing-town expansion](routine-existing-sites-proposal.md) and [Van Horn and Annesburg](routine-new-towns-proposal.md). `routine_locations.h` keeps a location's source anchor, bounded candidate search area, vertical tolerance, destination wander radius, visiting window, occupation mask and enabled state separate from the town's investigation circle. Source coordinates and owner surveys still require runtime validation and in-game checks. A coordinate in a Rockstar script does not by itself establish a safe outdoor spawn.
+The catalog now contains **60 candidate areas across seven towns**, following the owner's September 7 corrections below. Earlier expansion details are in [the existing-town expansion](routine-existing-sites-proposal.md) and [Van Horn and Annesburg](routine-new-towns-proposal.md). `routine_locations.h` records each source anchor, bounded candidate search area, vertical tolerance, visiting window, occupation mask and enabled state. Every stop has a shared 35 m wander/search radius. Source coordinates and owner surveys still require runtime validation and in-game checks. A coordinate in a Rockstar script does not by itself establish a safe outdoor spawn.
 
-All sources below are the owner's local `RDR3-Decompiled-Scripts-master/1491.50` checkout under `C:/Users/caleb/Desktop/RDR2 Coding`. Anchors copy the source's numerical coordinates exactly; candidate radii, height tolerance, wander radii, role compatibility and visiting windows are this mod's policy. Source volumes frequently describe the **centre of a three-dimensional area**, not ground height. The runtime must establish a ground/navigation point inside the candidate limit and reject water, interiors, another vertical level, occupied geometry or unavailable streaming. No source volume is created, claimed or modified by the catalog.
+The script sources below are the owner's local `RDR3-Decompiled-Scripts-master/1491.50` checkout under `C:/Users/caleb/Desktop/RDR2 Coding`. Script-derived anchors copy their numerical coordinates exactly; the new dock and moved Strawberry street use the owner's coordinates. Candidate radii, height tolerance, wander radius, role compatibility and visiting windows are this mod's policy. Source volumes frequently describe the **centre of a three-dimensional area**, not ground height. The runtime must establish a ground/navigation point inside the candidate limit and reject water, interiors, another vertical level, occupied geometry or unavailable streaming. No source volume is created, claimed or modified by the catalog.
+
+## Owner corrections — September 7, 2026
+
+| Change | Catalogue ID | Anchor (x, y, z) |
+| --- | --- | --- |
+| Remove Van Horn Northwest road | `vht_north_road` | Removed |
+| Remove Rhodes Northern camp | `rhd_north_camp` | Removed |
+| Remove Saint Denis Stable entrance | `sd_stables` | Removed |
+| Remove Strawberry Stable entrance | `str_stable_door` | Removed |
+| Add Saint Denis Eastern dock approach | `sd_docks_east` | `2822, -1415, 45.5` |
+| Move Strawberry South-loop street | `str_south_loop` | `-1827, -415, 161` |
+
+The extra dock is a daytime Work destination for dock workers and laborers. Both owner-supplied anchors retain bounded ground, exterior and clearance validation. The earlier proposal documents record the original catalogue; this table and `routine_locations.h` describe the current corrections.
 
 ## Hours and what a visit means
 
@@ -51,7 +64,7 @@ The names are deliberately short for card clues. Ground-level task destinations 
 | `sd_saloon` — slum saloon street | `2813.741, -1182.042, 46.2764` | [rcm_bh_sd_saloon.c:18929](<C:/Users/caleb/Desktop/RDR2 Coding/RDR3-Decompiled-Scripts-master/1491.50/rcm_bh_sd_saloon.c:18929>), explicit navmesh destination outside the saloon interior listed at [saintdenis.c:1984](<C:/Users/caleb/Desktop/RDR2 Coding/RDR3-Decompiled-Scripts-master/1491.50/saintdenis.c:1984>). |
 | `sd_public` — newspaper corner | `2683.454, -1400.018, 46.693` | [saintdenis.c:848](<C:/Users/caleb/Desktop/RDR2 Coding/RDR3-Decompiled-Scripts-master/1491.50/saintdenis.c:848>), named newspaper area. |
 
-Each town's search centre reuses its public/newspaper anchor, except Saint Denis which uses the gunsmith-frontage centre from [saintdenis.c:789](<C:/Users/caleb/Desktop/RDR2 Coding/RDR3-Decompiled-Scripts-master/1491.50/saintdenis.c:789>). The search radii are authored broad investigation areas covering all enabled destination candidates and their wander radii. They are neither spawn polygons nor navigation constraints, and remain fixed instead of following the target.
+The search circle uses the current validated destination and the same 35 m radius as wandering. It moves when a new valid stop is assigned, retaining its blip handle; it does not track the target's individual steps. A target travelling between stops can be outside this circle. The town-level centres remain catalogue reference anchors and no longer position the gameplay search circle.
 
 ## Unmarked places, construction, and missing coverage
 
@@ -64,7 +77,7 @@ The old Strawberry lower-right target had height `115.5`. Nearby source evidence
 ## Adding a location
 
 1. Record the exact source coordinate and its context, then check the place in the game. A map marker, business centre or roof-level volume is not sufficient ground evidence.
-2. Add a unique ID, short card name, town, kind and compatible occupation mask. Keep candidate search bounds small enough to stay on the intended street/yard, with a height tolerance that excludes adjacent floors. Wander radius and town search radius are separate decisions.
+2. Add a unique ID, short card name, town, kind and compatible occupation mask. Keep candidate search bounds small enough to stay on the intended street/yard, with a height tolerance that excludes adjacent floors. Use `RoutineData::kWanderRadius` for the matching wander/search radius.
 3. For a public exterior, label the window as an authored visiting schedule. For an interior or service, establish and implement its real opening, occupancy, mission and world-state conditions before enabling it. Do not present exterior loitering as participation in a service/game/show.
-4. Ensure each supported profile has a truthful day area and the town still has a validated all-day public fallback. If all bounded candidates fail, report a startup/location failure rather than spawn at an unchecked coordinate.
+4. Ensure each supported profile has a truthful day area and the town still has an all-day public fallback candidate. If a location fails validation, try another compatible site or town. Exhausting a bounded pass retains the request for an automatic retry; log rejected candidates without handing out a card for an unprepared target.
 5. Check arrival routes, night/day changes, weather/streaming, occupied frontages, lasso/combat transitions and the player's ability to reach the corpse. Record engine limitations separately from automated scheduling test results.
