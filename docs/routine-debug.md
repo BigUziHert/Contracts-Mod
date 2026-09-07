@@ -41,6 +41,9 @@ update, without changing card render-target selection or portrait code.
 | Loaded / routine / open / valid | Current local collision/navigation residency, observed routine task, the assigned stop's visiting window, and its latest runtime safety result. `Open` is the mod's exterior visiting window, not a shop's business hours. `Routine N` during combat means the routine is not the task being observed. |
 | XYZ | Current target coordinates, useful when reporting a wrong level or blocked route. |
 
+Preparing to fight also identifies an engagement waiting for a chair/scenario exit;
+the combat task and first weapon draw wait for that exit to finish.
+
 A dead target shows no travel plan. Its body distance and coordinates remain available
 while it exists. A missing target or removed corpse shows no stale live measurements.
 The panel deliberately exposes hunt information for testing; F8 hides it when testing

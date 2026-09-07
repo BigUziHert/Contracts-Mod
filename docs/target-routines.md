@@ -121,9 +121,11 @@ keeps a healthy travelling/wandering task when the selected destination is uncha
 It preserves the validated centre, wander radius and trip progress/deadline accounting.
 Portrait deployment can reload its distant destination once if capture outlasted residency.
 
-The combat policy runs first. Engagement requests a scenario exit before combat tasking;
-a stuck seated/queued engagement enters bounded recovery after its 2.5-second settle
-window. Search similarly requests a directed normal exit. Combat against anyone, an active combat task, pending
+The combat policy runs first. Engagement requests a scenario exit and waits for the
+target to stop sitting/using/exiting a scenario before combat tasking and weapon draw.
+A queued combat task or unstarted exit enters bounded recovery after 2.5 seconds;
+an observed exit animation gets eight seconds. Search requests a directed normal exit.
+Refused hints use normal exits, and recovery never clears tasks immediately. Combat against anyone, an active combat task, pending
 engagement, last-known-position search, ragdoll, getting up, lasso, being hogtied, hogtied
 and riding in a vehicle suppress routine tasks. After those priorities end, the controller
 selects for the current clock instead of returning to the original spawn. Time jumps and

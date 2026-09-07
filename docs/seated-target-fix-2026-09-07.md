@@ -1,5 +1,9 @@
 # Seated target and routine fixes — 2026-09-07
 
+Historical report for `69e722b`. The owner's next in-game test confirmed that the
+target fought, but immediately popped out of its chair. The immediate-exit behavior
+and ASI below are superseded by [the animated-exit and card-inspection followup](chair-exit-and-card-inspection-2026-09-07.md).
+
 Implemented on `dev`, based on `2e2212e`. No portrait/card/handoff/payment function,
 relationship group or loadout configuration changed. Native-shim validation and the
 Release/x64 build pass; actual RDR2 animation and combat still need the checks below.
