@@ -34,7 +34,18 @@ Preparation happens before replacing the current hunt. Failure there preserves t
 After successful portrait capture, the prepared point is checked again before the hidden
 provisional target is deployed and revealed. Failure cleans up its ped and portrait and
 issues no card. That later failure can leave no active hunt, as with existing portrait
-failure. Location-unavailable startup diagnostics use failure code 10.
+failure. Revalidation checks the saved point directly instead of selecting another nav
+coordinate and requiring the two answers to match. Already loaded destinations do not
+start another scene request. The hidden ped regains collision and physics before a
+bounded 1.5-second placement wait, with at most one ground-placement attempt per 100 ms.
+Actual geometry decides success: horizontal displacement is limited to 0.75 m, while
+the ped's body origin may be up to 2 m above the saved ground. The ground under its
+actual X/Y must remain within 0.35 m of that surface and pass the same outdoor, height,
+slope, water and clearance checks. A native placement return of false alone does not
+reject valid geometry. Only initial deployment sets coordinates; routine travel does not.
+Location-unavailable startup diagnostics use failure code 10 and a `routine-start-v2`
+line identifying the stage, location, failed check and expected/actual coordinates.
+See [the placement fix report](routine-spawn-fix-2026-09-06.md) for the regression evidence.
 
 The generated definition lives in stable runtime storage; the existing cleanup hook resets
 its plan and controller. Portrait generation, download ownership, slot rotation and all

@@ -7,6 +7,7 @@ $bountyRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $bountyOutput = Join-Path $bountyRoot 'tmp\tests'
 $bountySourcePath = Join-Path $bountyRoot 'rdr2 scripting environment\samples\Pools\script.cpp'
 $bountyDataPath = Join-Path $bountyRoot 'rdr2 scripting environment\samples\Pools\contract_data.h'
+$bountyRoutinePath = Join-Path $bountyRoot 'rdr2 scripting environment\samples\Pools\routine_runtime.h'
 $bountyVcVars = Join-Path $VisualStudio 'VC\Auxiliary\Build\vcvars64.bat'
 if (-not (Test-Path -LiteralPath $bountyVcVars)) {
     throw 'Visual Studio C++ tools not found; pass -VisualStudio with your installation directory.'
@@ -25,8 +26,7 @@ $bountyPatterns = @(
     '(?m)^enum class ContractStartFailure\s*\{[^\r\n]+\};',
     '(?m)^static ContractStartFailure lastStartFailure[^\r\n]+;',
     '(?m)^static bool LivingPed\(Ped ped\)[^\r\n]+',
-    '(?m)^static bool PlayerAvailable\(\)[^\r\n]+',
-    '(?ms)^static Ped SpawnTargetWithPhoto\(Hash model, const ContractDef& def\)\s*\{.*?^\}'
+    '(?m)^static bool PlayerAvailable\(\)[^\r\n]+'
 )
 foreach ($bountyPattern in $bountyPatterns) {
     $bountyMatches = [regex]::Matches($bountySource, $bountyPattern)
@@ -35,6 +35,19 @@ foreach ($bountyPattern in $bountyPatterns) {
     $bountyHeader += '#line {0} "{1}"' -f $bountyLine, $bountySourcePath.Replace('\', '/')
     $bountyHeader += $bountyMatches[0].Value
 }
+$bountyRoutine = [IO.File]::ReadAllText($bountyRoutinePath)
+foreach ($bountyPattern in @(
+    '(?ms)^struct RoutineStartDiagnostic\s*\{.*?^\};',
+    '(?m)^static RoutineStartDiagnostic routineStartDiagnostic;',
+    '(?ms)^static bool WaitForRoutinePlacement\(Ped ped, const ContractDef& def\)\s*\{.*?^\}'
+)) {
+    $bountyMatches = [regex]::Matches($bountyRoutine, $bountyPattern)
+    if ($bountyMatches.Count -ne 1) { throw "Expected exactly one routine declaration matching: $bountyPattern" }
+    $bountyHeader += $bountyMatches[0].Value
+}
+$bountyMatches = [regex]::Matches($bountySource, '(?ms)^static Ped SpawnTargetWithPhoto\(Hash model, const ContractDef& def\)\s*\{.*?^\}')
+if ($bountyMatches.Count -ne 1) { throw 'Expected exactly one production SpawnTargetWithPhoto.' }
+$bountyHeader += $bountyMatches[0].Value
 [IO.File]::WriteAllText((Join-Path $bountyOutput 'portrait_start_under_test.h'), ($bountyHeader -join "`r`n"))
 $bountyCommands = @('@echo off', ('call "{0}" >nul' -f $bountyVcVars), 'if errorlevel 1 exit /b 1')
 $bountyCommands += 'cl /nologo /std:c++20 /EHsc /W4 /WX /MT /Od /I"{0}" /Fo"{1}" /Fe"{2}" "{3}"' -f `

@@ -77,17 +77,19 @@ static constexpr Hash SD_DOCK[] = {Joaat("a_m_m_sddockworkers_02"), Joaat("a_m_m
 struct World
 {
     unsigned now = 1000, waits = 0, cancelAfter = 999999;
-    unsigned loadedAfter = 0, targetDiesAfter = 999999;
+    unsigned loadedAfter = 0, targetDiesAfter = 999999, settleAfterWaits = 999999, ownershipLostAfter = 999999;
     int minute = 720, clockRate = 2000, taskStatus = 0;
     bool canInteract = true, collision = true, nav = true, safe = true;
     bool outside = true, groundOk = true, occupied = false, hit = false;
     bool sceneActive = false, startOk = true;
     int interior = 0, probeStatus = 2, starts = 0, stops = 0, safeCalls = 0;
-    int requests = 0, failFirstRequests = 0, probes = 0;
-    float inputGround = 0, safeDx = 0, groundDz = 0;
+    int requests = 0, failFirstSafeCalls = 0, probes = 0;
+    int placementCalls = 0;
+    bool placementResult = false;
+    float safeDx = 0, groundDz = 0;
     Ped lastIgnored = -1, wanderedPed = 0;
     Vector3 wanderCentre{};
-    Vector3 pedPosition{};
+    Vector3 pedPosition{}, settledPosition{};
     Vector3 travelCentre{}, occupiedAt{};
     bool occupiedNear = false;
     float wanderRadius = 0, avoidRadius = 0;
@@ -100,7 +102,10 @@ struct World
     bool scenarioEnabled = false, scenarioStarts = true, enterAnimation = false;
     bool mayEnterWater = true;
 } w;
+static struct OwnedPedFixture { Ped ped = 77; } ownedPed;
+static bool OwnedPedIdentityMatches() { return w.waits < w.ownershipLostAfter; }
 static ULONGLONG RuntimeNowMs() { return w.now; }
+static ULONGLONG GetTickCount64() { return w.now; }
 static bool PlayerAvailable() { return w.waits < w.cancelAfter; }
 static bool LivingPed(Ped ped) { return ped != 0 && w.waits < w.targetDiesAfter; }
 static bool CanStartInteraction() { return PlayerAvailable() && w.canInteract; }
@@ -124,23 +129,31 @@ static int GET_MILLISECONDS_PER_GAME_MINUTE() { return w.clockRate; }
 namespace ENTITY
 {
 static bool HAS_COLLISION_LOADED_AROUND_POSITION(Vector3) { return w.collision && w.now >= w.loadedAfter; }
-static Vector3 GET_ENTITY_COORDS(Ped, bool, bool) { return w.pedPosition; }
+static Vector3 GET_ENTITY_COORDS(Ped, bool, bool) { return w.waits >= w.settleAfterWaits ? w.settledPosition : w.pedPosition; }
+static bool PLACE_ENTITY_ON_GROUND_PROPERLY(Ped ped, bool flag)
+{
+    Check(ped == 77 && flag, "settling retains the existing placement native parameters");
+    ++w.placementCalls; return w.placementResult;
+}
 }
 namespace PATH
 {
 static bool IS_NAVMESH_LOADED_IN_AREA(Vector3, Vector3) { return w.nav && w.now >= w.loadedAfter; }
 static bool GET_SAFE_COORD_FOR_PED(Vector3 position, bool, Vector3* result, int)
 {
-    ++w.safeCalls; w.inputGround = position.z; *result = position; result->x += w.safeDx;
-    return w.safe && (w.failFirstRequests == 0 || w.requests > w.failFirstRequests);
+    ++w.safeCalls; *result = position; result->x += w.safeDx;
+    return w.safe && w.safeCalls > w.failFirstSafeCalls;
 }
 static void ADD_NAVMESH_REQUIRED_REGION(float, float, float) {}
 }
 namespace MISC
 {
-static bool GET_GROUND_Z_AND_NORMAL_FOR_3D_COORD(Vector3, float* ground, Vector3* normal)
+static bool GET_GROUND_Z_AND_NORMAL_FOR_3D_COORD(Vector3 query, float* ground, Vector3* normal)
 {
-    *ground = w.inputGround + w.groundDz; *normal = {0, 0, 1}; return w.groundOk;
+    // Catalogue ground fixture: every sourced anchor uses a 2.5 m height tolerance,
+    // and validation queries 1 m above that bound. Geometry never depends on a
+    // preceding candidate-finder call, which need not run during revalidation.
+    *ground = query.z - 3.5f + w.groundDz; *normal = {0, 0, 1}; return w.groundOk;
 }
 static bool IS_POSITION_OCCUPIED(Vector3 point, float, bool, bool, bool, bool, bool, Ped ignore, bool)
 {
@@ -228,6 +241,7 @@ static void TestPreparedDefinition()
     Check(!R.enabled, "preparing a candidate does not publish it into active runtime");
     Check(prepared.enabled && RoutinePlan::Valid(prepared.plan), "prepared route is complete and enabled");
     Check(w.safeCalls > 0 && w.probes > 0, "a committed candidate passes actual nav and body validators");
+    Check(w.requests == 0 && w.starts == 0, "already loaded candidates never issue an unnecessary streaming request");
     const auto& location = RoutineData::kLocations[prepared.destination];
     Check(Within(prepared.definition.spawn, prepared.centre, .001f), "definition spawn is the validated point");
     Check(prepared.wanderRadius == location.wanderRadius, "normal wander radius belongs to the selected destination");
@@ -268,12 +282,12 @@ static void TestPreparationFailureAndFallback()
         Check(w.starts == w.stops, "failed startup releases only its successful scene requests");
         Check(w.wanderCalls == 0, "preparation does not task any ped");
     }
-    w = {}; std::srand(23); w.failFirstRequests = 1;
+    w = {}; std::srand(23); w.failFirstSafeCalls = 5;
     RoutineRuntime fallback;
     Check(PrepareRoutineContract(fallback), "unusable preferred location permits the all-day fallback");
     Check(RoutineData::kLocations[fallback.destination].kind == RoutineData::PlaceKind::Rest,
         "bounded alternate is the declared overnight/public fallback");
-    Check(w.requests == 2 && w.safeCalls <= 10, "startup tries at most two locations and five projected candidates each");
+    Check(w.requests == 0 && w.safeCalls == 6, "five failed preferred candidates permit one validated fallback without unneeded streaming");
 }
 
 static void TestDeploymentAndWander()
@@ -295,7 +309,13 @@ static void TestDeploymentAndWander()
     w.canInteract = true; w.outside = false;
     Check(!ValidateRoutineDeployment(77, R.definition), "changed collision/interior status rejects deployment");
     w.outside = true; w.safeDx = 2;
-    Check(!ValidateRoutineDeployment(77, R.definition), "nav projection drifting from prepared point rejects deployment");
+    const int safeCalls = w.safeCalls;
+    Check(ValidateRoutineDeployment(77, R.definition) && w.safeCalls == safeCalls,
+        "non-idempotent candidate projection cannot reject an unchanged valid saved destination");
+    w.safe = false;
+    Check(ValidateRoutineDeployment(77, R.definition) && w.safeCalls == safeCalls,
+        "saved point geometry is revalidated without requiring another candidate-finder success");
+    w.safe = true;
     w.safeDx = 0;
     const auto& place = RoutineData::kLocations[R.destination];
     Check(place.openMinute != place.closeMinute, "daytime fixture selected a closing destination");
@@ -329,6 +349,73 @@ static void TestDeploymentAndWander()
         "cleanup touches no game task or borrowed resource and disables later wander");
     cleanup();
     Check(!R.enabled && w.wanderCalls == 0, "routine cleanup is idempotent");
+}
+
+static void PlacementFixture()
+{
+    R = MakePrepared();
+    w = {};
+    w.pedPosition = R.definition.spawn;
+    w.pedPosition.z += 1.0f;
+    w.settledPosition = w.pedPosition;
+    ownedPed.ped = 77;
+    ResetRoutineStartDiagnostic();
+}
+static void TestPedOriginAndBoundedPlacement()
+{
+    PlacementFixture();
+    Check(!Within(w.pedPosition, R.definition.spawn, .75f),
+        "regression control: old spherical check rejects a normal standing origin one metre above ground");
+    Check(ValidateRoutinePlacement(77, R.definition),
+        "separate horizontal and vertical tolerances accept a standing ped above validated foot-level ground");
+    const Vector3 invalidOffsets[] = {{.8f, 0, 1}, {0, .8f, 1}, {0, 0, 2.1f}, {0, 0, -.26f}};
+    for (const auto& offset : invalidOffsets)
+    {
+        w.pedPosition = {R.definition.spawn.x + offset.x, R.definition.spawn.y + offset.y, R.definition.spawn.z + offset.z};
+        Check(!ValidateRoutinePlacement(77, R.definition) &&
+            std::strcmp(RoutineSpawn::diagnostic.check, "ped_position_out_of_bounds") == 0,
+            "horizontal drift, elevated roof-level origin and under-floor placement remain rejected");
+    }
+    PlacementFixture(); w.groundDz = .5f;
+    Check(!ValidateRoutinePlacement(77, R.definition),
+        "acceptable ped origin does not bypass changed surface geometry at its actual horizontal position");
+    PlacementFixture(); w.occupied = true;
+    Check(!ValidateRoutinePlacement(77, R.definition),
+        "acceptable ped origin does not bypass occupied ground-space validation");
+
+    PlacementFixture(); // Placement native defaults to false while geometry is correct.
+    Check(WaitForRoutinePlacement(77, R.definition) && w.placementCalls == 1 && w.waits == 0 &&
+        routineStartDiagnostic.placementAttempts == 1 && !routineStartDiagnostic.placementResult,
+        "false placement-native return is diagnostic only when actual settled geometry is valid");
+    PlacementFixture();
+    w.pedPosition.x += 2; w.settleAfterWaits = 1;
+    Check(WaitForRoutinePlacement(77, R.definition) && w.waits > 0 && w.placementCalls == 2 &&
+        w.now >= 1100 && w.now < 1200,
+        "placement becoming valid after a frame succeeds on the next rate-limited settling attempt");
+    PlacementFixture();
+    w.pedPosition.x += 2; w.placementResult = true;
+    const unsigned start = w.now;
+    Check(!WaitForRoutinePlacement(77, R.definition) && w.now - start >= 1500 && w.now - start <= 1516 &&
+        w.placementCalls > 1 && w.placementCalls <= 16,
+        "successful native returns cannot accept persistent bad geometry and settling stops within its finite deadline");
+    PlacementFixture(); w.pedPosition.x += 2; w.cancelAfter = 1;
+    Check(!WaitForRoutinePlacement(77, R.definition) && w.waits == 1 && w.placementCalls == 1,
+        "player loss aborts settling after a yield without another placement attempt");
+    PlacementFixture(); w.pedPosition.x += 2; w.targetDiesAfter = 1;
+    Check(!WaitForRoutinePlacement(77, R.definition) && w.waits == 1 && w.placementCalls == 1 &&
+        std::strcmp(RoutineSpawn::diagnostic.check, "interaction_interrupted") == 0,
+        "subject loss aborts settling after a yield without attempting to place a dead target");
+    PlacementFixture(); w.pedPosition.x += 2; w.ownershipLostAfter = 1;
+    Check(!WaitForRoutinePlacement(77, R.definition) && w.waits == 1 && w.placementCalls == 1 &&
+        std::strcmp(RoutineSpawn::diagnostic.check, "subject_ownership_changed") == 0,
+        "ownership changing across a yield stops all further placement calls on the borrowed or recycled handle");
+    PlacementFixture(); ownedPed.ped = 88;
+    Check(!WaitForRoutinePlacement(77, R.definition) && w.placementCalls == 0 &&
+        std::strcmp(RoutineSpawn::diagnostic.check, "subject_ownership_changed") == 0,
+        "a ped handle different from the owned subject never receives a placement task");
+    PlacementFixture(); w.canInteract = false;
+    Check(!WaitForRoutinePlacement(77, R.definition) && w.placementCalls == 0 && w.waits == 0,
+        "an interrupted interaction never starts a settling native");
 }
 
 static void SetDaytimeFixture()
@@ -587,6 +674,7 @@ int main()
     TestPreparedDefinition();
     TestPreparationFailureAndFallback();
     TestDeploymentAndWander();
+    TestPedOriginAndBoundedPlacement();
     TestTravelAndClock();
     TestSuspensionAndAvailability();
     TestTravelRecovery();

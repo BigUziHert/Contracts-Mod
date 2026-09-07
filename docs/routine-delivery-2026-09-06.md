@@ -1,5 +1,8 @@
 # Town routine delivery — 6 September 2026
 
+This records the original routine delivery. Its placement checks and downloadable
+artifact are superseded by [the startup placement fix](routine-spawn-fix-2026-09-06.md).
+
 Code revision: `908c1c7` on `dev`. The normal Release/x64 artifact is
 [`dist/TestScript.asi`](../dist/TestScript.asi), 276,992 bytes.
 SHA-256: `26986266714143EE5D09EA7D1434A09F807BD29C8CC488E40069B16C77B7F862`.

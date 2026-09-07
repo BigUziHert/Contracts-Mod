@@ -30,6 +30,26 @@ static void ResetRoutine() { R = RoutineRuntime{}; }
 static int RoutineMinute() { return CLOCK::GET_CLOCK_HOURS() * 60 + CLOCK::GET_CLOCK_MINUTES(); }
 static bool IsRoutine(const ContractDef& def) { return R.enabled && &def == &R.definition; }
 
+struct RoutineStartDiagnostic
+{
+    const char* stage = "none";
+    const char* location = "none";
+    Vector3 expected{}, actual{};
+    int placementAttempts = 0;
+    bool placementResult = false;
+};
+static RoutineStartDiagnostic routineStartDiagnostic;
+static void ResetRoutineStartDiagnostic() { routineStartDiagnostic = {}; RoutineSpawn::diagnostic = {}; }
+[[maybe_unused]] static void WriteRoutineStartDiagnostic(FILE* file)
+{
+    const auto& d = routineStartDiagnostic;
+    const auto& s = RoutineSpawn::diagnostic;
+    fprintf(file, "routine-start-v2 stage=%s location=%s check=%s attempts=%d placeResult=%d expected=%.3f,%.3f,%.3f actual=%.3f,%.3f,%.3f candidate=%.3f,%.3f,%.3f projected=%.3f,%.3f,%.3f ground=%.3f\n",
+        d.stage, d.location, s.check, d.placementAttempts, d.placementResult ? 1 : 0,
+        d.expected.x, d.expected.y, d.expected.z, d.actual.x, d.actual.y, d.actual.z,
+        s.candidate.x, s.candidate.y, s.candidate.z, s.projected.x, s.projected.y, s.projected.z, s.ground);
+}
+
 static ModelSet RoutineModels(int town, unsigned occupation)
 {
     // Reuse verified archetypes, narrowed to the occupation printed on the card.
@@ -54,6 +74,8 @@ static ModelSet RoutineModels(int town, unsigned occupation)
 
 static bool PrepareRoutineContract(RoutineRuntime& prepared)
 {
+    ResetRoutineStartDiagnostic();
+    routineStartDiagnostic.stage = "select_location";
     const unsigned seed = (static_cast<unsigned>(rand()) << 16) ^ static_cast<unsigned>(rand());
     const int town = static_cast<int>(seed % RoutineData::kTownCount);
     const unsigned occupation = town == 4 ? RoutineData::DockWorker :
@@ -69,6 +91,8 @@ static bool PrepareRoutineContract(RoutineRuntime& prepared)
             Routine::PhaseAt(minute, prepared.plan.offsetMinutes), occupation, minute, 15, seed);
         if (id < 0) break;
         const auto& location = RoutineData::kLocations[id];
+        routineStartDiagnostic.location = location.id;
+        routineStartDiagnostic.expected = location.anchor;
         Vector3 point;
         if (RoutineSpawn::Prepare(location.anchor, location.candidateRadius, location.maxHeightDelta, seed, point) &&
             Routine::CanArriveAndStay({location.openMinute, location.closeMinute}, RoutineMinute(), 0, 15))
@@ -77,6 +101,7 @@ static bool PrepareRoutineContract(RoutineRuntime& prepared)
             prepared.cardLines = RoutinePlan::CardLines(prepared.plan);
             prepared.destination = id;
             prepared.centre = point;
+            routineStartDiagnostic.expected = point;
             prepared.wanderRadius = location.wanderRadius;
             const auto& area = RoutineData::kTowns[town];
             prepared.definition = { area.name, RoutinePlan::OccupationName(occupation), area.name,
@@ -92,14 +117,14 @@ static bool ValidateRoutineDeployment(Ped ped, const ContractDef& def)
 {
     if (!IsRoutine(def)) return true;
     const auto& location = RoutineData::kLocations[R.destination];
-    Vector3 point;
+    routineStartDiagnostic.stage = "revalidate_destination";
     // Capture can outlast distant streaming residency. Reload once, bounded, while
     // the photographed subject remains hidden; recheck both actors after any yield.
-    if (!RoutineSpawn::Loaded(def.spawn) &&
-        !RoutineSpawn::Prepare(location.anchor, location.candidateRadius, location.maxHeightDelta, R.plan.seed, point)) return false;
-    return LivingPed(ped) && CanStartInteraction() && Routine::CanArriveAndStay({location.openMinute, location.closeMinute}, RoutineMinute(), 0, 15) &&
-        RoutineSpawn::Validate(location.anchor, location.candidateRadius, location.maxHeightDelta, def.spawn, point, ped) &&
-        Within(point, def.spawn, .5f);
+    if (!RoutineSpawn::EnsureLoaded(def.spawn)) return false;
+    if (!LivingPed(ped) || !CanStartInteraction()) return RoutineSpawn::Reject("interaction_interrupted");
+    if (!Routine::CanArriveAndStay({location.openMinute, location.closeMinute}, RoutineMinute(), 0, 15))
+        return RoutineSpawn::Reject("visiting_window_closed");
+    return RoutineSpawn::ValidatePoint(location.anchor, location.candidateRadius, location.maxHeightDelta, def.spawn, ped);
 }
 
 static bool StartRoutineWander(Ped ped, const ContractDef& def)
@@ -116,7 +141,47 @@ static bool ValidateRoutinePlacement(Ped ped, const ContractDef& def)
 {
     if (!IsRoutine(def)) return true;
     const Vector3 actual = ENTITY::GET_ENTITY_COORDS(ped, true, false);
-    return Within(actual, def.spawn, .75f) && RoutineSpawn::Loaded(actual);
+    routineStartDiagnostic.actual = actual;
+    const float dx = actual.x - def.spawn.x, dy = actual.y - def.spawn.y, height = actual.z - def.spawn.z;
+    // Entity coordinates describe the ped's origin, not the surface under his feet.
+    // camp_horseshoeoverlook.c:4372 uses separate .5/.5/2.0 ped/scenario tolerances.
+    if (!std::isfinite(actual.x) || !std::isfinite(actual.y) || !std::isfinite(actual.z) ||
+        dx * dx + dy * dy > .75f * .75f || height < -.25f || height > 2.0f)
+        return RoutineSpawn::Reject("ped_position_out_of_bounds");
+    if (!RoutineSpawn::Loaded(actual)) return RoutineSpawn::Reject("ped_collision_or_nav_unloaded");
+    const auto& location = RoutineData::kLocations[R.destination];
+    return RoutineSpawn::ValidatePoint(location.anchor, location.candidateRadius, location.maxHeightDelta,
+        Vector3(actual.x, actual.y, def.spawn.z), ped);
+}
+
+static bool WaitForRoutinePlacement(Ped ped, const ContractDef& def)
+{
+    routineStartDiagnostic.stage = "settle_ped";
+    routineStartDiagnostic.expected = def.spawn;
+    ULONGLONG nextAttemptMs = 0;
+    bool accepted = false;
+    WaitUntil(1500, [&] {
+        if (!LivingPed(ped) || !CanStartInteraction())
+        {
+            RoutineSpawn::Reject("interaction_interrupted");
+            return true; // stop waiting; the caller still receives failure
+        }
+        if (ped != ownedPed.ped || !OwnedPedIdentityMatches())
+        {
+            RoutineSpawn::Reject("subject_ownership_changed");
+            return true;
+        }
+        const ULONGLONG now = GetTickCount64();
+        if (now < nextAttemptMs) return false;
+        nextAttemptMs = now + 100;
+        ++routineStartDiagnostic.placementAttempts;
+        routineStartDiagnostic.placementResult = ENTITY::PLACE_ENTITY_ON_GROUND_PROPERLY(ped, 1) != 0;
+        // The return is useful diagnostics, not proof of invalid geometry. Some R*
+        // callers ignore it; others retry. Actual settled position decides success.
+        accepted = ValidateRoutinePlacement(ped, def);
+        return accepted;
+    });
+    return accepted;
 }
 
 static int RoutineTravelMinutes(const Vector3& from, const Vector3& to)
@@ -222,14 +287,13 @@ static void UpdateRoutine(Ped ped, const ContractDef& def, bool mayAct)
             const auto& location = RoutineData::kLocations[R.destination];
             if (observation.nowMs >= R.nextValidationMs)
             {
-                Vector3 checked;
                 // The activity already owns its small standing space. Scenario props
                 // must not make the traveller's own bottle fail destination clearance.
                 R.destinationValid = location.enabled && (R.controller.state == Routine::State::Activity ||
                     observation.nowMs < R.activityClearanceGraceUntilMs
                     ? RoutineSpawn::Loaded(R.centre)
-                    : RoutineSpawn::Validate(location.anchor, location.candidateRadius,
-                        location.maxHeightDelta, R.centre, checked, ped) && Within(checked, R.centre, .5f));
+                    : RoutineSpawn::ValidatePoint(location.anchor, location.candidateRadius,
+                        location.maxHeightDelta, R.centre, ped));
                 R.nextValidationMs = observation.nowMs + 1000;
             }
             observation.destinationOpen = Routine::CanArriveAndStay({location.openMinute, location.closeMinute},

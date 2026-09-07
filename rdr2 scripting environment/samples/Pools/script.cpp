@@ -198,6 +198,7 @@ static void WritePhotoTiming(FILE* file, const char* phase)
 		C.photoUploadMs, C.photoCleanupMs, C.photoReadbackMs, C.photoRequestCallMaxMs);
 }
 
+static void WriteRoutineStartDiagnostic(FILE* file);
 static void LogContractStartFailure(Hash model, int attempt)
 {
 	HMODULE module = nullptr;
@@ -222,6 +223,7 @@ static void LogContractStartFailure(Hash model, int attempt)
 		C.photoCommitReady ? 1 : 0, C.photoCommitBefore ? 1 : 0, C.photoBusyBefore ? 1 : 0,
 		C.photoBusyAfterCleanup ? 1 : 0, C.photoBusyAtRequest ? 1 : 0, C.photoRequestAttempts);
 	if (lastStartFailure == ContractStartFailure::PortraitFailed) WritePhotoTiming(file, lastPhotoStage);
+	if (lastStartFailure == ContractStartFailure::LocationUnavailable) WriteRoutineStartDiagnostic(file);
 	fclose(file);
 }
 
@@ -899,18 +901,25 @@ static Ped SpawnTargetWithPhoto(Hash model, const ContractDef& def)
 		ReleaseTargetPhoto();
 		return 0;
 	}
-	// Deployment occurs once, while still hidden and frozen. Routine travel never teleports.
-	ENTITY::SET_ENTITY_COORDS(ped, def.spawn.x, def.spawn.y, def.spawn.z, false, false, false, true);
-	if (!ENTITY::PLACE_ENTITY_ON_GROUND_PROPERLY(ped, 1) || !ValidateRoutinePlacement(ped, def))
+	// Move once while hidden, then allow collision/physics to settle before revealing.
+	// Do not clear ambient entities from the destination. Active routine travel never teleports.
+	ENTITY::SET_ENTITY_COORDS(ped, def.spawn.x, def.spawn.y, def.spawn.z, false, false, false, false);
+	ENTITY::SET_ENTITY_COLLISION(ped, true, false);
+	ENTITY::FREEZE_ENTITY_POSITION(ped, false);
+	if (!WaitForRoutinePlacement(ped, def))
 	{
-		lastStartFailure = ContractStartFailure::LocationUnavailable;
+		lastStartFailure = PlayerAvailable() ? ContractStartFailure::LocationUnavailable : ContractStartFailure::Interrupted;
+		// Deletion can be deferred. Keep our hidden subject inert while cleanup retries.
+		if (ped == ownedPed.ped && ENTITY::DOES_ENTITY_EXIST(ped) && OwnedPedIdentityMatches())
+		{
+			ENTITY::FREEZE_ENTITY_POSITION(ped, true);
+			ENTITY::SET_ENTITY_COLLISION(ped, false, false);
+		}
 		RequestOwnedPedCleanup(ped);
 		ReleaseTargetPhoto();
 		return 0;
 	}
 	ENTITY::SET_ENTITY_VISIBLE(ped, true);
-	ENTITY::SET_ENTITY_COLLISION(ped, true, false);
-	ENTITY::FREEZE_ENTITY_POSITION(ped, false);
 	return ped;
 }
 
