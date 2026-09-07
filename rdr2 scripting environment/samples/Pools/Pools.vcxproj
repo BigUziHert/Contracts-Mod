@@ -19,6 +19,11 @@
     <ClInclude Include="..\..\inc\types.h" />
     <ClInclude Include="common.hpp" />
     <ClInclude Include="contract_data.h" />
+    <ClInclude Include="routine_locations.h" />
+    <ClInclude Include="routine_logic.h" />
+    <ClInclude Include="routine_plan.h" />
+    <ClInclude Include="routine_spawn.h" />
+    <ClInclude Include="routine_runtime.h" />
     <ClInclude Include="target_ai_logic.h" />
     <ClInclude Include="handoff_logic.h" />
     <ClInclude Include="keyboard.h" />

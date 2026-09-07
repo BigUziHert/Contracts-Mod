@@ -43,6 +43,7 @@ static struct World
     bool collision = true;
     bool visible = true;
     bool acceptedPhoto = false;
+    bool destinationValid = true, placementValid = true, groundPlacement = true;
     unsigned frame = 0;
     unsigned spawns = 0;
     unsigned releases = 0;
@@ -120,11 +121,12 @@ static void SET_ENTITY_COORDS(Ped ped, float x, float y, float z, bool, bool, bo
     Check(x == 100.0f && y == 200.0f && z == 300.0f, "target reaches the selected contract location");
     ++world.teleports;
 }
-static void PLACE_ENTITY_ON_GROUND_PROPERLY(Ped ped, int)
+static bool PLACE_ENTITY_ON_GROUND_PROPERLY(Ped ped, int)
 {
     Check(ped == kTarget && world.targetExists && world.teleports == 1,
         "ground placement follows the successful target teleport");
     ++world.placements;
+    return world.groundPlacement;
 }
 }
 
@@ -197,6 +199,8 @@ static void RequestOwnedPedCleanup(Ped ped)
 }
 
 static void LogContractStartFailure(Hash model, int attempt);
+static bool ValidateRoutineDeployment(Ped, const ContractDef&) { return world.destinationValid; }
+static bool ValidateRoutinePlacement(Ped, const ContractDef&) { return world.placementValid; }
 #include "portrait_start_under_test.h"
 
 static void LogContractStartFailure(Hash model, int attempt)
@@ -246,6 +250,20 @@ int main()
     Check(world.subjects.size() == 1 && world.frame == 0 && world.failures.empty(),
         "first-attempt success needs no retry or failure report");
     CheckReady();
+
+    Reset({ CaptureResult::Success });
+    world.destinationValid = false;
+    Check(Prepare() == 0 && lastStartFailure == ContractStartFailure::LocationUnavailable,
+        "destination disappearing during portrait refuses deployment");
+    CheckFailed(1);
+    for (int failure = 0; failure < 2; ++failure)
+    {
+        Reset({ CaptureResult::Success });
+        world.placementValid = failure != 0;
+        world.groundPlacement = failure != 1;
+        Check(Prepare() == 0 && world.teleports == 1 && world.reveals == 0 && world.deletes == 1 && world.releases == 1,
+            "failed placement cleans up while hidden without exposing a broken target");
+    }
 
     Reset({ CaptureResult::Failure, CaptureResult::Success });
     Check(Prepare() == kTarget, "retry success returns the original target");

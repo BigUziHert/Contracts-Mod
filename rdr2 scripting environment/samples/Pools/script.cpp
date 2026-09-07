@@ -25,7 +25,7 @@
 
 // ===== [ STATE ] =====
 enum ContractState { CONTRACT_NONE, CONTRACT_UNKNOWN, CONTRACT_FOUND, CONTRACT_DEAD, CONTRACT_PAID };
-enum class ContractStartFailure { None, Interrupted, InvalidModel, ModelLoadTimeout, PedCreationFailed, PortraitFailed, PedPoolFull, CleanupPending, PhotoDiagnosticComplete, PhotoCacheExhausted };
+enum class ContractStartFailure { None, Interrupted, InvalidModel, ModelLoadTimeout, PedCreationFailed, PortraitFailed, PedPoolFull, CleanupPending, PhotoDiagnosticComplete, PhotoCacheExhausted, LocationUnavailable };
 static ContractStartFailure lastStartFailure = ContractStartFailure::None;
 static const char* lastPhotoStage = "none";
 // Session-wide portrait slot bookkeeping; see NextPhotoSlot in the target portrait section.
@@ -335,6 +335,7 @@ static void ReportContractStartFailure()
 	case ContractStartFailure::CleanupPending: DisplaySubtitle("PREVIOUS TARGET IS STILL BEING REMOVED. TRY AGAIN SHORTLY."); break;
 	case ContractStartFailure::PhotoDiagnosticComplete: DisplaySubtitle("PHOTO TEST FINISHED. SEE BountyContracts-photo-test.log."); break;
 	case ContractStartFailure::PhotoCacheExhausted: DisplaySubtitle("PORTRAIT SLOTS FULL. RESTART THE GAME FOR NEW CONTRACTS."); break;
+	case ContractStartFailure::LocationUnavailable: DisplaySubtitle("NO SAFE TARGET LOCATION AVAILABLE. TRY AGAIN."); break;
 	case ContractStartFailure::None: DisplaySubtitle("CONTRACT REQUEST FAILED. TRY AGAIN."); break;
 	}
 }
@@ -380,6 +381,8 @@ template<typename Pred> static bool WaitUntil(DWORD timeoutMs, Pred pred)
 		WAIT(0);
 	}
 }
+
+#include "routine_runtime.h"
 
 static bool LoadModel(Hash model)
 {
@@ -455,7 +458,15 @@ static void StyleTargetBlip(Blip blip, const char* colorModifier, bool large, bo
 }
 static void AddSearchBlip()
 {
-	C.searchBlip = MAP::BLIP_ADD_FOR_RADIUS(BLIP_STYLE_MP_MISSION_GIVER, C.def->spawn, C.def->searchRadius);
+	Vector3 centre = C.def->spawn;
+	float radius = C.def->searchRadius;
+	if (IsRoutine(*C.def))
+	{
+		const auto& town = RoutineData::kTowns[R.plan.townIndex];
+		centre = town.searchCenter;
+		radius = town.searchRadius;
+	}
+	C.searchBlip = MAP::BLIP_ADD_FOR_RADIUS(BLIP_STYLE_MP_MISSION_GIVER, centre, radius);
 	StyleTargetBlip(C.searchBlip, "BLIP_MODIFIER_MP_COLOR_32", true, false);
 }
 static void AddFoundBlip()
@@ -881,11 +892,25 @@ static Ped SpawnTargetWithPhoto(Hash model, const ContractDef& def)
 		return 0;
 	}
 
+	if (!ValidateRoutineDeployment(ped, def))
+	{
+		lastStartFailure = ContractStartFailure::LocationUnavailable;
+		RequestOwnedPedCleanup(ped);
+		ReleaseTargetPhoto();
+		return 0;
+	}
+	// Deployment occurs once, while still hidden and frozen. Routine travel never teleports.
+	ENTITY::SET_ENTITY_COORDS(ped, def.spawn.x, def.spawn.y, def.spawn.z, false, false, false, true);
+	if (!ENTITY::PLACE_ENTITY_ON_GROUND_PROPERLY(ped, 1) || !ValidateRoutinePlacement(ped, def))
+	{
+		lastStartFailure = ContractStartFailure::LocationUnavailable;
+		RequestOwnedPedCleanup(ped);
+		ReleaseTargetPhoto();
+		return 0;
+	}
 	ENTITY::SET_ENTITY_VISIBLE(ped, true);
 	ENTITY::SET_ENTITY_COLLISION(ped, true, false);
 	ENTITY::FREEZE_ENTITY_POSITION(ped, false);
-	ENTITY::SET_ENTITY_COORDS(ped, def.spawn.x, def.spawn.y, def.spawn.z, false, false, false, true);
-	ENTITY::PLACE_ENTITY_ON_GROUND_PROPERLY(ped, 1);
 	return ped;
 }
 
@@ -1286,6 +1311,7 @@ static void StartWander(Ped ped, const ContractDef& def)
 {
 	PED::SET_PED_CONFIG_FLAG(ped, 233, false);
 	PED::SET_PED_COMBAT_ATTRIBUTES(ped, 5, false);
+	if (StartRoutineWander(ped, def)) return;
 	TASK::SET_PED_PATH_PREFER_TO_AVOID_WATER(ped, true, def.searchRadius);
 	TASK::SET_PED_PATH_MAY_ENTER_WATER(ped, false);
 	TASK::TASK_WANDER_IN_AREA(ped, def.spawn, def.searchRadius, 0.0f, 0.0f, 1);
@@ -1506,7 +1532,21 @@ static bool StartContract()
 	lastStartFailure = ContractStartFailure::None;
 	lastPhotoStage = "none";
 	if (!CanPrepareContract()) return false;
+	RoutineRuntime prepared;
+	if (!PrepareRoutineContract(prepared))
+	{
+		lastStartFailure = PlayerAvailable() ? ContractStartFailure::LocationUnavailable : ContractStartFailure::Interrupted;
+		LogContractStartFailure(0, 0);
+		return false;
+	}
+	if (!CanStartInteraction())
+	{
+		lastStartFailure = ContractStartFailure::Interrupted;
+		LogContractStartFailure(0, 0);
+		return false;
+	}
 	ClearContract(true);
+	R = prepared;
 	for (int attempt = 0; attempt < Tune::kSpawnAttempts; ++attempt)
 	{
 		if (!PlayerAvailable())
@@ -1515,7 +1555,7 @@ static bool StartContract()
 			LogContractStartFailure(0, attempt + 1);
 			break;
 		}
-		const ContractDef& def = kContracts[rand() % kContractCount];
+		const ContractDef& def = R.definition;
 		Hash model = def.models.list[rand() % def.models.count];
 		Ped ped = SpawnTargetWithPhoto(model, def);
 		if (!ped)
@@ -1526,7 +1566,7 @@ static bool StartContract()
 			// Capture already retried this subject. Do not multiply capture timeouts by rerolling models.
 			if (lastStartFailure == ContractStartFailure::Interrupted || lastStartFailure == ContractStartFailure::PortraitFailed ||
 				lastStartFailure == ContractStartFailure::PedPoolFull || lastStartFailure == ContractStartFailure::CleanupPending ||
-				lastStartFailure == ContractStartFailure::PhotoDiagnosticComplete) break;
+				lastStartFailure == ContractStartFailure::PhotoDiagnosticComplete || lastStartFailure == ContractStartFailure::LocationUnavailable) break;
 			if (attempt + 1 < Tune::kSpawnAttempts) WAIT(0);
 			continue;
 		}
@@ -1550,6 +1590,7 @@ static bool StartContract()
 		lastStartFailure = ContractStartFailure::None;
 		return true;
 	}
+	ResetRoutine();
 	return false;
 }
 

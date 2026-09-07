@@ -87,6 +87,7 @@ static void GIVE_WEAPON_TO_PED(Ped, Hash weapon, int, bool, bool, int, bool, flo
 static void SET_CURRENT_PED_WEAPON(Ped, Hash, bool, int, bool, bool) { ++N.draws; }
 }
 
+static bool StartRoutineWander(Ped, const ContractDef&) { return false; }
 #include "target_ai_bridge_under_test.h"
 
 static const Ped target = 2;

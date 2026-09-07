@@ -209,6 +209,8 @@ static void SET_ENTITY_VISIBLE(Ped subject, bool visible)
 }
 }
 
+[[maybe_unused]] static bool ValidateRoutineDeployment(Ped, const ContractDef&) { return true; }
+[[maybe_unused]] static bool ValidateRoutinePlacement(Ped, const ContractDef&) { return true; }
 #include "photo_self_test_under_test.h"
 
 static void Reset()
