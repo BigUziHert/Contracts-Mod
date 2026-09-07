@@ -24,6 +24,8 @@
     <ClInclude Include="routine_plan.h" />
     <ClInclude Include="routine_spawn.h" />
     <ClInclude Include="routine_runtime.h" />
+    <ClInclude Include="routine_activity.h" />
+    <ClInclude Include="routine_activity_bridge.h" />
     <ClInclude Include="routine_card.h" />
     <ClInclude Include="routine_debug.h" />
     <ClInclude Include="startup_trace.h" />

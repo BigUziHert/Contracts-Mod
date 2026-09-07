@@ -284,7 +284,7 @@ int main() {
     const Location* easternDock=findLocation("sd_docks_east");
     Check(easternDock && easternDock->enabled && easternDock->town==TownId::SaintDenis &&
         easternDock->kind==PlaceKind::Work && SamePoint(easternDock->anchor,{2822.0f,-1415.0f,45.5f}) &&
-        easternDock->occupations==(Laborer|DockWorker) && easternDock->openMinute==360 && easternDock->closeMinute==1080 &&
+        easternDock->occupations==(Laborer|DockWorker) && easternDock->openMinute==360 && easternDock->closeMinute==960 &&
         std::strstr(easternDock->source,"owner-provided coordinates"),
         "second Saint Denis dock preserves the supplied coordinates and daytime dock-worker/laborer work role");
     const Location* southLoop=findLocation("str_south_loop");

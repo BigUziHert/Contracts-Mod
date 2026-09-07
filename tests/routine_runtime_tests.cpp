@@ -1,4 +1,5 @@
 #include <array>
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -12,6 +13,8 @@ using BOOL = int;
 using DWORD = unsigned;
 using ULONGLONG = unsigned long long;
 using Hash = unsigned;
+using Interior = int;
+using Any = std::uint64_t;
 struct Vector3
 {
     float x, y, z;
@@ -74,6 +77,14 @@ struct ContractDef
 namespace Tune { constexpr float kReAggroSightDist = 45.0f; }
 static constexpr Hash SD_DOCK[] = {Joaat("a_m_m_sddockworkers_02"), Joaat("a_m_m_nbxdockworkers_01")};
 
+struct ScenarioFixture
+{
+    int id;
+    Hash hash;
+    Vector3 position;
+    bool exists = true, active = true, compatible = true;
+    Ped user = 0;
+};
 struct World
 {
     unsigned now = 1000, waits = 0, cancelAfter = 999999;
@@ -106,7 +117,17 @@ struct World
     Hash lastTaskHash = 0, activeTaskHash = 0;
     Hash scenarioInUse = 0;
     bool mayEnterWater = true;
+    std::vector<ScenarioFixture> points;
+    int selectedPoint = 0, pointTasks = 0, clears = 0, pointQueries = 0;
+    bool scenarioBase = false, scenarioTask = false, exiting = false, stallExit = false;
+    bool interiorReady = true;
+    bool scenarioActive = false;
 } w;
+static ScenarioFixture* Scenario(int id)
+{
+    for (auto& point : w.points) if (point.id == id) return &point;
+    return nullptr;
+}
 static struct OwnedPedFixture { Ped ped = 77; } ownedPed;
 static bool OwnedPedIdentityMatches() { return w.waits < w.ownershipLostAfter; }
 static ULONGLONG RuntimeNowMs() { return w.now; }
@@ -171,6 +192,8 @@ namespace INTERIOR
 {
 static bool IS_COLLISION_MARKED_OUTSIDE(Vector3) { return w.outside; }
 static int GET_INTERIOR_FROM_COLLISION(Vector3) { return w.interior; }
+static int GET_INTERIOR_AT_COORDS(Vector3) { return w.interior; }
+static bool IS_INTERIOR_READY(Interior) { return w.interiorReady; }
 }
 namespace WATER { static bool GET_WATER_HEIGHT(Vector3 point, float* height) { *height = point.z; return w.waterPresent; } }
 namespace SHAPETEST
@@ -190,6 +213,44 @@ static void REQUEST_COLLISION_AT_COORD(Vector3) { ++w.requests; }
 }
 namespace TASK
 {
+static int GET_SCENARIO_POINTS_IN_AREA(Vector3, float, Any* points, int capacity)
+{
+    ++w.pointQueries;
+    Check(points[0] == static_cast<Any>(capacity), "scenario array has the RAGE capacity header");
+    const int count = (std::min)(capacity, static_cast<int>(w.points.size()));
+    for (int index = 0; index < count; ++index) points[index + 1] = w.points[index].id;
+    return count;
+}
+static bool DOES_SCENARIO_POINT_EXIST(int id) { const auto p = Scenario(id); return p && p->exists; }
+static Hash _GET_SCENARIO_POINT_TYPE(int id) { const auto p = Scenario(id); return p ? p->hash : 0; }
+static bool _IS_SCENARIO_POINT_ACTIVE(int id) { const auto p = Scenario(id); return p && p->active; }
+static bool _IS_SCENARIO_IN_USE(int id) { const auto p = Scenario(id); return p && p->user != 0; }
+static Ped _GET_PED_USING_SCENARIO_POINT(int id) { const auto p = Scenario(id); return p ? p->user : 0; }
+static Vector3 _GET_SCENARIO_POINT_COORDS(int id, bool) { const auto p = Scenario(id); return p ? p->position : Vector3{}; }
+static bool IS_SCENARIO_TYPE_ENABLED(const char*) { return true; }
+static bool PED_HAS_USE_SCENARIO_TASK(Ped) { return w.scenarioTask; }
+static bool _PED_IS_IN_SCENARIO_BASE(Ped) { return w.scenarioBase; }
+static bool IS_PED_ACTIVE_IN_SCENARIO(Ped, int) { return w.scenarioActive; }
+static bool IS_PED_EXITING_SCENARIO(Ped, bool) { return w.exiting; }
+static void TASK_USE_SCENARIO_POINT(Ped ped, int id, const char* clip, int duration, bool enter, bool warp,
+    Hash conditional, bool p7, float p8, bool p9)
+{
+    Check(ped == 77 && !clip && duration == -1 && enter && !warp && conditional == 0 && !p7 && p8 == -1 && !p9,
+        "scenario task borrows the owned ped with normal entry and no warp");
+    ++w.pointTasks; ++w.activityCalls; w.selectedPoint = id; w.scenarioTask = true;
+    if (auto point = Scenario(id)) point->user = ped;
+}
+static void CLEAR_PED_TASKS(Ped ped, bool p1, bool p2)
+{
+    Check(ped == 77 && p1 && !p2, "routine exit recovery uses only ordinary task clearing");
+    ++w.clears;
+    if (!w.stallExit)
+    {
+        if (auto point = Scenario(w.selectedPoint)) point->user = 0;
+        w.scenarioInUse = 0; w.selectedPoint = 0; w.scenarioTask = w.scenarioBase = w.scenarioActive = w.exiting = false;
+        w.taskStatus = 7;
+    }
+}
 static void SET_PED_PATH_PREFER_TO_AVOID_WATER(Ped, bool avoid, float radius)
 {
     Check(avoid, "routine path prefers avoiding water"); ++w.avoidCalls; w.avoidRadius = radius;
@@ -236,7 +297,7 @@ namespace PED
 {
 static void SET_PED_SHOULD_PLAY_NORMAL_SCENARIO_EXIT(Ped ped)
 {
-    Check(ped == 77 && w.scenarioInUse != 0, "normal scenario exit applies only to the observed ambient target");
+    Check(ped == 77, "normal scenario exit applies only to the owned target");
     ++w.scenarioExits;
 }
 static void SET_PED_KEEP_TASK(Ped, bool keep) { Check(keep, "routine task is kept"); ++w.keepCalls; }
@@ -245,6 +306,10 @@ static bool IS_PED_USING_ANY_SCENARIO(Ped ped)
     Check(ped == 77, "ambient scenario observation examines the existing target"); ++w.scenarioReads;
     return w.scenarioInUse != 0;
 }
+static bool IS_PED_USING_THIS_SCENARIO(Ped, int id) { return id > 0 && w.selectedPoint == id; }
+static bool IS_PED_USING_SCENARIO_HASH(Ped, Hash hash) { return w.scenarioInUse == hash; }
+static bool _CAN_PED_USE_SCENARIO_POINT(Ped, int id, int, int, int)
+{ const auto point = Scenario(id); return point && point->compatible; }
 }
 
 #include "../rdr2 scripting environment/samples/Pools/routine_runtime.h"
@@ -266,8 +331,9 @@ static void CheckPreparedCard(const RoutineRuntime& prepared)
     Check(prepared.enabled && RoutinePlan::Valid(prepared.plan), "accepted alternate retains a complete compatible routine plan");
     const auto& location = RoutineData::kLocations[prepared.destination];
     const int phase = static_cast<int>(location.kind);
+    constexpr int cardRowForPhase[] = {1, 3, 4, 5, 2};
     Check(prepared.plan.route[phase] == prepared.destination &&
-        prepared.cardLines[phase + 2].find(RoutinePlan::CardLocationName(location)) != std::string::npos,
+        prepared.cardLines[cardRowForPhase[phase]].find(RoutinePlan::CardLocationName(location)) != std::string::npos,
         "accepted alternate is inserted into its matching advertised card habit before publication");
     Check(location.town == RoutineData::kTowns[prepared.plan.townIndex].id &&
         prepared.definition.models.list == RoutineModels(prepared.plan.townIndex, prepared.plan.occupation).list &&
@@ -595,21 +661,21 @@ static void TestTravelAndClock()
     for (int frame = 0; frame < 20; ++frame) Tick();
     Check(w.wanderCalls == 1 && Within(R.centre, fixed, .001f) && w.activeTaskHash == Joaat("SCRIPT_TASK_WANDER_IN_AREA"),
         "wandering does not move the centre or repeat a running task");
-    w.minute = 900;
+    w.minute = 1020;
     const int tasks = TaskCount();
     Tick();
     Check(R.selectPending && TaskCount() == tasks, "phase change first requests fresh location selection");
     Tick();
     Check(R.destination == R.plan.route[1] && w.travelCalls == 2, "afternoon physically travels to the advertised shop frontage");
 
-    w.minute = 1100;
+    w.minute = 1200;
     Check(StartRoutineWander(77, R.definition), "post-search recovery requests current schedule");
     Tick(); Tick();
     Check(R.destination == R.plan.route[2], "resuming after time change chooses evening destination");
     const int beforeJump = TaskCount();
-    w.minute = 100;
+    w.minute = 240;
     Tick();
-    Check(R.selectPending && TaskCount() == beforeJump, "midnight time skip requests reselection without teleporting");
+    Check(R.selectPending && TaskCount() == beforeJump, "time skip into the three-to-six rest window reselects without teleporting");
     Tick();
     Check(R.destination == R.plan.route[3], "overnight clock selects the advertised all-day fallback");
 
@@ -642,7 +708,7 @@ static void BeginShopTravelFromAcceptedWork()
     w.pedPosition = R.centre; Tick();
     const int held = R.destination;
     const Vector3 heldCentre = R.centre;
-    w.minute = 900;
+    w.minute = 1020;
     w.pedPosition = RoutineData::kLocations[R.plan.route[1]].anchor; w.pedPosition.x += 90;
     Tick(); Tick();
     Check(R.destination == R.plan.route[1] && R.controller.state == Routine::State::Travelling &&
@@ -675,7 +741,7 @@ static void TestArrivalAtWanderBoundary()
 
     SetDaytimeFixture();
     const int previous = R.fallbackDestination;
-    w.minute = 900;
+    w.minute = 1020;
     w.pedPosition = RoutineData::kLocations[R.plan.route[1]].anchor; w.pedPosition.x += 20.0f;
     Check(StartRoutineWander(77, R.definition), "nearby scheduled fixture requests route selection");
     Tick(); Tick();
@@ -720,7 +786,7 @@ static void TestSuspensionAndAvailability()
     Tick(16, false); Tick(30000, false);
     Check(R.controller.state == Routine::State::Suspended && TaskCount() == tasks && w.statusCalls == statusCalls,
         "combat, search or restraint priority performs no routine task or task-status recovery");
-    w.minute = 900;
+    w.minute = 1020;
     Tick();
     Check(R.selectPending && TaskCount() == tasks, "resumption re-evaluates clock before taking control");
     Tick();
@@ -741,7 +807,7 @@ static void TestSuspensionAndAvailability()
     w.minute = 1070;
     w.pedPosition = RoutineData::kLocations[R.plan.route[1]].anchor; w.pedPosition.x += 245;
     StartRoutineWander(77, R.definition); Tick(); Tick();
-    Check(R.destination == R.plan.route[3], "travel plus minimum stay skips a shop that closes before a useful arrival");
+    Check(R.destination == R.plan.route[3], "travel estimate skips errands that cannot be reached before the evening boundary");
     SetDaytimeFixture();
     w.occupiedNear = true; w.occupiedAt = RoutineData::kLocations[R.plan.route[0]].anchor;
     StartRoutineWander(77, R.definition); Tick(); Tick();
@@ -785,7 +851,7 @@ static void TestTravelEstimateAndLongDeadline()
     Check(RoutineTravelMinutes({}, {45, 0, 0}) == 0 && RoutineTravelMinutes({}, {40, 0, 0}) == 0,
         "arrival at or inside the wander radius has no remaining travel allowance");
     Check(RoutineTravelMinutes({}, {}) == 0, "a zero-distance visit needs no travel allowance");
-    w.minute = 60;
+    w.minute = 240;
     w.pedPosition = RoutineData::kLocations[R.plan.route[3]].anchor;
     w.pedPosition.x += 500;
     BeginTravel();
@@ -809,7 +875,7 @@ static void TestTravelEstimateAndLongDeadline()
 static void TravelToLeisure(unsigned seed)
 {
     SetDaytimeFixture();
-    R.plan.seed = seed; w.minute = 1100;
+    R.plan.seed = seed; w.minute = 1200;
     w.pedPosition = RoutineData::kLocations[R.plan.route[2]].anchor; w.pedPosition.x += 90;
     BeginTravel();
     Check(R.destination == R.plan.route[2], "ambient fixture physically travels to a real leisure destination");
@@ -874,14 +940,18 @@ static void TestAmbientPriorityAndTravelRecovery()
     Check(TaskCount() == tasks && w.scenarioReads == reads && R.controller.state == Routine::State::Suspended,
         "combat, search, restraint or handoff priority suspends without routine tasks or ambient reads");
     Tick();
-    Check(R.selectPending && TaskCount() == tasks, "post-priority resume reselects the current schedule before tasking");
+    Check(R.activity.state == RoutineActivity::State::Exiting && TaskCount() == tasks,
+        "post-priority resume waits for an observed scenario exit before current-time reselection");
+    Tick();
+    Check(R.selectPending && TaskCount() == tasks, "completed exit reselects before submitting movement");
 
     TravelToLeisure(28); Tick();
     w.scenarioInUse = Joaat("WORLD_HUMAN_SMOKE"); w.taskStatus = 7;
     Tick(5000); const int beforePhase = TaskCount();
-    w.minute = 60; Tick();
-    Check(R.selectPending && TaskCount() == beforePhase, "a native scenario cannot suppress a new scheduled phase");
-    w.scenarioExitPending = true; Tick();
+    w.minute = 240; Tick();
+    Check(R.activity.state == RoutineActivity::State::Exiting && TaskCount() == beforePhase,
+        "a phase change requests exit without submitting movement in the exit frame");
+    w.scenarioExitPending = true; Tick(); Tick();
     Check(R.destination == R.plan.route[3] && w.travelCalls == 2 && w.scenarioExits == 1 && !w.scenarioExitPending,
         "phase change requests a normal scenario exit before travelling to the new destination");
     Tick();
@@ -903,8 +973,12 @@ static void TestAmbientPriorityAndTravelRecovery()
     SetDaytimeFixture(); BeginTravel();
     w.scenarioInUse = Joaat("WORLD_HUMAN_SMOKE"); w.taskStatus = 7;
     const int failed = R.destination;
-    Tick(100); Tick(4100); Tick(100); Tick(4100); Tick(100); Tick(4100);
-    Check(w.travelCalls == 3 && w.standCalls == 0 && w.wanderCalls == 1 && R.controller.IsCoolingDown(failed, w.now) &&
+    Tick(100); Tick(4100);
+    Check(w.travelCalls == 1 && w.scenarioExits == 1 && R.activity.state == RoutineActivity::State::Exiting,
+        "dropped travel waits for an unrelated scenario to exit before retrying navigation");
+    Tick(); Tick();
+    for (int attempt = 0; attempt < 8 && !R.controller.IsCoolingDown(failed, w.now); ++attempt) Tick(4100);
+    Check(w.travelCalls == 4 && w.standCalls == 0 && w.wanderCalls == 1 && R.controller.IsCoolingDown(failed, w.now) &&
         R.controller.state == Routine::State::Waiting && R.ambientFallback,
         "an unrelated mid-travel scenario cannot mask dropped nav tasks or replace the cached-area wander fallback");
 }
@@ -1019,19 +1093,21 @@ static void TestUnavailablePhaseContinuesAmbiently()
         const int tasks = TaskCount();
         w.groundOk = false;
         if (scenario) { w.scenarioInUse = Joaat("WORLD_HUMAN_DRINKING"); w.taskStatus = 7; }
-        w.minute = 60; Tick(); Tick();
+        w.minute = 240; Tick(); Tick();
+        if (scenario) { Tick(); w.taskStatus = 0; }
         Check(R.controller.state == Routine::State::Waiting && R.ambientFallback && R.destination == held &&
             !R.destinationValid && Within(R.centre, centre, .001f) && R.wanderRadius == 45.0f,
             "an unavailable new phase retains the last accepted authored area for ambient continuation");
-        Check(TaskCount() == tasks && w.standCalls == 0 && w.scenarioExits == 0,
-            "failure to find the next stop never clears or replaces healthy wandering or its native scenario");
+        const int continuedTasks = tasks + (scenario ? 1 : 0);
+        Check(TaskCount() == continuedTasks && w.standCalls == 0 && w.scenarioExits == (scenario ? 1 : 0),
+            "a phase exit resumes ambient wandering when the next area is unavailable");
         Tick(); // Settle the controller's initial availability request before measuring repeated frames.
         const int afterFailureSafeCalls = w.safeCalls;
         for (int frame = 0; frame < 50; ++frame) Tick(16);
-        Check(TaskCount() == tasks && w.safeCalls == afterFailureSafeCalls,
+        Check(TaskCount() == continuedTasks && w.safeCalls == afterFailureSafeCalls,
             "pending per-frame updates neither spam tasks nor repeatedly query failed destinations");
         for (int retry = 0; retry < 3; ++retry) { Tick(5000); Tick(); }
-        Check(TaskCount() == tasks && w.safeCalls > afterFailureSafeCalls && w.scenarioExits == 0 &&
+        Check(TaskCount() == continuedTasks && w.safeCalls > afterFailureSafeCalls && w.scenarioExits == (scenario ? 1 : 0) &&
             R.destination == held && Within(R.centre, centre, .001f),
             "bounded availability retries continue without interrupting the cached ambient task");
         const int beforePriority = TaskCount(), reads = w.statusCalls;
@@ -1047,7 +1123,7 @@ static void TestUnavailablePhaseContinuesAmbiently()
             R.controller.state == Routine::State::Travelling && w.travelCalls == 2 && w.standCalls == 0,
             "a newly available advertised destination resumes physical scheduled travel without freezing");
         Check(w.scenarioExits == (scenario ? 1 : 0),
-            "native scenario exit is requested only when a valid replacement trip actually starts");
+            "a schedule exit is not repeated by later successful destination recovery");
     }
 }
 
@@ -1104,8 +1180,131 @@ static void TestRejectedSavedPointCanFindAnotherPoint()
         "a replaced endpoint receives a fresh travel task to the new point within authored candidate bounds");
 }
 
+static void TestDailyActivityTransitions()
+{
+    SetDaytimeFixture(); w.minute = 600; w.clockRate = 60000;
+    const auto habits = R.plan;
+    const int workplace = R.plan.route[static_cast<int>(Routine::Phase::Work)];
+    w.points = {{501, Joaat("WORLD_HUMAN_BROOM_WORKING"), RoutineData::kLocations[workplace].anchor}};
+    BeginTravel();
+    Check(w.pointTasks == 0 && !RoutineActivityObserved(77), "a known workplace point cannot start before physical area arrival");
+    w.pedPosition = R.centre; Tick();
+    Check(w.selectedPoint == 501 && R.activity.state == RoutineActivity::State::Entering && !RoutineActivityObserved(77),
+        "work arrival attempts a real point and reports entry rather than completed work activity");
+    w.scenarioInUse = w.points[0].hash; Tick();
+    Check(!RoutineActivityObserved(77), "a requested matching scenario without its running base is still only entry");
+    w.scenarioBase = true; Tick();
+    Check(RoutineActivityObserved(77) && R.activity.state == RoutineActivity::State::Active,
+        "matching point, type and scenario base establish observed activity");
+    const int healthyTasks = TaskCount();
+    for (int frame = 0; frame < 12; ++frame) Tick(5000);
+    Check(TaskCount() == healthyTasks && RoutineActivityObserved(77), "a successful work activity survives without periodic task reissue");
+    w.scenarioBase = false; w.scenarioActive = true;
+    Tick(5000); Tick(5000);
+    Check(TaskCount() == healthyTasks && RoutineActivityObserved(77) && w.scenarioExits == 0,
+        "confirmed scenario graph transitions remain healthy outside the initial base state");
+    w.scenarioBase = true; w.scenarioActive = false;
+
+    auto transition = [&](int minute, Routine::Phase phase, int pointId, Hash hash) {
+        const int travelBefore = w.travelCalls;
+        w.minute = minute; Tick();
+        Check(R.activity.state == RoutineActivity::State::Exiting && w.travelCalls == travelBefore,
+            "each real activity boundary starts a normal scenario exit without same-frame travel");
+        const int destination = R.plan.route[static_cast<int>(phase)];
+        w.points = {{pointId, hash, RoutineData::kLocations[destination].anchor}};
+        const int pointsBefore = w.pointTasks;
+        const bool needsTravel = !Within(w.pedPosition, RoutineData::kLocations[destination].anchor, RoutineData::kWanderRadius);
+        // Native-free fixtures advance the exit/selection state, then simulate
+        // the result of physical navmesh arrival. They do not prove a game path.
+        for (int frame = 0; frame < 10 && (R.destination != destination ||
+            (needsTravel ? R.controller.state != Routine::State::Travelling : w.pointTasks == pointsBefore)); ++frame) Tick();
+        Check(R.destination == destination && !RoutineActivityObserved(77), "schedule selects the correct new area without claiming completed activity");
+        if (needsTravel)
+            Check(R.controller.state == Routine::State::Travelling && w.pointTasks == pointsBefore && w.travelCalls > travelBefore,
+                "a newly selected distant area with a compatible point requires normal travel before activity discovery");
+        else
+            Check(w.travelCalls == travelBefore, "overlapping accepted areas do not require a redundant walk back to their centre");
+        w.pedPosition = R.centre;
+        for (int frame = 0; frame < 5 && w.pointTasks == pointsBefore; ++frame) Tick();
+        Check(w.selectedPoint == pointId && R.activity.state == RoutineActivity::State::Entering && !RoutineActivityObserved(77),
+            "the new area's intended activity is attempted only after arrival and remains labeled entry");
+        w.scenarioInUse = hash; w.scenarioBase = true; Tick();
+        Check(RoutineActivityObserved(77), "a completed entry is recognized at every scheduled stop");
+    };
+    transition(660, Routine::Phase::Lunch, 502, Joaat("PROP_HUMAN_SEAT_CHAIR_TABLE_EATING_KNIFE_FORK"));
+    Check(R.activity.point.kind == RoutineActivity::Kind::Eat, "lunch observation requires an actual compatible eating scenario");
+    w.minute = 710; pausedDurationMs += 45000;
+    const int lunchTasks = TaskCount();
+    Tick(); Tick();
+    Check(RoutineActivityObserved(77) && R.destination == habits.route[4] && TaskCount() == lunchTasks,
+        "pause revalidation keeps healthy lunch through 11:50 without an obsolete minimum-stay cutoff");
+    transition(720, Routine::Phase::Work, 501, Joaat("WORLD_HUMAN_BROOM_WORKING"));
+    Check(R.destination == workplace, "noon returns to the exact assigned morning workplace");
+    transition(960, Routine::Phase::Shops, 503, Joaat("WORLD_HUMAN_SMOKE"));
+    transition(1140, Routine::Phase::Leisure, 504, Joaat("WORLD_CAMP_FIRE_STANDING"));
+    // Approach midnight naturally; a deliberate multi-hour jump would correctly
+    // ask the route policy to re-evaluate even within the same activity phase.
+    for (int minute = 1170; minute < 1440; minute += 30) { w.minute = minute; Tick(); }
+    w.minute = 1439; Tick();
+    const int midnightTasks = TaskCount(), midnightExits = w.scenarioExits;
+    w.minute = 0; Tick();
+    Check(TaskCount() == midnightTasks && w.scenarioExits == midnightExits && RoutineActivityObserved(77) &&
+        R.destination == habits.route[2], "midnight preserves the observed evening activity without an invented transition");
+    transition(180, Routine::Phase::Rest, 505, Joaat("WORLD_HUMAN_SLEEP_GROUND_ARM"));
+    Check(R.activity.point.kind == RoutineActivity::Kind::Sleep, "nighttime sleeping is observed only from the running sleep point");
+    transition(360, Routine::Phase::Work, 501, Joaat("WORLD_HUMAN_BROOM_WORKING"));
+    for (int phase = 0; phase < Routine::kPhaseCount; ++phase)
+        Check(R.plan.route[phase] == habits.route[phase], "all six boundaries retain the complete immutable target habit plan");
+}
+
+static void TestPointFailureRecovery()
+{
+    SetDaytimeFixture(); w.minute = 600; w.clockRate = 60000;
+    const auto habits = R.plan;
+    const Vector3 workplace = RoutineData::kLocations[habits.route[0]].anchor;
+    w.points = {{601, Joaat("WORLD_HUMAN_BROOM_WORKING"), workplace},
+        {602, Joaat("WORLD_HUMAN_BROOM_WORKING"), {workplace.x + 1.0f, workplace.y, workplace.z}}};
+    BeginTravel(); w.pedPosition = R.centre; Tick();
+    const int failed = w.selectedPoint;
+    Check(failed > 0 && w.pointTasks == 1 && !RoutineActivityObserved(77), "failed-entry fixture starts an unconfirmed work point");
+    Tick(static_cast<unsigned>(RoutineActivity::Controller::kEntryMs));
+    Check(R.activity.IsCoolingDown(failed, w.now) && R.activity.state == RoutineActivity::State::Exiting,
+        "a point whose entry never completes is excluded and exits within the bounded entry deadline");
+    for (int frame = 0; frame < 12 && w.pointTasks < 2; ++frame) Tick();
+    Check(w.pointTasks == 2 && w.selectedPoint > 0 && w.selectedPoint != failed && R.activity.IsCoolingDown(failed, w.now),
+        "failed entry retries a distinct compatible point instead of selecting the same failed handle");
+    const int good = w.selectedPoint;
+    w.scenarioInUse = Scenario(good)->hash; w.scenarioBase = true; Tick();
+    Check(RoutineActivityObserved(77), "another suitable point can recover to an actually observed work activity");
+
+    const int taskCount = TaskCount(), clearCount = w.clears, exitCount = w.scenarioExits, queryCount = w.pointQueries;
+    Tick(16, false); Tick(30000, false);
+    Check(TaskCount() == taskCount && w.clears == clearCount && w.scenarioExits == exitCount && w.pointQueries == queryCount,
+        "combat, search, restraint or handoff priority suppresses movement, activity, exit, clear and discovery calls");
+    // The higher-priority interaction consumes the old scenario. Resume must
+    // select the current clock's lunch activity rather than retry obsolete work.
+    Scenario(good)->user = 0;
+    w.scenarioInUse = 0; w.selectedPoint = 0; w.scenarioTask = w.scenarioBase = false;
+    w.minute = 660;
+    const int lunch = habits.route[4];
+    w.points.push_back({603, Joaat("WORLD_HUMAN_DRINKING"), RoutineData::kLocations[lunch].anchor});
+    for (int frame = 0; frame < 12 && R.destination != lunch; ++frame) Tick();
+    Check(R.destination == lunch && R.controller.state == Routine::State::Travelling && !RoutineActivityObserved(77),
+        "interruption recovery uses the current-time lunch destination and preserves walking transit");
+    w.pedPosition = R.centre;
+    for (int frame = 0; frame < 5 && w.selectedPoint != 603; ++frame) Tick();
+    Check(w.selectedPoint == 603 && R.activity.state == RoutineActivity::State::Entering,
+        "after interruption a compatible lunch point is entered at the current stop");
+    w.scenarioInUse = Joaat("WORLD_HUMAN_DRINKING"); w.scenarioBase = true; Tick();
+    Check(RoutineActivityObserved(77) && R.activity.point.kind == RoutineActivity::Kind::Drink,
+        "interruption recovery reports observed drinking only after the actual scenario base runs");
+    for (int phase = 0; phase < Routine::kPhaseCount; ++phase)
+        Check(R.plan.route[phase] == habits.route[phase], "point failure and priority recovery never reroll identity or workplace");
+}
+
 int main()
 {
+    Check(!RoutineActivityObserved(77), "an unassigned activity is never reported as observed");
     TestPreparedDefinition();
     TestGeneratedTownModels();
     TestPreparationFailureAndFallback();
@@ -1124,5 +1323,7 @@ int main()
     TestUnavailablePhaseContinuesAmbiently();
     TestFailedTravelUsesCachedArea();
     TestRejectedSavedPointCanFindAnotherPoint();
+    TestDailyActivityTransitions();
+    TestPointFailureRecovery();
     std::printf("Routine runtime bridge: %u checks passed.\n", checks);
 }

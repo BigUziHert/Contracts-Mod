@@ -41,6 +41,8 @@ if ($LASTEXITCODE -ne 0) { throw 'Regression tests failed.' }
 & (Join-Path $PSScriptRoot 'run-routine-spawn-tests.ps1') -VisualStudio $VisualStudio
 & (Join-Path $PSScriptRoot 'run-routine-logic-tests.ps1') -VisualStudio $VisualStudio
 & (Join-Path $PSScriptRoot 'run-routine-plan-tests.ps1') -VisualStudio $VisualStudio
+& (Join-Path $PSScriptRoot 'run-routine-activity-tests.ps1') -VisualStudio $VisualStudio
+& (Join-Path $PSScriptRoot 'run-routine-activity-bridge-tests.ps1') -VisualStudio $VisualStudio
 & (Join-Path $PSScriptRoot 'run-routine-runtime-tests.ps1') -VisualStudio $VisualStudio
 & (Join-Path $PSScriptRoot 'run-routine-card-tests.ps1') -VisualStudio $VisualStudio
 & (Join-Path $PSScriptRoot 'run-routine-debug-view-tests.ps1') -VisualStudio $VisualStudio

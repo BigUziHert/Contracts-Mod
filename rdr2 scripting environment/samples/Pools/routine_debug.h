@@ -26,9 +26,28 @@ static const char* ObserveRoutineDebugActivity(RoutineDebugView::Snapshot& snaps
     if (PED::IS_PED_IN_COMBAT(ped, 0) && !snapshot.nativeCombat) return "Fighting another actor";
     if (PED::IS_PED_IN_ANY_VEHICLE(ped, false)) return "In a vehicle";
     if (!snapshot.loaded) return "Paused: area not loaded";
-    if (R.controller.state == Routine::State::Suspended) return "Routine paused";
-    if ((R.selectPending || R.resumeRequested) && !R.ambientFallback) return "Choosing destination";
+    // Route suspension can remain set while an activity exit completes after an
+    // interruption. Loaded, unrestrained transition work is observed separately.
+    if (R.controller.state == Routine::State::Suspended &&
+        R.activity.state != RoutineActivity::State::Entering && R.activity.state != RoutineActivity::State::Exiting)
+        return "Routine paused";
     snapshot.taskActive = RoutineTaskActive(ped);
+    if (R.activity.state == RoutineActivity::State::Exiting) return "Exiting activity scenario";
+    if (R.activity.state == RoutineActivity::State::Entering) return "Entering activity scenario";
+    if (R.activity.state == RoutineActivity::State::Active && RoutineActivityObserved(ped))
+    {
+        switch (R.activity.point.kind)
+        {
+        case RoutineActivity::Kind::Work: return "Working (scenario)";
+        case RoutineActivity::Kind::Eat: return "Eating (scenario)";
+        case RoutineActivity::Kind::Drink: return "Drinking (scenario)";
+        case RoutineActivity::Kind::Social: return "Social activity (scenario)";
+        case RoutineActivity::Kind::Rest: return "Resting (scenario)";
+        case RoutineActivity::Kind::Sleep: return "Sleeping (scenario)";
+        case RoutineActivity::Kind::None: break;
+        }
+    }
+    if ((R.selectPending || R.resumeRequested) && !R.ambientFallback) return "Choosing destination";
     if (snapshot.inScenario)
     {
         if (PED::IS_PED_USING_SCENARIO_HASH(ped, Joaat("WORLD_HUMAN_SMOKE"))) return "Smoking (ambient)";
@@ -39,6 +58,8 @@ static const char* ObserveRoutineDebugActivity(RoutineDebugView::Snapshot& snaps
         return snapshot.taskActive ? "Wandering while route recovers" : "Wander task pending / recovery";
     if (R.controller.state == Routine::State::Travelling)
         return snapshot.taskActive ? "Walking to destination" : "Travel task pending / recovery";
+    if (R.activityFallback)
+        return snapshot.taskActive ? "Wandering while route recovers" : "Wander task pending / recovery";
     return snapshot.taskActive ? "Wandering near destination" : "Wander task pending / recovery";
 }
 
@@ -73,10 +94,11 @@ static RoutineDebugView::Snapshot ObserveRoutineDebug()
     snapshot.loaded = RoutineSpawn::Loaded(target);
     snapshot.inside = INTERIOR::GET_INTERIOR_FROM_COLLISION(target) != 0 || !INTERIOR::IS_COLLISION_MARKED_OUTSIDE(target);
     snapshot.wanderRadius = R.wanderRadius;
-    const int phase = static_cast<int>(Routine::PhaseAt(snapshot.minute, R.plan.offsetMinutes));
-    const int nextPhase = (phase + 1) % 4;
-    const int nextBoundary[] = {840, 1080, 1440, 360};
-    snapshot.nextMinute = Routine::NormalizeMinute(nextBoundary[phase] + R.plan.offsetMinutes);
+    const auto phase = Routine::PhaseAt(snapshot.minute);
+    const int nextPhase = static_cast<int>(Routine::NextPhaseAt(snapshot.minute));
+    snapshot.intended = Routine::PhaseName(phase);
+    snapshot.nextActivity = Routine::PhaseName(Routine::NextPhaseAt(snapshot.minute));
+    snapshot.nextMinute = Routine::NextPhaseMinute(snapshot.minute);
     snapshot.nextDestination = RoutineData::kLocations[R.plan.route[nextPhase]].name;
     snapshot.hasDestination = R.destination >= 0 && R.destination < RoutineData::kLocationCount;
     if (snapshot.hasDestination)
@@ -87,7 +109,8 @@ static RoutineDebugView::Snapshot ObserveRoutineDebug()
         snapshot.destinationValid = R.destinationValid;
         snapshot.destinationOpen = Routine::IsOpen({location.openMinute, location.closeMinute}, snapshot.minute);
         snapshot.fallback = R.ambientFallback ||
-            (location.kind == RoutineData::PlaceKind::Rest && phase != static_cast<int>(Routine::Phase::Rest));
+            (R.activityFallback && R.controller.state != Routine::State::Travelling) ||
+            (location.kind == RoutineData::PlaceKind::Rest && phase != Routine::Phase::Rest);
     }
     snapshot.doing = ObserveRoutineDebugActivity(snapshot);
     return snapshot;

@@ -21,9 +21,11 @@ struct Snapshot
     float x = 0, y = 0, z = 0;
     const char* town = "Unknown";
     const char* occupation = "Unknown";
+    const char* intended = "None";
     const char* doing = "Waiting";
     const char* destination = "None";
     const char* nextDestination = "None";
+    const char* nextActivity = "None";
 };
 using Lines = std::array<std::string, 10>;
 
@@ -103,7 +105,10 @@ inline Lines Format(const Snapshot& snapshot)
         : "Stop: None";
     lines[5] = "Next planned: " + Label(snapshot.nextDestination, 22, "None");
     if (snapshot.nextMinute != -1) lines[5] += " @ " + Time(snapshot.nextMinute);
-    lines[6] = "Plans may change with hours / access.";
+    // Intent is independent of observed action: a lunch destination or a rest
+    // window never establishes that an eating/sleeping scenario actually ran.
+    lines[6] = "Intended: " + Label(snapshot.intended, 18, "None") +
+        " | Next: " + Label(snapshot.nextActivity, 18, "None");
     lines[7] = "Wander: " + Number(snapshot.wanderRadius) + " m | " + (snapshot.inside ? "Indoors" : "Outdoors");
     lines[8] = std::string("Loaded ") + (snapshot.loaded ? "Y" : "N") + " | Routine " + (snapshot.taskActive ? "Y" : "N") +
         " | Open " + (snapshot.hasDestination ? (snapshot.destinationOpen ? "Y" : "N") : "-") +

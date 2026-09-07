@@ -20,9 +20,9 @@ foreach ($bountyName in @('routineDebugEnabled', 'routineDebugNextSampleMs', 'ro
     if ($bountyMatches.Count -ne 1) { throw "Expected exactly one production debug global: $bountyName" }
     $bountyHeader += $bountyMatches[0].Value
 }
-foreach ($bountyName in @('RoutineTaskActive', 'ObserveRoutineDebugActivity', 'ObserveRoutineDebug', 'ToggleRoutineDebug', 'UpdateRoutineDebug')) {
-    $bountySource = if ($bountyName -eq 'RoutineTaskActive') { $bountyRuntime } else { $bountyDebug }
-    $bountyPath = if ($bountyName -eq 'RoutineTaskActive') { $bountyRuntimePath } else { $bountyDebugPath }
+foreach ($bountyName in @('RoutineTaskActive', 'RoutineActivityObserved', 'ObserveRoutineDebugActivity', 'ObserveRoutineDebug', 'ToggleRoutineDebug', 'UpdateRoutineDebug')) {
+    $bountySource = if ($bountyName -in @('RoutineTaskActive', 'RoutineActivityObserved')) { $bountyRuntime } else { $bountyDebug }
+    $bountyPath = if ($bountyName -in @('RoutineTaskActive', 'RoutineActivityObserved')) { $bountyRuntimePath } else { $bountyDebugPath }
     $bountyMatches = [regex]::Matches($bountySource, '(?ms)^static [^\r\n]+\b' + $bountyName + '\([^\r\n]*\)\s*\{.*?^\}')
     if ($bountyMatches.Count -ne 1) { throw "Expected exactly one production debug function: $bountyName" }
     $bountyLine = 1 + ([regex]::Matches($bountySource.Substring(0, $bountyMatches[0].Index), '\n')).Count

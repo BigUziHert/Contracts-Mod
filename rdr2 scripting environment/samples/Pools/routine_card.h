@@ -16,6 +16,6 @@ inline void Draw(const std::array<std::string, 6>& lines)
     for (std::size_t index = 0; index < lines.size(); ++index)
         DrawTextToScreen(lines[index].c_str(), .49f, .375f + static_cast<float>(index) * .027f,
             .28f, 255, 255, 255, 255);
-    DrawTextToScreen("Visits may vary.", .49f, .545f, .25f, 255, 255, 255, 255);
+    DrawTextToScreen("Habits; activities may vary.", .49f, .545f, .25f, 255, 255, 255, 255);
 }
 }

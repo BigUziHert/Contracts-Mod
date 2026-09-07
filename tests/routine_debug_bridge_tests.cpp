@@ -11,6 +11,7 @@ using Hash = unsigned;
 using ULONGLONG = unsigned long long;
 struct Vector3 { float x = 0, y = 0, z = 0; };
 #include "../rdr2 scripting environment/samples/Pools/routine_plan.h"
+#include "../rdr2 scripting environment/samples/Pools/routine_activity.h"
 #include "../rdr2 scripting environment/samples/Pools/target_ai_logic.h"
 #include "../rdr2 scripting environment/samples/Pools/routine_debug_view.h"
 
@@ -53,6 +54,8 @@ struct RuntimeFixture
     Vector3 centre{};
     float wanderRadius = 22.0f;
     Routine::Controller controller;
+    RoutineActivity::Controller activity;
+    bool activityFallback = false, activityPointValid = true;
     bool selectPending = false, resumeRequested = false, destinationValid = true, ambientFallback = false;
 } R;
 struct World
@@ -63,6 +66,8 @@ struct World
     bool hogtied = false, hogtying = false, lassoed = false, ragdoll = false, gettingUp = false;
     bool combatAnyone = false, combatPlayer = false, vehicle = false, sitting = false;
     Hash usingScenario = 0;
+    bool assignedActivity = false;
+    unsigned assignedActivityReads = 0;
     int combatStatus = 7, routineStatus = 0;
     Vector3 player{}, target{3, 4, 0};
     unsigned coordinates = 0, deathReads = 0, liveReads = 0, clockReads = 0;
@@ -143,6 +148,15 @@ static bool IsKeyJustUp(unsigned key)
     Check(key == VK_F8, "production integration consumes only F8 for this toggle");
     ++w.keySamples;
     const bool released = w.releasedF8; w.releasedF8 = false; return released;
+}
+// The runtime suite checks the native evidence behind this read-only boundary;
+// these observer tests check that unconfirmed intended activities never get labels.
+namespace RoutineActivityBridge
+{
+static bool Active(Ped ped, const RoutineActivity::Point&, bool = false)
+{
+    ReadLiving(ped); ++w.assignedActivityReads; return w.assignedActivity;
+}
 }
 #include "routine_debug_bridge_under_test.h"
 
@@ -318,15 +332,33 @@ static void AmbientRecoveryLabels()
 }
 static void ScheduleAndReadOnlySnapshot()
 {
-    struct Case { int minute, offset, nextMinute, nextPhase; };
-    for (const auto& item : std::array<Case, 6>{{{600,0,840,1}, {900,0,1080,2}, {1300,0,0,3},
-        {60,0,360,0}, {0,30,30,3}, {1439,-30,330,0}}})
+    struct Case { int minute, nextMinute; Routine::Phase phase, nextPhase; };
+    using Routine::Phase;
+    for (const auto& item : std::array<Case, 16>{{
+        {0,180,Phase::Leisure,Phase::Rest}, {179,180,Phase::Leisure,Phase::Rest},
+        {180,360,Phase::Rest,Phase::Work}, {359,360,Phase::Rest,Phase::Work},
+        {360,660,Phase::Work,Phase::Lunch}, {659,660,Phase::Work,Phase::Lunch},
+        {660,720,Phase::Lunch,Phase::Work}, {719,720,Phase::Lunch,Phase::Work},
+        {720,960,Phase::Work,Phase::Shops}, {959,960,Phase::Work,Phase::Shops},
+        {960,1140,Phase::Shops,Phase::Leisure}, {1139,1140,Phase::Shops,Phase::Leisure},
+        {1140,180,Phase::Leisure,Phase::Rest}, {1439,180,Phase::Leisure,Phase::Rest},
+        {1440,180,Phase::Leisure,Phase::Rest}, {-1,180,Phase::Leisure,Phase::Rest}}})
+    for (int offset : {-60, -30, 0, 30, 60})
     {
-        Fixture(); w.minute = item.minute; R.plan.offsetMinutes = item.offset;
+        Fixture(); w.minute = item.minute; R.plan.offsetMinutes = offset;
         const auto snapshot = ObserveRoutineDebug();
         Check(snapshot.nextMinute == item.nextMinute && std::strcmp(snapshot.nextDestination,
-            RoutineData::kLocations[R.plan.route[item.nextPhase]].name) == 0, "next scheduled destination handles phase offset and midnight");
+            RoutineData::kLocations[R.plan.route[static_cast<int>(item.nextPhase)]].name) == 0,
+            "next destination uses exact activity boundary across midnight and ignores legacy offsets");
+        Check(std::strcmp(snapshot.intended, Routine::PhaseName(item.phase)) == 0 &&
+            std::strcmp(snapshot.nextActivity, Routine::PhaseName(item.nextPhase)) == 0,
+            "intended and next activity describe the exact current and next time windows");
     }
+    Fixture(); w.minute = 660;
+    const auto lunch = ObserveRoutineDebug();
+    Check(lunch.nextMinute == 720 && std::strcmp(lunch.nextDestination,
+        RoutineData::kLocations[R.plan.route[static_cast<int>(Phase::Work)]].name) == 0,
+        "lunch always advertises a return to the target's same assigned workplace");
     Fixture(); R.destination = -1;
     Check(!ObserveRoutineDebug().hasDestination, "unset destination cannot index the catalogue");
     R.destination = RoutineData::kLocationCount;
@@ -343,6 +375,64 @@ static void ScheduleAndReadOnlySnapshot()
         "observation changes no contract/controller/route/task state");
     Check(DistSq(w.target, originalTarget) == 0 && DistSq(w.player, originalPlayer) == 0 && w.markerUpdates == 0,
         "snapshot changes neither world coordinates nor markers");
+}
+static void AssignedActivityEvidenceAndPriority()
+{
+    struct Case { RoutineActivity::Kind kind; const char* label; };
+    for (const auto& item : std::array<Case, 6>{{
+        {RoutineActivity::Kind::Work,"Working (scenario)"}, {RoutineActivity::Kind::Eat,"Eating (scenario)"},
+        {RoutineActivity::Kind::Drink,"Drinking (scenario)"}, {RoutineActivity::Kind::Social,"Social activity (scenario)"},
+        {RoutineActivity::Kind::Rest,"Resting (scenario)"}, {RoutineActivity::Kind::Sleep,"Sleeping (scenario)"}}})
+    {
+        Fixture(); R.controller.state = Routine::State::Wandering;
+        R.activity.state = RoutineActivity::State::Active;
+        R.activity.point = {42, item.kind, Joaat("WORLD_HUMAN_STARE_STOIC")};
+        Check(Activity() == "Wandering near destination",
+            "active controller metadata without native confirmation cannot claim assigned activity");
+        w.usingScenario = R.activity.point.hash;
+        Check(Activity() == "Ambient scenario",
+            "a generic observed scenario is not proof of the exact assigned activity");
+        w.assignedActivity = true;
+        Check(Activity() == item.label, "confirmed matching assigned scenario produces its specific observed action");
+        R.activityPointValid = false;
+        Check(Activity() == "Ambient scenario", "invalidated point cannot advertise assigned activity even with stale native use evidence");
+        R.activityPointValid = true;
+        w.assignedActivity = false;
+        Check(Activity() == "Ambient scenario", "loss of native confirmation immediately removes assigned action label");
+        w.assignedActivity = true; R.selectPending = true;
+        Check(Activity() == item.label, "a pending route check does not hide a still-performing assigned scenario");
+        R.activity.state = RoutineActivity::State::Entering;
+        Check(Activity() == "Entering activity scenario", "entry state does not prematurely claim eating, sleeping or working");
+        R.activity.state = RoutineActivity::State::Exiting;
+        Check(Activity() == "Exiting activity scenario", "exit state remains distinct even while the old scenario is still active");
+        R.controller.state = Routine::State::Suspended;
+        Check(Activity() == "Exiting activity scenario",
+            "after an interruption, route suspension cannot hide a routine scenario exit already underway");
+        w.loaded = false;
+        Check(Activity() == "Paused: area not loaded", "unloaded area retains priority over the recorded exit transition");
+        w.loaded = true;
+        C.ai.state = TargetAI::State::Search;
+        Check(Activity() == "Searching for player", "search priority overrides routine exit/active labels");
+        C.ai.state = TargetAI::State::Engaged;
+        Check(Activity() == "Fighting", "combat priority overrides routine activity labels");
+        C.combatExitPending = true;
+        Check(Activity() == "Preparing to fight", "combat scenario exit retains its higher-priority distinct label");
+        w.hogtied = true;
+        Check(Activity() == "Hogtied", "restraint priority overrides every assigned scenario label");
+    }
+    for (int minute : {600, 660, 800, 960, 1140, 180})
+    {
+        Fixture(); w.minute = minute; R.activityFallback = true;
+        R.controller.state = Routine::State::Wandering;
+        const auto snapshot = ObserveRoutineDebug();
+        Check(snapshot.fallback && Activity() == "Wandering while route recovers",
+            "failed or unavailable activity shows ambient fallback independently of intended time window");
+        w.routineStatus = 7;
+        Check(Activity() == "Wander task pending / recovery", "missing activity-fallback wander task is not called a successful action");
+        R.controller.state = Routine::State::Travelling; w.routineStatus = 1;
+        Check(Activity() == "Walking to destination" && !ObserveRoutineDebug().fallback,
+            "previous activity failure cannot mislabel current travel as wandering or the new stop as failed");
+    }
 }
 static void SamplingRenderingAndEarlyToggle()
 {
@@ -371,6 +461,6 @@ static void SamplingRenderingAndEarlyToggle()
 int main()
 {
     ExistenceDeathAndFreshCoordinates(); PriorityAndScenarioLabels(); CombatEvidenceBeforePriority(); AmbientRecoveryLabels();
-    ScheduleAndReadOnlySnapshot(); SamplingRenderingAndEarlyToggle();
+    ScheduleAndReadOnlySnapshot(); AssignedActivityEvidenceAndPriority(); SamplingRenderingAndEarlyToggle();
     std::printf("Routine debug bridge: %u checks passed.\n", checks);
 }

@@ -46,19 +46,17 @@ static void CheckDrawnCard(const RoutinePlan::Plan& plan)
     RoutineCard::Draw(lines);
     Check(draws.size() == 8, "complete card draws one title, six actual habit fields and one variation note");
     Check(draws[0].text == "USUAL HAUNTS", "routine section has the requested title");
-    Check(draws[7].text == "Visits may vary.", "card describes habits as variable visits");
-    Check(draws[1].text == std::string("Occupation: ") + RoutinePlan::OccupationName(plan.occupation),
-        "drawn occupation matches the issued plan");
-    Check(draws[2].text == std::string("Town: ") + RoutineData::kTowns[plan.townIndex].name,
-        "drawn town matches the issued plan");
-    const char* phasePrefixes[] = {"Day: ", "Afternoon: ", "Evening: ", "Late: "};
-    for (int phase = 0; phase < 4; ++phase)
+    Check(draws[7].text == "Habits; activities may vary.", "card identifies intended habits without claiming observed activity");
+    Check(draws[1].text == std::string(RoutinePlan::OccupationName(plan.occupation)) + ", " +
+        RoutineData::kTowns[plan.townIndex].name, "drawn occupation and town match the issued plan");
+    const char* phasePrefixes[] = {"Work 06-11/12-16 ", "Errands 16-19 ", "Eve 19-03 ", "Rest 03-06 ", "Lunch 11-12 "};
+    constexpr int drawForPhase[] = {2, 4, 5, 6, 3};
+    for (int phase = 0; phase < Routine::kPhaseCount; ++phase)
     {
         const auto& location = RoutineData::kLocations[plan.route[phase]];
-        const std::string exteriorName = std::string(location.name) == "General store frontage"
-            ? "Store frontage" : location.name;
-        Check(draws[phase + 3].text == std::string(phasePrefixes[phase]) + exteriorName,
-            "drawn habit names the exact selected route location and preserves its exterior qualifier");
+        const std::string exteriorName = RoutinePlan::CardLocationName(location);
+        Check(draws[drawForPhase[phase]].text == std::string(phasePrefixes[phase]) + exteriorName,
+            "drawn habit names the exact selected route area and fixed clock windows");
     }
     for (std::size_t index = 0; index < lines.size(); ++index)
     {

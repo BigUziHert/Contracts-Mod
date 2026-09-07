@@ -22,7 +22,9 @@ inline std::uint64_t TravelEstimateMs(double distance)
     return estimate >= static_cast<double>(maximum) ? maximum : static_cast<std::uint64_t>(estimate);
 }
 struct Window { int startMinute = 0; int endMinute = 0; }; // Equal endpoints mean 24 hours.
-enum class Phase { Work, Shops, Leisure, Rest };
+// Keep existing phase indices stable for saved/in-memory route identities.
+enum class Phase { Work, Shops, Leisure, Rest, Lunch };
+constexpr int kPhaseCount = 5;
 constexpr unsigned PhaseMask(Phase phase) { return 1u << static_cast<unsigned>(phase); }
 constexpr int NormalizeMinute(int minute)
 {
@@ -53,13 +55,34 @@ constexpr int BoundedOffset(std::uint32_t seed, int maximumMinutes = 30)
     const int bound = maximumMinutes < 0 ? 0 : (maximumMinutes > 60 ? 60 : maximumMinutes);
     return static_cast<int>(seed % static_cast<unsigned>(2 * bound + 1)) - bound;
 }
-constexpr Phase PhaseAt(int minute, int offsetMinutes = 0)
+constexpr Phase PhaseAt(int minute, int /*legacyOffsetMinutes*/ = 0)
 {
-    // Offset routine transitions only; never apply it to business opening hours.
-    const int offset = offsetMinutes < -60 ? -60 : (offsetMinutes > 60 ? 60 : offsetMinutes);
-    minute = NormalizeMinute(minute - offset);
-    return minute < 360 ? Phase::Rest : minute < 840 ? Phase::Work :
-        minute < 1080 ? Phase::Shops : Phase::Leisure;
+    // These are exact world-clock windows. Legacy habit offsets are deliberately
+    // ignored, including when an old prepared plan survives a load/interruption.
+    minute = NormalizeMinute(minute);
+    if (minute < 180 || minute >= 1140) return Phase::Leisure;
+    if (minute < 360) return Phase::Rest;
+    if (minute >= 660 && minute < 720) return Phase::Lunch;
+    return minute < 960 ? Phase::Work : Phase::Shops;
+}
+constexpr int NextPhaseMinute(int minute)
+{
+    minute = NormalizeMinute(minute);
+    return minute < 180 ? 180 : minute < 360 ? 360 : minute < 660 ? 660 :
+        minute < 720 ? 720 : minute < 960 ? 960 : minute < 1140 ? 1140 : 180;
+}
+constexpr Phase NextPhaseAt(int minute) { return PhaseAt(NextPhaseMinute(minute)); }
+constexpr const char* PhaseName(Phase phase)
+{
+    switch (phase)
+    {
+    case Phase::Work: return "Work";
+    case Phase::Lunch: return "Lunch";
+    case Phase::Shops: return "Errands";
+    case Phase::Leisure: return "Evening";
+    case Phase::Rest: return "Rest";
+    }
+    return "Unknown";
 }
 struct Candidate
 {

@@ -1,5 +1,10 @@
 # Town target routines
 
+This document records the original route-controller and deployment design. The current
+[daily routine system](daily-routine-system.md) supersedes the four-phase timings and
+ambient-only activity descriptions below. It uses exact work/lunch/errands/evening/rest
+windows, compatible authored scenario points, bounded exits and the existing 45 m fallback.
+
 ## Stage 1: sourced locations and initial deployment
 
 New contracts choose an occupation and a four-destination plan in one of seven towns.

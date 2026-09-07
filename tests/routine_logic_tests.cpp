@@ -47,15 +47,39 @@ static void OpeningWindowsAndArrival()
     Check(!CanArriveAndStay(shop, 600, 1, -1), "invalid stay estimate rejected");
     Check(CanArriveAndStay(allDay, 1400, 2000, 100), "24-hour fallback survives travel across day boundaries");
     Check(PhaseAt(359) == Phase::Rest && PhaseAt(360) == Phase::Work, "morning starts work");
-    Check(PhaseAt(840) == Phase::Shops && PhaseAt(1080) == Phase::Leisure, "afternoon and evening have distinct habits");
-    Check(PhaseAt(0) == Phase::Rest && PhaseAt(1439) == Phase::Leisure, "midnight switches to rest");
-    Check(PhaseAt(370, 30) == Phase::Rest && PhaseAt(390, 30) == Phase::Work, "offset delays routine transition");
+    Check(PhaseAt(960) == Phase::Shops && PhaseAt(1140) == Phase::Leisure, "errands and evening start at exact requested hours");
+    Check(PhaseAt(0) == Phase::Leisure && PhaseAt(1439) == Phase::Leisure, "evening continues across midnight");
+    Check(PhaseAt(370, 30) == Phase::Work && PhaseAt(359, -30) == Phase::Rest, "legacy offsets cannot shift fixed windows");
     for (std::uint32_t seed = 0; seed < 1000; ++seed)
     {
         const int offset = BoundedOffset(seed);
         Check(offset >= -30 && offset <= 30, "contract time variation stays bounded");
         Check(!IsOpen(shop, 1080), "schedule variation never changes shop closing");
     }
+}
+static void ExactDailySchedule()
+{
+    for (int minute = -1440; minute < 2880; ++minute)
+    {
+        const int clock = NormalizeMinute(minute);
+        const Phase expected = clock < 180 || clock >= 1140 ? Phase::Leisure :
+            clock < 360 ? Phase::Rest : clock < 660 ? Phase::Work :
+            clock < 720 ? Phase::Lunch : clock < 960 ? Phase::Work : Phase::Shops;
+        for (int oldOffset : {-100000, -60, -30, 0, 30, 60, 100000})
+            Check(PhaseAt(minute, oldOffset) == expected, "every minute uses exact windows regardless of old offsets or date");
+        const int next = NextPhaseMinute(minute);
+        Check(PhaseAt(next) != expected, "next boundary always changes the intended activity");
+        Check(PhaseAt(NormalizeMinute(next - 1)) == expected, "the minute before the next boundary retains the activity");
+        Check(NextPhaseAt(minute) == PhaseAt(next), "debug next-phase helper follows the same source of schedule truth");
+    }
+    for (const int boundary : {180, 360, 660, 720, 960, 1140})
+        Check(PhaseAt(boundary - 1) != PhaseAt(boundary), "each exact activity boundary includes its start and excludes prior stop");
+    Check(PhaseAt(659) == Phase::Work && PhaseAt(660) == Phase::Lunch && PhaseAt(719) == Phase::Lunch &&
+        PhaseAt(720) == Phase::Work, "lunch overrides work for precisely eleven to noon");
+    Check(PhaseAt(179) == Phase::Leisure && PhaseAt(180) == Phase::Rest && PhaseAt(359) == Phase::Rest,
+        "late evening continues until three, then rest lasts until six");
+    Check(NextPhaseMinute(1439) == 180 && NextPhaseMinute(0) == 180,
+        "midnight does not invent an extra evening-to-rest transition");
 }
 static void CandidateSelection()
 {
@@ -365,7 +389,7 @@ static void PriorityResumeClockAndClosure()
     observation.minute = 1439;
     controller.Tick(config, observation);
     observation.minute = 0;
-    Check(controller.Tick(config, observation).reevaluate, "midnight habit transition reselects overnight destination");
+    Check(!controller.Tick(config, observation).reevaluate, "midnight preserves the active evening destination");
     observation.destinationId = 8;
     controller.Tick(config, observation);
     observation.minute = 1;
@@ -519,6 +543,7 @@ static void FailedTravelUsesAmbientFallback()
 int main()
 {
     OpeningWindowsAndArrival();
+    ExactDailySchedule();
     CandidateSelection();
     TravelArrivalAndWandering();
     ConfiguredAreaArrivalBoundary();

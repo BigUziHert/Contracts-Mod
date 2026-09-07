@@ -34,9 +34,10 @@ update, without changing card render-target selection or portrait code.
 | --- | --- |
 | Clock / town / occupation | Current game time and the current contract's selected identity. |
 | Target distance | Straight-line player-to-target distance from fresh entity coordinates, in metres. |
-| Doing | Combat, search, restraint, vehicle and unloaded-area priorities override the routine controller. Fighting, Searching for player and Preparing to fight append observed combat evidence: task status (0 queued, 1 performing, 7 missing), engine combat Y/N, and SCENARIO / SEATED when detected. For example, `Fighting [task 0, engine Y, SCENARIO, SEATED]` exposes a queued seated engagement despite the policy label. Smoking/drinking requires a confirmed matching scenario and is labelled ambient; other observed scenarios say Ambient scenario. The mod does not start them. Missing routine tasks show pending/recovery rather than claiming movement. |
-| Stop and distance | Assigned destination and straight-line target-to-stop distance. A fallback label identifies the all-day public destination used outside its normal phase, or the cached authored area used while a route is unavailable. |
-| Next planned | The following schedule phase's authored destination and transition time, including this contract's clock offset. Availability can change the actual next stop. |
+| Doing | Combat, search, restraint, vehicle and unloaded-area priorities override routine activities. Fighting, Searching for player and Preparing to fight append observed combat evidence: task status (0 queued, 1 performing, 7 missing), engine combat Y/N, and SCENARIO / SEATED when detected. `Entering activity scenario` and `Exiting activity scenario` describe the controller's transition. Working, eating, drinking, social activity, resting and sleeping labels require a valid assigned point, matching point/type use, confirmed entry followed by actual scenario activity and no native exit. Confirmation first requires the base scenario state; a later active conditional animation remains healthy. Ambient smoking/drinking requires a matching native scenario; other observed scenarios say Ambient scenario. Missing routine tasks show pending/recovery rather than claiming movement. |
+| Stop and distance | Assigned destination and straight-line target-to-stop distance. A fallback label identifies the all-day public destination used outside its normal phase, the cached authored area used while a route is unavailable, or ambient wandering while an activity is unavailable. An old activity failure does not label travel to the next destination as wandering. |
+| Next planned | The following activity's assigned destination and exact transition time. Boundaries are 03:00, 06:00, 11:00, 12:00, 16:00 and 19:00; legacy offsets do not shift them. Evening continues across midnight until 03:00. Lunch's next destination is the same workplace used before lunch. Availability can change the actual next stop. |
+| Intended / Next | Current and next scheduled activity: Work, Lunch, Errands, Evening or Rest. These are plans, separate from the observed Doing line. A saloon frontage does not establish lunch, and a target wandering during Rest is never called sleeping. |
 | Wander / indoors | Configured wander radius (45 m at every stop) and current interior classification. This does not prevent a target from walking indoors. The gameplay search circle uses the same radius and moves to the next stop when the target enters its wander area. During travel it stays at the previous stop. |
 | Loaded / routine / open / valid | Current local collision/navigation residency, observed routine task, the assigned stop's visiting window, and route validation status. `Open` is the mod's exterior visiting window, not a shop's business hours. During cached fallback roaming `Valid N` means fresh route selection is pending; it does not command the ped to stand still. `Routine N` during combat means the routine is not the task being observed. |
 | XYZ | Current target coordinates, useful when reporting a wrong level or blocked route. |
@@ -46,8 +47,10 @@ the combat task and first weapon draw wait for that exit to finish.
 
 When fresh route selection is unavailable, a healthy native task shows **Wandering while
 route recovers** and keeps its authored stop marker. A missing task shows **Wander task
-pending / recovery**. Observed smoking, drinking or another scenario still takes precedence
-over these labels. Periodic selection retries do not hide ongoing fallback activity.
+pending / recovery**. A missing suitable activity uses the same ambient behavior with
+bounded retries. Observed smoking, drinking or another scenario still takes precedence
+over generic wandering labels. Periodic selection retries do not hide a confirmed healthy
+activity; scenario entry and exit remain explicitly labelled until their transition ends.
 
 A dead target shows no travel plan. Its body distance and coordinates remain available
 while it exists. A missing target or removed corpse shows no stale live measurements.
@@ -61,11 +64,14 @@ streaming, clear nearby entities or change discovery.
    locations. Press F8 twice to confirm all debug markers and text hide, then return.
 2. Press U, inspect/put away the card, and walk toward the target. Confirm player distance
    changes independently of the target's distance to its assigned stop.
-3. Watch a scheduled transition. The debug destination marker should identify the newly
+3. Watch all transitions at 03:00, 06:00, 11:00, 12:00, 16:00 and 19:00, plus midnight.
+   The Intended line changes at the exact boundary; midnight retains Evening. The debug destination marker should identify the newly
    selected stop while the yellow search circle stays at the previous stop. When the target
-   enters the new stop's 45 m area, travel should switch to wandering and the search circle
-   should move there. The target need not reach the marker first. The panel should distinguish
-   walking, wandering and any smoking/drinking.
+   enters the new stop's 45 m area, travel should switch to activity discovery or wandering,
+   and the search circle should move there. The target need not reach the marker first.
+   Confirm entry, actual activity and exit have distinct labels. Unavailable lunch or rest
+   points must show wandering/recovery, never eating or sleeping. At noon, check that the
+   same assigned workplace appears again.
 4. Provoke or restrain the target. The panel should show that priority without assigning
    another routine task. After death, it should show body distance without a travel plan.
 5. Replace/end a contract. Exact markers should update/remove while catalog dots remain.

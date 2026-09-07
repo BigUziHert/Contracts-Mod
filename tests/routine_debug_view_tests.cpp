@@ -22,6 +22,7 @@ static RoutineDebugView::Snapshot Live()
     snapshot.loaded = snapshot.taskActive = snapshot.destinationOpen = snapshot.destinationValid = true;
     snapshot.minute = 1073; snapshot.nextMinute = 1115;
     snapshot.town = "Valentine"; snapshot.occupation = "Livestock hand";
+    snapshot.intended = "Errands"; snapshot.nextActivity = "Evening";
     snapshot.doing = "Walking"; snapshot.destination = "Stable frontage"; snapshot.nextDestination = "Smithfield's frontage";
     snapshot.playerDistance = 63.125f; snapshot.destinationDistance = 12.375f; snapshot.wanderRadius = 26;
     snapshot.x = -269.75f; snapshot.y = 785.4375f; snapshot.z = 118.5f;
@@ -44,7 +45,8 @@ int main()
     Check(Format(snapshot)[4] == "Stop: General store frontage | 12.4 m", "authored stop names remain readable without truncation");
     snapshot.destination = "Stable frontage";
     Check(lines[3] == "Doing: Walking" && snapshot.doing == std::string("Walking"), "doing is displayed without mutating the snapshot");
-    Check(lines[5] == "Next planned: Smithfield's frontage @ 18:35" && Contains(lines, "Plans may change"), "future stop and time are explicitly a changeable plan");
+    Check(lines[5] == "Next planned: Smithfield's frontage @ 18:35", "future stop and time are explicitly a plan");
+    Check(lines[6] == "Intended: Errands | Next: Evening", "current and next intended activities are distinct from observed doing");
     Check(!Contains(lines, "will arrive") && !Contains(lines, "guaranteed"), "future schedule never promises arrival");
     Check(lines[7] == "Wander: 26.0 m | Outdoors", "wander radius is separate from interior status");
     Check(lines[8] == "Loaded Y | Routine Y | Open Y | Valid Y", "native and destination validity states stay distinct");
@@ -112,17 +114,34 @@ int main()
     Check(Format(snapshot)[5].find('@') == std::string::npos, "unknown next time never displays a fabricated clock value");
 
     snapshot = Live(); snapshot.town = nullptr; snapshot.occupation = nullptr; snapshot.doing = nullptr;
+    snapshot.intended = snapshot.nextActivity = nullptr;
     snapshot.destination = nullptr; snapshot.nextDestination = nullptr;
     lines = Format(snapshot);
-    Check(lines[1] == "Unknown | Unknown" && lines[3] == "Doing: Waiting" && Contains(lines, "Next planned: None"), "all externally supplied text fields are null safe");
+    Check(lines[1] == "Unknown | Unknown" && lines[3] == "Doing: Waiting" && Contains(lines, "Next planned: None") &&
+        lines[6] == "Intended: None | Next: None", "all externally supplied text fields are null safe");
     const std::string longText(10000, 'A');
-    snapshot.town = snapshot.occupation = snapshot.doing = snapshot.destination = snapshot.nextDestination = longText.c_str();
+    snapshot.town = snapshot.occupation = snapshot.doing = snapshot.destination = snapshot.nextDestination =
+        snapshot.intended = snapshot.nextActivity = longText.c_str();
     snapshot.fallback = true;
     lines = Format(snapshot);
     for (const auto& line : lines) Check(line.size() <= 60, "long snapshot labels cannot overflow the compact panel rows");
     Check(Contains(lines, "..."), "overlong labels are visibly truncated");
     snapshot = Live(); snapshot.doing = "Walking\n\r\tto shop";
     Check(Format(snapshot)[3].find_first_of("\n\r\t") == std::string::npos, "control characters cannot create extra overlay rows");
+
+    for (const char* intended : {"Work", "Lunch", "Errands", "Evening", "Rest"})
+    {
+        snapshot = Live(); snapshot.intended = intended; snapshot.doing = "Wandering while route recovers";
+        lines = Format(snapshot);
+        Check(lines[6].find(intended) != std::string::npos && lines[3] == "Doing: Wandering while route recovers",
+            "intended activity never relabels observed fallback wandering as work, eating or sleeping");
+    }
+    for (const char* doing : {"Entering activity scenario", "Exiting activity scenario", "Eating (scenario)", "Sleeping (scenario)"})
+    {
+        snapshot = Live(); snapshot.doing = doing;
+        Check(Format(snapshot)[3] == std::string("Doing: ") + doing,
+            "actual entry, exit and confirmed scenario observations remain distinct from intent");
+    }
 
     for (float bad : {std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity(), 1.0e30f})
     {

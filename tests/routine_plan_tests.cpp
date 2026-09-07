@@ -40,7 +40,7 @@ static void DefaultsAndInvalidInputs()
     Check(Build(plan, 0, RoutineData::Local, 77), "valid preparation succeeds before replacement failure");
     Check(!Build(plan, 0, RoutineData::DockWorker, 88), "town without dock-worker workplace rejected");
     CheckEmpty(plan);
-    Routine::Candidate candidates[4];
+    Routine::Candidate candidates[Routine::kPhaseCount];
     for (auto& candidate : candidates) candidate.id = 999;
     Check(!Candidates(plan, candidates), "unprepared plan rejects candidate conversion");
     for (const auto& candidate : candidates)
@@ -60,13 +60,12 @@ static void TownRoleSeedCoverageAndTruthfulCards()
         {true, true, false, true}, {true, true, true, false},
         {true, true, true, false}, {true, true, false, false}
     };
-    const char* prefixes[4] = {"Day: ", "Afternoon: ", "Evening: ", "Late: "};
     Check(RoutineData::kTownCount == 7, "coverage table includes every authored town");
     for (int town = 0; town < RoutineData::kTownCount; ++town)
         for (int role = 0; role < 4; ++role)
         {
             const unsigned occupation = 1u << role;
-            std::set<int> visited[4];
+            std::set<int> visited[Routine::kPhaseCount];
             for (std::uint32_t seed = 0; seed < 128; ++seed)
             {
                 Plan plan, repeat;
@@ -76,55 +75,67 @@ static void TownRoleSeedCoverageAndTruthfulCards()
                 Check(Valid(plan), "constructed route is valid");
                 Check(plan.seed == seed && plan.townIndex == town && plan.occupation == occupation,
                     "constructed plan preserves contract identity");
-                Check(plan.offsetMinutes >= -30 && plan.offsetMinutes <= 30, "habit time offset remains within half an hour");
+                Check(plan.offsetMinutes == 0, "new habits do not generate legacy schedule offsets");
                 Check(Build(repeat, town, occupation, seed), "same seed preparation succeeds");
-                Check(repeat.offsetMinutes == plan.offsetMinutes, "time variation is deterministic per contract");
-                Routine::Candidate candidates[4];
+                Check(repeat.offsetMinutes == 0, "repeated preparation preserves fixed schedule times");
+                Routine::Candidate candidates[Routine::kPhaseCount];
                 Check(Candidates(plan, candidates), "complete plan builds live-selection candidates");
                 const auto lines = CardLines(plan);
-                Check(lines[1] == std::string("Town: ") + RoutineData::kTowns[town].name, "card uses actual contract town");
+                Check(lines[0] == std::string(OccupationName(occupation)) + ", " + RoutineData::kTowns[town].name,
+                    "card uses actual contract occupation and town");
                 for (const auto& line : lines)
+                {
+                    if (line.size() > 32) std::fprintf(stderr, "Oversized card field (%zu): %s\n", line.size(), line.c_str());
                     Check(!line.empty() && line.size() <= 32, "every card line fits a bounded readable field");
-                for (int phase = 0; phase < 4; ++phase)
+                }
+                for (int phase = 0; phase < Routine::kPhaseCount; ++phase)
                 {
                     Check(plan.route[phase] == repeat.route[phase], "same contract seed selects same route");
                     visited[phase].insert(plan.route[phase]);
                     const auto& location = RoutineData::kLocations[plan.route[phase]];
                     Check(location.enabled && location.town == RoutineData::kTowns[town].id,
                         "every habit refers to an enabled same-town place");
-                    Check(static_cast<int>(location.kind) == phase && (location.occupations & occupation) != 0,
+                    Check(RoutineData::SupportsPhase(location, static_cast<Routine::Phase>(phase)) && (location.occupations & occupation) != 0,
                         "habit destination matches time phase and target occupation");
                     const auto& candidate = candidates[phase];
                     Check(candidate.id == plan.route[phase] && candidate.phases == (1u << phase),
-                        "live destination IDs are exactly the four card habit destinations");
+                        "live destination IDs are exactly the five card habit destinations");
                     Check(candidate.occupations == location.occupations && candidate.available,
                         "candidate retains authored occupation and availability constraints");
-                    Check(candidate.hours.startMinute == location.openMinute && candidate.hours.endMinute == location.closeMinute,
-                        "routine offset cannot change the actual destination visiting window");
+                    const Routine::Window expectedHours = phase == 4 ? Routine::Window{660, 720} :
+                        phase == 2 ? Routine::Window{1140, 180} : Routine::Window{location.openMinute, location.closeMinute};
+                    Check(candidate.hours.startMinute == expectedHours.startMinute && candidate.hours.endMinute == expectedHours.endMinute,
+                        "candidate uses exact lunch and evening windows without legacy offsets");
                     Check(candidate.travelMinutes == 0 && candidate.fallback == (phase == 3),
                         "bridge supplies travel estimate and only overnight place is fallback");
-                    const std::string name = std::string(location.name) == "General store frontage"
-                        ? "Store frontage" : location.name;
-                    Check(lines[phase + 2] == std::string(prefixes[phase]) + name,
-                        "card names actual selected location with its exterior qualifier");
+                    constexpr int rowForPhase[] = {1, 3, 4, 5, 2};
+                    constexpr const char* prefixes[] = {"Work 06-11/12-16 ", "Errands 16-19 ", "Eve 19-03 ", "Rest 03-06 ", "Lunch 11-12 "};
+                    Check(lines[rowForPhase[phase]] == std::string(prefixes[phase]) + CardLocationName(location),
+                        "card names intended place and exact schedule while preserving exterior meaning");
                 }
-                Check(Routine::SelectDestination(candidates, 4, Routine::Phase::Work, occupation, 600, 15, seed) == plan.route[0],
+                Check(Routine::SelectDestination(candidates, Routine::kPhaseCount, Routine::Phase::Work, occupation, 600, 15, seed) == plan.route[0],
                     "daytime selection visits the card's actual day destination");
-                Check(Routine::SelectDestination(candidates, 4, Routine::Phase::Leisure, occupation, 1320, 15, seed) == plan.route[2],
+                Check(Routine::SelectDestination(candidates, Routine::kPhaseCount, Routine::Phase::Leisure, occupation, 1320, 15, seed) == plan.route[2],
                     "evening selection visits the card's actual evening destination");
+                Check(Routine::SelectDestination(candidates, Routine::kPhaseCount, Routine::Phase::Lunch, occupation, 660, 15, seed) == plan.route[4],
+                    "eleven o'clock switches to the assigned meal location");
+                Check(Routine::SelectDestination(candidates, Routine::kPhaseCount, Routine::Phase::Work, occupation, 720, 15, seed) == plan.route[0],
+                    "noon returns to the identical morning workplace without rerolling");
+                Check(Routine::SelectDestination(candidates, Routine::kPhaseCount, Routine::Phase::Leisure, occupation, 120, 15, seed) == plan.route[2],
+                    "two in the morning still chooses the evening area");
                 candidates[0].available = false;
-                Check(Routine::SelectDestination(candidates, 4, Routine::Phase::Work, occupation, 600, 15, seed) == plan.route[3],
+                Check(Routine::SelectDestination(candidates, Routine::kPhaseCount, Routine::Phase::Work, occupation, 600, 15, seed) == plan.route[3],
                     "unavailable work falls back to another truthful card destination");
                 const auto stillSame = CardLines(plan);
                 Check(stillSame == lines, "live candidate unavailability does not reroll printed habits");
             }
             if (!supported[town][role]) continue;
-            for (int phase = 0; phase < 4; ++phase)
+            for (int phase = 0; phase < Routine::kPhaseCount; ++phase)
                 for (int index = 0; index < RoutineData::kLocationCount; ++index)
                 {
                     const auto& location = RoutineData::kLocations[index];
                     if (location.enabled && location.town == RoutineData::kTowns[town].id &&
-                        static_cast<int>(location.kind) == phase && (location.occupations & occupation) != 0)
+                        RoutineData::SupportsPhase(location, static_cast<Routine::Phase>(phase)) && (location.occupations & occupation) != 0)
                         Check(visited[phase].contains(index), "seed range reaches every eligible authored location");
                 }
         }
@@ -170,11 +181,64 @@ static void CorruptOrStalePlanCannotPrintClues()
     plan = Plan{};
     CheckEmpty(plan);
 }
+static void MealMetadataAndFailureKeepTruthfulStableHabits()
+{
+    unsigned saloons = 0, publicMeals = 0;
+    for (const auto& location : RoutineData::kLocations)
+    {
+        const auto venue = RoutineData::LunchVenueFor(location);
+        Check(RoutineData::SupportsPhase(location, Routine::Phase::Lunch) ==
+            (venue != RoutineData::LunchVenue::None), "only explicitly classified meal areas are lunch candidates");
+        if (venue == RoutineData::LunchVenue::Saloon) ++saloons;
+        if (venue == RoutineData::LunchVenue::PublicMealFallback)
+        {
+            ++publicMeals;
+            Check(location.town == RoutineData::TownId::Strawberry || location.town == RoutineData::TownId::Annesburg,
+                "public meal fallback is explicit only where no local saloon anchor was established");
+        }
+        if (std::strstr(location.id, "theatre") || std::strstr(location.id, "vaudeville") ||
+            std::strstr(location.id, "lantern"))
+            Check(venue == RoutineData::LunchVenue::None, "theatre frontage is not relabeled a saloon or lunch activity");
+        Check(location.wanderRadius == 45.0f, "every activity area retains the established ambient fallback radius");
+    }
+    Check(saloons == 7 && publicMeals == 4, "metadata covers source-supported saloons and explicit public alternatives");
+    for (int town = 0; town < RoutineData::kTownCount; ++town)
+    {
+        Plan plan;
+        Check(Build(plan, town, GeneratedOccupation(town, 7), 7), "each generated town has a full lunch-enabled routine");
+        const auto printed = CardLines(plan);
+        const int workplace = plan.route[0];
+        const auto lunchVenue = RoutineData::LunchVenueFor(RoutineData::kLocations[plan.route[4]]);
+        Check(lunchVenue == ((town == 3 || town == 6) ? RoutineData::LunchVenue::PublicMealFallback :
+            RoutineData::LunchVenue::Saloon), "every town uses a real saloon approach or clearly classified local fallback");
+        Routine::Candidate candidates[Routine::kPhaseCount];
+        Check(Candidates(plan, candidates), "valid meal plan converts to native-free selection candidates");
+        candidates[4].available = false;
+        Check(Routine::SelectDestination(candidates, Routine::kPhaseCount, Routine::Phase::Lunch,
+            plan.occupation, 660, 15, plan.seed) == plan.route[3],
+            "unavailable lunch venue uses an explicit ambient destination without implying a meal");
+        candidates[4].available = true;
+        candidates[4].travelMinutes = 61;
+        Check(Routine::SelectDestination(candidates, Routine::kPhaseCount, Routine::Phase::Lunch,
+            plan.occupation, 660, 0, plan.seed) == plan.route[3],
+            "a destination that cannot be reached during lunch is rejected rather than delaying the noon return");
+        candidates[4].travelMinutes = 0;
+        Check(Routine::SelectDestination(candidates, Routine::kPhaseCount, Routine::Phase::Lunch,
+            plan.occupation, 661, 15, plan.seed) == plan.route[4], "recovered meal availability restores the stable lunch destination");
+        Check(plan.route[0] == workplace && CardLines(plan) == printed,
+            "meal failures and retries cannot reroll assigned workplace or printed identity");
+        plan.offsetMinutes = 60;
+        Check(Routine::PhaseAt(660, plan.offsetMinutes) == Routine::Phase::Lunch &&
+            Routine::PhaseAt(720, plan.offsetMinutes) == Routine::Phase::Work,
+            "old loaded habit metadata cannot delay lunch or the return to work");
+    }
+}
 int main()
 {
     DefaultsAndInvalidInputs();
     TownRoleSeedCoverageAndTruthfulCards();
     IssuedContractsCanReachEveryCatalogSite();
     CorruptOrStalePlanCannotPrintClues();
+    MealMetadataAndFailureKeepTruthfulStableHabits();
     std::printf("routine_plan: %u checks passed\n", checks);
 }

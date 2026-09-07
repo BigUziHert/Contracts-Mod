@@ -17,16 +17,27 @@ The script sources below are the owner's local `RDR3-Decompiled-Scripts-master/1
 
 The extra dock is a daytime Work destination for dock workers and laborers. Both owner-supplied anchors retain bounded ground, exterior and clearance validation. The earlier proposal documents record the original catalogue; this table and `routine_locations.h` describe the current corrections.
 
-## Hours and what a visit means
+## Fixed schedule and what a visit means
+
+The current schedule is **06:00–11:00 Work, 11:00–12:00 Lunch, 12:00–16:00 the same Work location, 16:00–19:00 Errands, 19:00–03:00 Evening, and 03:00–06:00 Rest**. Lunch takes precedence over work. The evening window continues through midnight; midnight itself is not a transition. Previous per-target clock offsets are ignored, including offsets carried by an old prepared plan. Seeded variation changes preferred areas and compatible activity choices, never these hours.
+
+Each contract has five immutable preferred areas: one workplace used both before and after lunch, a lunch area, an errands area, an evening area, and a nighttime area. A failed activity or unavailable destination does not rewrite those habits. The card lists the exact hours and intended areas, with a note that activities may vary; only the live observer can say the target is actually using an eating, drinking or rest scenario.
 
 | Location kind | Authored visiting window | Implemented meaning of the catalog entry |
 | --- | --- | --- |
-| Work | 06:00–18:00 | Daytime presence near the selected workplace or market; the target's profile must be compatible. This is not a claim that an employer or business is currently operating. |
-| Shops | 08:00–20:00 | Presence near an outdoor shop frontage or public market; no transaction, haircut or outfit purchase is implied. |
-| Leisure | 17:00–02:00 | Evening ambient loitering near a saloon or, in Strawberry, the hotel frontage. The window crosses midnight. |
-| Rest | All day | Public outdoor fallback and overnight loitering area. This does not mean the target rents a room or sleeps at a newspaper stand. |
+| Work | Candidate area 06:00–16:00; requested activity excludes lunch | Attempt a compatible existing work scenario around the assigned workplace; continue ambient wandering if none is usable. An approach does not prove an employer is currently operating. |
+| Lunch | 11:00–12:00, including expected arrival | Prefer a source-supported saloon approach and discover an available compatible eating/drinking point. Arrival at the frontage never proves lunch happened. See the explicit local fallback exceptions below. |
+| Shops / Errands | Requested activity 16:00–19:00; outdoor area bounds 08:00–20:00 | Suitable public frontage/market activity and ambient wandering. No transaction, haircut or purchase is implied. |
+| Leisure / Evening | 19:00–03:00, including expected arrival | Compatible saloon/social/campfire points, then continued ambient behavior with retries when none is usable. The approach remains an outdoor area, with no asserted interior opening time. |
+| Rest | Requested activity 03:00–06:00; outdoor fallback area available all day | Discover existing compatible rest/sleep points around the assigned nighttime area. No bed coordinates, rented rooms or floor-level sleep animations are invented. Without a valid point the target continues ambient behavior and is not reported as sleeping. |
 
-The `openMinute` and `closeMinute` field names describe availability to the **mod's routine**, not verified Rockstar business hours. An equal pair means all day. All enabled destinations are exterior candidate areas, so closing a venue never requires sending the target into a locked interior. The route controller must consider expected arrival before selecting a destination near the end of its visiting window.
+The `openMinute` and `closeMinute` field names describe availability to the **mod's routine**, not verified Rockstar business hours. An equal pair means all day. All enabled destination anchors remain exterior candidate areas; lunch and evening candidates add their exact phase visiting window separately. Scenario discovery must independently validate the actual point and current interior access. The route controller considers expected arrival before selecting a destination near the end of its visiting window.
+
+### Saloon coverage and explicit local fallback
+
+`LunchVenueFor` explicitly recognizes Rhodes saloon, Blackwater saloon, Valentine's Smithfield's and Keane's, Saint Denis slum and fancy saloons, and Van Horn saloon. Existing source anchors below and in the expansion proposals remain unchanged. Theatre approaches are never classified as saloons. The named Blackwater campfire (`blackwater.c:830`) is also an evening social candidate.
+
+The local review found **no source-supported local saloon arrival area for Strawberry or Annesburg**. Strawberry's source labels distinguish its hotel/porch (`strawberry.c:662–666`) and public newspaper area (`strawberry.c:691`); this does not make the hotel a saloon. Annesburg uses the already catalogued station approach (`train_fast_travel_core.c:2057`) and public main street (`rcm_edith_down21.c:3038`). Those four entries carry `PublicMealFallback` metadata and attempt only compatible existing meal points. Unavailable points lead to ordinary ambient behavior and retries. The routine does not fabricate a tavern or impose an out-of-town walk that cannot fit the one-hour break. This is an explicit coverage limitation for saloon lunch, while those towns still receive every schedule phase and runtime activity attempt.
 
 Live venue availability needs more than a clock lookup. For example, [theatre_ticket_taker.c:1299](<C:/Users/caleb/Desktop/RDR2 Coding/RDR3-Decompiled-Scripts-master/1491.50/theatre_ticket_taker.c:1299>) chooses its no-show response using `func_110`; [the helper at 2726](<C:/Users/caleb/Desktop/RDR2 Coding/RDR3-Decompiled-Scripts-master/1491.50/theatre_ticket_taker.c:2726>) reads the theatre manager's active-show record. The adjoining door setup at 2735–2750 also reads world state. No stable read-only native interface for this complete availability state was established. Theatre interiors, gambling participation and shop services are therefore outside this enabled catalog, rather than being described as available at guessed times.
 

@@ -26,7 +26,7 @@ static bool IsRoutine(const ContractDef& definition) { return definition.routine
 enum ContractState { CONTRACT_NONE, CONTRACT_UNKNOWN, CONTRACT_FOUND, CONTRACT_DEAD, CONTRACT_PAID };
 static ContractState g_state = CONTRACT_UNKNOWN;
 static struct Contract { const ContractDef* def = nullptr; Blip searchBlip = 0; Vector3 targetPos; } C;
-static struct Routine
+static struct RoutineFixture
 {
     Vector3 centre;
     float wanderRadius = RoutineData::kWanderRadius;

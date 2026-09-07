@@ -1,5 +1,11 @@
 # Routine activities and Saint Denis transit evidence
 
+Historical research and original implementation report. The [current daily routine
+system](daily-routine-system.md) now borrows compatible existing scenario points for work,
+lunch, errands, evening and rest; its [source evidence](daily-routine-sources.md) distinguishes
+those activities from persistent-character schedules. Statements below that all assigned
+activities are disabled describe the earlier build. Minigame and tram exclusions remain.
+
 Research date: 2026-09-06. The local Rockstar scripts cited below are from `C:\Users\caleb\Desktop\RDR2 Coding\RDR3-Decompiled-Scripts-master\1491.50`. They establish actual game call patterns; native-shim tests cannot establish animation, prop, pathfinding, streaming or corpse behavior in the running game.
 
 The routine implementation uses physical walking and native area wandering. The earlier forced in-place smoking/drinking tasks have been removed after the owner observed awkward stops in the road. The game can choose ambient pauses while wandering; their occurrence and placement remain an in-game check. True poker, blackjack, five-finger fillet, theatre attendance, shop transactions, haircuts and ambient tram travel remain disabled. Card clues describe selected destinations; visiting a street outside a shop is not implemented shopping.
