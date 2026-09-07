@@ -34,7 +34,7 @@ update, without changing card render-target selection or portrait code.
 | --- | --- |
 | Clock / town / occupation | Current game time and the current contract's selected identity. |
 | Target distance | Straight-line player-to-target distance from fresh entity coordinates, in metres. |
-| Doing | Combat, search, restraint, vehicle and unloaded-area priorities override the routine controller. Smoking/drinking requires a confirmed matching scenario and is labelled ambient; other observed scenarios say Ambient scenario. The mod does not start them. Missing tasks show pending/recovery rather than claiming movement. |
+| Doing | Combat, search, restraint, vehicle and unloaded-area priorities override the routine controller. Fighting, Searching for player and Preparing to fight append observed combat evidence: task status (0 queued, 1 performing, 7 missing), engine combat Y/N, and SCENARIO / SEATED when detected. For example, `Fighting [task 0, engine Y, SCENARIO, SEATED]` exposes a queued seated engagement despite the policy label. Smoking/drinking requires a confirmed matching scenario and is labelled ambient; other observed scenarios say Ambient scenario. The mod does not start them. Missing routine tasks show pending/recovery rather than claiming movement. |
 | Stop and distance | Assigned destination and straight-line target-to-stop distance. A fallback label identifies the all-day public destination used outside its normal phase. |
 | Next planned | The following schedule phase's authored destination and transition time, including this contract's clock offset. Availability can change the actual next stop. |
 | Wander / indoors | Configured wander radius and current interior classification. This does not prevent a target from walking indoors. |

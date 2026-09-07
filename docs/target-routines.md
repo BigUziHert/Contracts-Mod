@@ -104,7 +104,9 @@ ETA. A destination needs at least 15 game minutes for a visit after expected arr
 closure during travel triggers another selection. Windows crossing midnight work normally.
 
 `TASK_FOLLOW_NAV_MESH_TO_COORD` follows `act_hunting_2.c:10128` for walking speed, flags
-and unconstrained heading. Travel has a five-minute gameplay deadline, a 20-second
+and unconstrained heading. ETA and each trip's gameplay deadline share a named walking
+speed of 1 metre/second and a 1.2 detour factor. The deadline has a five-minute floor;
+long routes receive more time. Travel retains a 20-second
 no-progress threshold, a four-second recovery interval and at most two retries. Failed
 destinations cool down for 60 seconds. Navigation failure uses the selected all-day public
 fallback, otherwise an explicit waiting state. Arrival starts fixed-centre local wandering.
@@ -114,10 +116,14 @@ Per-frame travel never starts a global scene load or waits. It requests missing 
 and navmesh at a bounded rate and suspends tasks while the target's local navigation is
 unloaded. Destination validation is at most once per second; selection retries at most
 once per five seconds. Settled fallback visits reconsider the preferred destination after
-60 seconds. This recheck does not reset a travelling fallback's stuck/deadline accounting.
+60 seconds. A pause/fade or fallback recheck still reselects for the current clock, but
+keeps a healthy travelling/wandering task when the selected destination is unchanged.
+It preserves the validated centre, wander radius and trip progress/deadline accounting.
 Portrait deployment can reload its distant destination once if capture outlasted residency.
 
-The combat policy runs first. Combat against anyone, an active combat task, pending
+The combat policy runs first. Engagement requests a scenario exit before combat tasking;
+a stuck seated/queued engagement enters bounded recovery after its 2.5-second settle
+window. Search similarly requests a directed normal exit. Combat against anyone, an active combat task, pending
 engagement, last-known-position search, ragdoll, getting up, lasso, being hogtied, hogtied
 and riding in a vehicle suppress routine tasks. After those priorities end, the controller
 selects for the current clock instead of returning to the original spawn. Time jumps and
@@ -128,7 +134,8 @@ destination, retry and cooldown state via its existing hook. Active targets neve
 A stale native player-combat flag alone does not override the combat policy's completed
 search. Pending/active combat tasks, new engagement and combat against other actors still
 block routines. A changed accumulated pause duration forces one fresh selection even when
-the outer loop skipped all routine updates during the pause/fade.
+the outer loop skipped all routine updates during the pause/fade. Healthy tasks at an
+unchanged destination survive that selection; a changed phase/destination still travels.
 
 A target can enter an interior through normal AI, including during combat. The outdoor
 test applies to authored spawn/arrival points, not to combat position. Routine venues are
@@ -158,10 +165,15 @@ smoking point, impose a duration, or start a scenario on arrival. Natural pauses
 still occur and need observation in game.
 
 While Wandering, an observed `IS_PED_USING_ANY_SCENARIO` counts as a healthy task, so the
-task-loss watchdog does not repeatedly cancel an ambient pause. Travel still requires
-its navigation task and retains bounded recovery. Residency checks replace destination
-clearance probes during an observed ambient scenario and for five seconds afterward,
-so the target's own props do not invalidate the stop. Phase changes, visiting windows,
+task-loss watchdog does not repeatedly cancel an ambient pause. Any observed healthy
+wander task resets its recovery budget, so separate recovered interruptions do not
+eventually cool down a valid stop. Travel still requires its navigation task and retains
+bounded recovery; a stall retry resets its distance baseline to allow real detours.
+Held wandering destinations retain residency, ground/exterior, water and visiting-hour
+checks without occupied-space or body-clearance probes. Bystanders and scenario props
+at the fixed centre therefore do not cancel an otherwise valid visit. Travelling
+destinations retain full clearance validation. Scheduled Travel/Wait departures request
+a normal scenario exit before their task when a scenario was observed. Phase changes, visiting windows,
 streaming and encounter priorities retain precedence. Debug text observes actual
 smoking, drinking or another scenario; it does not infer activity from the destination.
 
