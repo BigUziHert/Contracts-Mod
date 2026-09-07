@@ -6,6 +6,8 @@ Targets follow daily walking routes in Rhodes, Blackwater, Valentine, Strawberry
 
 The destination windows are authored outdoor visiting hours, not verified business opening hours. Actual shopping, haircuts, work animations, poker, blackjack, five-finger fillet, theatre attendance and tram travel remain disabled. Construction and other changing sites without verified availability checks are omitted. Spawn points receive ground, navigation, exterior and clearance checks, but the new locations, routes and activities still need in-game validation.
 
+If the next destination is unavailable, the target keeps ambiently wandering at its last accepted spawn/arrived stop while route selection retries. It no longer receives an indefinite stand-still task. Existing ambient scenarios continue, and repeated checks of the old arrival point no longer cancel an established visit. See [the destination-freeze fix](docs/routine-ambient-fallback-2026-09-07.md).
+
 1. Visit a station clerk and choose **Get Contract**, or press **U** to receive a contract remotely.
 2. Read the card, find the target, and complete the hunt.
 3. Photograph the target's corpse when prompted.

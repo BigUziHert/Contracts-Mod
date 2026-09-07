@@ -117,17 +117,29 @@ and unconstrained heading. ETA and each trip's gameplay deadline share a named w
 speed of 1 metre/second and a 1.2 detour factor. The deadline has a five-minute floor;
 long routes receive more time. Travel retains a 20-second
 no-progress threshold, a four-second recovery interval and at most two retries. Failed
-destinations cool down for 60 seconds. Navigation failure uses the selected all-day public
-fallback, otherwise an explicit waiting state. Arrival starts fixed-centre local wandering.
+destinations cool down for 60 seconds. Navigation failure tries the selected all-day public
+fallback. If neither route is usable, the target uses native 35 m wandering around the last
+accepted spawn/arrived stop while selection retries. The cached centre never follows the
+ped's footsteps and never comes from a failed travel endpoint. Arrival starts fixed-centre local wandering.
 Tasks are issued on transitions or bounded recovery, never once per frame.
 
 Per-frame travel never starts a global scene load or waits. It requests missing collision
 and navmesh at a bounded rate and suspends tasks while the target's local navigation is
-unloaded. Destination validation is at most once per second; selection retries at most
-once per five seconds. Settled fallback visits reconsider the preferred destination after
+unloaded. Incoming destinations are validated at most once per second. An established
+wandering visit retains its accepted centre through native ambient pauses and task-recovery
+gaps, without repeating spawn-point geometry/clearance checks there. Failed selection retries
+use a five-second interval. Settled public-fallback visits reconsider the preferred destination after
 60 seconds. A pause/fade or fallback recheck still reselects for the current clock, but
 keeps a healthy travelling/wandering task when the selected destination is unchanged.
 It preserves the validated centre, wander radius and trip progress/deadline accounting.
+If a saved endpoint is rejected, another bounded point in the same authored area can be
+accepted; a changed centre requires a new movement task even when the location ID is the same.
+Selection failure keeps a real stop assigned. The controller's Waiting state now means
+ambient wandering during route recovery, with no `TASK_STAND_STILL` call. Missing fallback
+wander tasks receive a 1.5-second absence grace and four-second retry interval without a
+permanent retry-exhaustion freeze. Healthy fallback wandering/scenarios stay uninterrupted.
+Accepting that same area again does not send the target back to its centre. Exterior
+fallback loitering can continue beyond its authored visiting hours until a route is usable.
 Portrait deployment can reload its distant destination once if capture outlasted residency.
 
 The combat policy runs first. Engagement requests a scenario exit and waits for the
@@ -180,11 +192,13 @@ task-loss watchdog does not repeatedly cancel an ambient pause. Any observed hea
 wander task resets its recovery budget, so separate recovered interruptions do not
 eventually cool down a valid stop. Travel still requires its navigation task and retains
 bounded recovery; a stall retry resets its distance baseline to allow real detours.
-Held wandering destinations retain residency, ground/exterior, water and visiting-hour
-checks without occupied-space or body-clearance probes. Bystanders and scenario props
-at the fixed centre therefore do not cancel an otherwise valid visit. Travelling
-destinations retain full clearance validation. Scheduled Travel/Wait departures request
-a normal scenario exit before their task when a scenario was observed. Phase changes, visiting windows,
+Spawn and incoming travel destinations retain ground/exterior, water and clearance checks.
+Once arrived, the target keeps its accepted area through transient centre-query failures;
+local navigation residency and interaction priority still gate routine task submission,
+and native movement retains water avoidance. Scheduled Travel departures request
+a normal scenario exit before their task when a scenario was observed. Fallback recovery
+preserves scenarios belonging to the held area; an unrelated mid-travel scenario is not
+treated as proof of fallback arrival. Phase changes, visiting windows,
 streaming and encounter priorities retain precedence. Debug text observes actual
 smoking, drinking or another scenario; it does not infer activity from the destination.
 
