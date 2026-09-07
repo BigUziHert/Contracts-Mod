@@ -367,7 +367,7 @@ static void ReportContractStartFailure()
 	case ContractStartFailure::CleanupPending: DisplaySubtitle("PREVIOUS TARGET IS STILL BEING REMOVED. TRY AGAIN SHORTLY."); break;
 	case ContractStartFailure::PhotoDiagnosticComplete: DisplaySubtitle("PHOTO TEST FINISHED. SEE BountyContracts-photo-test.log."); break;
 	case ContractStartFailure::PhotoCacheExhausted: DisplaySubtitle("PORTRAIT SLOTS FULL. RESTART THE GAME FOR NEW CONTRACTS."); break;
-	case ContractStartFailure::LocationUnavailable: DisplaySubtitle("NO SAFE TARGET LOCATION AVAILABLE. TRY AGAIN."); break;
+	case ContractStartFailure::LocationUnavailable: break; // The pending request keeps looking automatically.
 	case ContractStartFailure::None: DisplaySubtitle("CONTRACT REQUEST FAILED. TRY AGAIN."); break;
 	}
 }
@@ -500,12 +500,20 @@ static void AddSearchBlip()
 	float radius = C.def->searchRadius;
 	if (IsRoutine(*C.def))
 	{
-		const auto& town = RoutineData::kTowns[R.plan.townIndex];
-		centre = town.searchCenter;
-		radius = town.searchRadius;
+		centre = R.centre;
+		radius = R.wanderRadius;
 	}
 	C.searchBlip = MAP::BLIP_ADD_FOR_RADIUS(BLIP_STYLE_MP_MISSION_GIVER, centre, radius);
 	StyleTargetBlip(C.searchBlip, "BLIP_MODIFIER_MP_COLOR_32", true, false);
+}
+static void UpdateSearchArea()
+{
+	if (g_state != CONTRACT_UNKNOWN || !C.def || !IsRoutine(*C.def) ||
+		R.destination < 0 || !R.destinationValid || !C.searchBlip || !MAP::DOES_BLIP_EXIST(C.searchBlip)) return;
+	// Follow changes of routine stop, not the ped's individual wandering steps.
+	// Keep the same circle/handle; an unchanged stop makes no map write.
+	if (DistSq(MAP::GET_BLIP_COORDS(C.searchBlip), R.centre) > .01f)
+		MAP::SET_BLIP_COORDS(C.searchBlip, R.centre);
 }
 static void AddFoundBlip()
 {
@@ -1721,7 +1729,8 @@ static bool StartContract()
 	StartupTrace::Record("destination_prepare_begin");
 	if (!PrepareRoutineContract(prepared))
 	{
-		lastStartFailure = PlayerAvailable() ? ContractStartFailure::LocationUnavailable : ContractStartFailure::Interrupted;
+		lastStartFailure = !PlayerAvailable() || strcmp(RoutineSpawn::diagnostic.check, "interaction_interrupted") == 0
+			? ContractStartFailure::Interrupted : ContractStartFailure::LocationUnavailable;
 		LogContractStartFailure(0, 0);
 		return false;
 	}
@@ -1825,7 +1834,7 @@ static void CheckTargetFound()
 	bool interacting = PLAYER::GET_PLAYER_INTERACTION_TARGET_ENTITY(me, &interacted, false, false) && interacted == (Entity)C.target;
 
 	// Free-aim / lock-on register by camera direction at ANY distance, so only count them when the
-	// player is inside the search area and actually has line of sight.
+	// player is near the target and actually has line of sight.
 	bool nearWithLOS = Within(playerPos, C.targetPos, C.def->searchRadius) &&
 	                   ENTITY::HAS_ENTITY_CLEAR_LOS_TO_ENTITY(pedMe, C.target, 17) != 0;
 	bool aimed = nearWithLOS && (PLAYER::IS_PLAYER_FREE_AIMING_AT_ENTITY(me, C.target) || PLAYER::IS_PLAYER_TARGETTING_ENTITY(me, C.target, false));
@@ -2117,9 +2126,80 @@ static void UpdateHandoff()
 		PAD::DISABLE_CONTROL_ACTION(0, input, true);
 }
 
+struct PendingContractStart
+{
+	Ped player = 0;
+	Ped giver = 0;
+	ULONGLONG nextAttemptMs = 0;
+	bool attempting = false;
+};
+static PendingContractStart pendingContractStart;
+
+static void CancelPendingContractStart()
+{
+	pendingContractStart = PendingContractStart();
+}
+
+static void RequestContractStart(Ped giver)
+{
+	if (pendingContractStart.player || !PlayerAvailable() || g_state == CONTRACT_DEAD || g_state == CONTRACT_PAID) return;
+	pendingContractStart.player = pedMe;
+	pendingContractStart.giver = giver;
+	DisplaySubtitle(ContractActive() ? "REPLACING CONTRACT" : "PREPARING CONTRACT");
+}
+
+static void UpdatePendingContractStart()
+{
+	if (!pendingContractStart.player || pendingContractStart.attempting) return;
+	if (!PlayerAvailable() || pendingContractStart.player != pedMe || g_state == CONTRACT_DEAD || g_state == CONTRACT_PAID)
+	{
+		CancelPendingContractStart();
+		return;
+	}
+	if (handoff.active || Cd.obj || !CanStartInteraction() || HUD::IS_PAUSE_MENU_ACTIVE() || CAMERA::IS_SCREEN_FADED_OUT() ||
+		ownedPed.cleanupPending || RuntimeNowMs() < pendingContractStart.nextAttemptMs) return;
+	pendingContractStart.attempting = true;
+	const Ped requestedPlayer = pendingContractStart.player;
+	const Ped giver = pendingContractStart.giver;
+	const bool ready = StartContract();
+	pendingContractStart.attempting = false;
+	if (!PlayerAvailable() || requestedPlayer != pedMe)
+	{
+		CancelPendingContractStart();
+		return;
+	}
+	if (ready)
+	{
+		CancelPendingContractStart(); // Complete before the existing handoff can yield.
+		if (!LivingPed(giver) || !FindGiverSpot(giver) || !BeginHandoff(giver, false)) C.cardOpenPending = true;
+		DisplaySubtitle("FIND THE TARGET");
+		return;
+	}
+	if (lastStartFailure == ContractStartFailure::LocationUnavailable || lastStartFailure == ContractStartFailure::CleanupPending ||
+		lastStartFailure == ContractStartFailure::Interrupted)
+	{
+		// Location checks and cleanup can outlast one attempt. Wait for the same
+		// request to become actionable, preserving any hunt that was not replaced.
+		pendingContractStart.nextAttemptMs = RuntimeNowMs() + 1000;
+		return;
+	}
+	if (lastStartFailure == ContractStartFailure::InvalidModel || lastStartFailure == ContractStartFailure::ModelLoadTimeout ||
+		lastStartFailure == ContractStartFailure::PedCreationFailed || lastStartFailure == ContractStartFailure::PortraitFailed ||
+		lastStartFailure == ContractStartFailure::PedPoolFull)
+	{
+		// Resource pressure can clear later; the next attempt prepares a fresh
+		// candidate without repeating a failure subtitle or bypassing cleanup.
+		pendingContractStart.nextAttemptMs = RuntimeNowMs() + 3000;
+		return;
+	}
+	CancelPendingContractStart();
+	ReportContractStartFailure();
+}
+
 static void UpdateGiverPrompt()
 {
-	if (handoff.active || Cd.obj || !CanStartInteraction() || RuntimeNowMs() < giverCooldownUntilMs)
+	if (handoff.active || Cd.obj || (pendingContractStart.player && g_state == CONTRACT_NONE) ||
+		!CanStartInteraction() || RuntimeNowMs() < giverCooldownUntilMs)
 	{
 		ShowPrompt(giverPrompt, false);
 		return;
@@ -2152,21 +2232,14 @@ static void UpdateGiverPrompt()
 	{
 	case CONTRACT_NONE:
 	{
-		DisplaySubtitle("PREPARING CONTRACT");
-		if (StartContract())
-		{
-			if (!BeginHandoff(giver, false)) C.cardOpenPending = true;
-			DisplaySubtitle("FIND THE TARGET");
-		}
-		else
-		{
-			ReportContractStartFailure();
-		}
+		RequestContractStart(giver);
+		UpdatePendingContractStart();
 		break;
 	}
 
 	case CONTRACT_UNKNOWN:
 	case CONTRACT_FOUND:
+		CancelPendingContractStart();
 		DisplaySubtitle("CONTRACT ENDED");
 		ClearContract(true);
 		break;
@@ -2193,22 +2266,15 @@ static void UpdatePlayer()
 
 static void StartRemoteContract()
 {
+	if (pendingContractStart.player) return;
 	StartupTrace::Record("remote_requested");
-	Ped requestedPlayer = pedMe;
-	DisplaySubtitle(ContractActive() ? "REPLACING CONTRACT" : "PREPARING CONTRACT");
+	RequestContractStart(0);
+	if (!pendingContractStart.player) return;
 	// Run creation on a fresh game frame after the keyboard event, then refresh the player snapshot.
 	WAIT(0);
 	UpdatePlayer();
 	SetRuntimePaused(!PlayerAvailable() || HUD::IS_PAUSE_MENU_ACTIVE() || CAMERA::IS_SCREEN_FADED_OUT());
-	if (pedMe != requestedPlayer || !CanStartInteraction())
-	{
-		lastStartFailure = ContractStartFailure::Interrupted;
-		LogContractStartFailure(0, 0);
-		ReportContractStartFailure();
-		return;
-	}
-	if (StartContract()) { C.cardOpenPending = true; DisplaySubtitle("FIND THE TARGET"); }
-	else ReportContractStartFailure();
+	UpdatePendingContractStart();
 }
 
 // Keep one U release across this card's put-away outro. Other blocked interactions discard it.
@@ -2276,6 +2342,7 @@ void ScriptMain()
 		if (IsKeyJustUp(VK_F8)) ToggleRoutineDebug();
 		if (!PlayerAvailable() || (previousPlayer && previousPlayer != pedMe))
 		{
+			CancelPendingContractStart();
 			StopHandoff();
 			DestroyCardObject(true);
 			C.cardOpenPending = false;
@@ -2305,6 +2372,7 @@ void ScriptMain()
 		if (inspectPressed && ContractActive() && !handoff.active && !Cd.obj) C.cardOpenPending = true;
 
 		UpdateHandoff();
+		UpdatePendingContractStart();
 		// Select the contract state only AFTER processing a prompt that can clear/change it.
 		if (g_state != CONTRACT_PAID) UpdateGiverPrompt();
 		if (!PlayerAvailable() || HUD::IS_PAUSE_MENU_ACTIVE() || CAMERA::IS_SCREEN_FADED_OUT())
@@ -2351,6 +2419,7 @@ void ScriptMain()
 		// re-triggering aggression through walls for the rest of the contract.
 		if (C.damagedByPlayer && TargetExists()) ENTITY::CLEAR_ENTITY_LAST_DAMAGE_ENTITY(C.target);
 		C.damagedByPlayer = false;
+		UpdateSearchArea();
 		TraceCardInspection();
 		UpdateRoutineDebug();
 		UpdateCard(); // render-target drawing must remain last

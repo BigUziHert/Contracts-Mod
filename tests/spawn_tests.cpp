@@ -16,6 +16,7 @@ struct Vector3 { float x, y, z; };
 constexpr Hash kModel = 1234;
 constexpr Ped kPlayer = 42;
 constexpr Ped kSpawnedPed = 77;
+constexpr Ped kGiver = 66;
 constexpr DWORD kFrameMs = 16;
 static Ped pedMe = kPlayer;
 static unsigned checks = 0;
@@ -75,6 +76,13 @@ static struct World
     unsigned resumeFrame = std::numeric_limits<unsigned>::max();
     unsigned interactionBlockedFrame = std::numeric_limits<unsigned>::max();
     bool remoteStartSucceeds = true;
+    unsigned locationFailures = 0, handoffCalls = 0;
+    int forcedStartFailure = -1;
+    bool cleanupAfterLocationFailure = false, losePlayerDuringStart = false;
+    bool handoffSucceeds = true, giverAlive = true, giverSpotMatches = true;
+    Ped handoffGiver = 0;
+    ULONGLONG attemptDurationMs = 0;
+    std::vector<ULONGLONG> startTimes;
     bool contractActive = false;
     unsigned playerRefreshes = 0;
     unsigned contractStarts = 0;
@@ -167,7 +175,7 @@ static bool DOES_ENTITY_EXIST(int entity)
         world.spawnedAlive = true;
     }
     return ((entity == kPlayer || entity == world.playerId) && world.playerAlive) ||
-        (entity == kSpawnedPed && world.spawnedAlive);
+        (entity == kSpawnedPed && world.spawnedAlive) || (entity == kGiver && world.giverAlive);
 }
 static void SET_ENTITY_AS_MISSION_ENTITY(Ped ped, bool scriptHostObject, bool grabFromOtherScript)
 {
@@ -250,6 +258,14 @@ static void UpdatePlayer();
 static bool CanStartInteraction();
 static bool ContractActive();
 static bool StartContract();
+static bool BeginHandoff(Ped giver, bool payout);
+struct GiverSpot {};
+static const GiverSpot* FindGiverSpot(Ped giver)
+{
+    static const GiverSpot spot;
+    Check(giver == kGiver && world.giverAlive, "delayed clerk validation only examines the retained living giver");
+    return world.giverSpotMatches ? &spot : nullptr;
+}
 static void LogContractStartFailure(Hash model, int attempt);
 static void ReportContractStartFailure();
 static void LogOwnedPedCleanup(const char*) {}
@@ -266,11 +282,33 @@ static void UpdatePlayer()
 static bool CanStartInteraction() { return PlayerAvailable() && world.interactionAllowed; }
 static bool StartContract()
 {
-    Check(world.frame > 0 && world.playerRefreshes == 1 && CanStartInteraction(),
-        "remote creation runs after refreshing and validating the player");
+    Check(CanStartInteraction() && !world.paused && !world.faded && !Cd.obj && !handoff.active && !ownedPed.cleanupPending,
+        "queued creation starts only while interaction, card and cleanup guards permit it");
     ++world.contractStarts;
+    world.startTimes.push_back(RuntimeNowMs());
+    world.nowMs += world.attemptDurationMs;
+    if (world.losePlayerDuringStart) world.playerAlive = false;
+    if (world.locationFailures)
+    {
+        --world.locationFailures;
+        lastStartFailure = ContractStartFailure::LocationUnavailable;
+        ownedPed.cleanupPending = world.cleanupAfterLocationFailure;
+        return false;
+    }
+    if (world.forcedStartFailure >= 0)
+    {
+        lastStartFailure = static_cast<ContractStartFailure>(world.forcedStartFailure);
+        return false;
+    }
     lastStartFailure = world.remoteStartSucceeds ? ContractStartFailure::None : ContractStartFailure::PedCreationFailed;
+    if (world.remoteStartSucceeds) g_state = CONTRACT_UNKNOWN;
     return world.remoteStartSucceeds;
+}
+static bool BeginHandoff(Ped giver, bool payout)
+{
+    Check(!pendingContractStart.player && !payout, "completed request retires before its ordinary clerk handoff");
+    ++world.handoffCalls; world.handoffGiver = giver;
+    return world.handoffSucceeds;
 }
 static void LogContractStartFailure(Hash model, int attempt)
 {
@@ -291,6 +329,7 @@ static void Reset()
     C = {};
     Cd = {};
     handoff = {};
+    pendingContractStart = {};
     g_state = CONTRACT_NONE;
     photoSlotsBound = 0;
     pausedDurationMs = pauseStartedMs = 0;
@@ -509,23 +548,25 @@ static void TestRemoteStart()
     world.playerChangeFrame = 1;
     StartRemoteContract();
     Check(pedMe == 99 && CanStartInteraction(), "the replacement player is otherwise eligible");
-    Check(world.contractStarts == 0 && !C.cardOpenPending && world.failureLogs == 1 &&
-        world.reportedFailure == static_cast<int>(ContractStartFailure::Interrupted),
+    Check(world.contractStarts == 0 && !C.cardOpenPending && !pendingContractStart.player && world.failureReports == 0,
         "a different eligible player cannot inherit the previous player's request");
 
     Reset();
     world.interactionBlockedFrame = 1;
     StartRemoteContract();
-    Check(world.contractStarts == 0 && !C.cardOpenPending && world.failureReports == 1 &&
-        world.reportedFailure == static_cast<int>(ContractStartFailure::Interrupted),
-        "losing interaction eligibility during the fresh frame cancels creation");
+    Check(world.contractStarts == 0 && !C.cardOpenPending && world.failureReports == 0 && pendingContractStart.player == kPlayer,
+        "losing interaction eligibility during the fresh frame keeps the original request pending");
+    world.interactionAllowed = true;
+    UpdatePendingContractStart();
+    Check(world.contractStarts == 1 && C.cardOpenPending && !pendingContractStart.player,
+        "the retained fresh-frame request completes once interaction becomes available");
 
     Reset();
     world.remoteStartSucceeds = false;
     StartRemoteContract();
-    Check(world.contractStarts == 1 && !C.cardOpenPending && world.failureReports == 1 &&
-        world.reportedFailure == static_cast<int>(ContractStartFailure::PedCreationFailed),
-        "normal creation failure is preserved and never queues a card");
+    Check(world.contractStarts == 1 && !C.cardOpenPending && world.failureReports == 0 && pendingContractStart.player &&
+        lastStartFailure == ContractStartFailure::PedCreationFailed,
+        "transient creation failure keeps the request pending without claiming the card is ready");
     Check(world.messages.size() == 1, "failed remote creation never displays a successful hunt objective");
 }
 
@@ -546,6 +587,156 @@ static void TestPauseDuringWait()
     world.nowMs += 5000;
     SetRuntimePaused(false);
     Check(RuntimeNowMs() == 1000 + kFrameMs, "resuming after the timeout excludes the remaining pause");
+}
+
+static void TestPendingLocationStarts()
+{
+    Reset();
+    world.contractActive = true; g_state = CONTRACT_FOUND;
+    world.locationFailures = 2; world.attemptDurationMs = 6000;
+    StartRemoteContract();
+    Check(world.contractStarts == 1 && pendingContractStart.player == kPlayer && !C.cardOpenPending &&
+        g_state == CONTRACT_FOUND && world.contractActive, "failed location preparation preserves the existing hunt and one pending replacement");
+    const unsigned frame = world.frame, refreshes = world.playerRefreshes;
+    StartRemoteContract(); RequestContractStart(77); UpdatePendingContractStart();
+    Check(world.frame == frame && world.playerRefreshes == refreshes && world.contractStarts == 1 &&
+        pendingContractStart.giver == 0 && world.messages.size() == 1,
+        "repeated U, clerk requests and the same-frame pump cannot stack or restart pending work");
+    world.nowMs = pendingContractStart.nextAttemptMs - 1;
+    UpdatePendingContractStart();
+    Check(world.contractStarts == 1, "a failed slow attempt receives a full retry delay after it finishes");
+    ++world.nowMs; UpdatePendingContractStart();
+    Check(world.contractStarts == 2 && world.failureReports == 0 && world.messages.size() == 1 && !C.cardOpenPending,
+        "repeated location failures remain quiet without claiming the card is ready");
+    world.nowMs = pendingContractStart.nextAttemptMs; UpdatePendingContractStart();
+    Check(world.contractStarts == 3 && !pendingContractStart.player && C.cardOpenPending && world.messages.size() == 2,
+        "eventual target and portrait success schedules exactly one inspection and completes the request");
+    Check(world.startTimes[1] - world.startTimes[0] >= 7000 && world.startTimes[2] - world.startTimes[1] >= 7000,
+        "bounded location work cannot cause immediate back-to-back retries after its yields");
+    UpdatePendingContractStart(); UpdatePendingContractStart();
+    Check(world.contractStarts == 3 && world.messages.size() == 2, "completed work never starts another contract automatically");
+}
+
+static void TestPendingStartGuardsAndCancellation()
+{
+    for (int blocked = 0; blocked < 5; ++blocked)
+    {
+        Reset(); world.locationFailures = 1;
+        RequestContractStart(0); UpdatePendingContractStart();
+        world.nowMs = pendingContractStart.nextAttemptMs;
+        switch (blocked)
+        {
+        case 0: world.paused = true; break;
+        case 1: world.faded = true; break;
+        case 2: world.interactionAllowed = false; break; // Foreign native item task, mounting or combat.
+        case 3: Cd.obj = 123; break;
+        case 4: handoff.active = true; break;
+        }
+        UpdatePendingContractStart();
+        Check(world.contractStarts == 1 && pendingContractStart.player == kPlayer && world.failureReports == 0,
+            "pause, fade, foreign interaction, card inspection and handoff suspend the existing request");
+        world.paused = world.faded = false; world.interactionAllowed = true; Cd.obj = 0; handoff.active = false;
+        UpdatePendingContractStart();
+        Check(world.contractStarts == 2 && C.cardOpenPending && !pendingContractStart.player,
+            "the same request resumes after its temporary blocker clears");
+    }
+    for (int cancelled = 0; cancelled < 6; ++cancelled)
+    {
+        Reset(); world.locationFailures = 1;
+        RequestContractStart(0); UpdatePendingContractStart();
+        world.nowMs = pendingContractStart.nextAttemptMs;
+        switch (cancelled)
+        {
+        case 0: world.playerAlive = false; break;
+        case 1: world.playerDying = true; break;
+        case 2: world.playerId = pedMe = 99; break;
+        case 3: g_state = CONTRACT_DEAD; break;
+        case 4: g_state = CONTRACT_PAID; break;
+        case 5: CancelPendingContractStart(); break; // Explicit End Contract routing is asserted by the runner.
+        }
+        UpdatePendingContractStart();
+        Check(world.contractStarts == 1 && !pendingContractStart.player && !C.cardOpenPending && world.failureReports == 0,
+            "death, player change, proof, payment and explicit cancellation cannot start a queued replacement");
+        world.playerAlive = true; world.playerDying = false; world.playerId = pedMe = kPlayer; g_state = CONTRACT_NONE;
+        UpdatePendingContractStart();
+        Check(world.contractStarts == 1, "cancelled work cannot resume when the old blocker later disappears");
+    }
+    Reset(); world.forcedStartFailure = static_cast<int>(ContractStartFailure::Interrupted);
+    RequestContractStart(0); UpdatePendingContractStart();
+    world.nowMs = pendingContractStart.nextAttemptMs; world.paused = true;
+    UpdatePendingContractStart();
+    Check(world.contractStarts == 1 && pendingContractStart.player && world.failureReports == 0,
+        "an interruption during a yielding startup keeps the living player's request for later");
+    world.paused = false; world.forcedStartFailure = -1; UpdatePendingContractStart();
+    Check(C.cardOpenPending && world.contractStarts == 2, "interrupted startup completes after its same-player pause ends");
+
+    Reset(); world.losePlayerDuringStart = true; world.locationFailures = 1;
+    RequestContractStart(0); UpdatePendingContractStart();
+    Check(!pendingContractStart.player && !C.cardOpenPending, "a player lost during startup cannot retain its request");
+}
+
+static void TestPendingCleanupAndGiverDelivery()
+{
+    for (bool giverAvailable : {false, true})
+    {
+        Reset(); world.locationFailures = 1; world.cleanupAfterLocationFailure = true;
+        world.handoffSucceeds = giverAvailable;
+        RequestContractStart(kGiver); UpdatePendingContractStart();
+        Check(ownedPed.cleanupPending && pendingContractStart.player == kPlayer && pendingContractStart.giver == kGiver,
+            "a post-deployment location failure retains its clerk and provisional cleanup");
+        world.nowMs = pendingContractStart.nextAttemptMs + 5000;
+        UpdatePendingContractStart();
+        Check(world.contractStarts == 1 && world.failureReports == 0,
+            "pending provisional cleanup delays the next pool preflight instead of ending the request");
+        ownedPed.cleanupPending = false; UpdatePendingContractStart();
+        Check(world.contractStarts == 2 && world.handoffCalls == 1 && world.handoffGiver == kGiver &&
+            !pendingContractStart.player && C.cardOpenPending == !giverAvailable,
+            "delayed success uses the original clerk or existing inspection fallback if handoff is unavailable");
+    }
+    for (bool living : {false, true})
+    {
+        Reset(); world.locationFailures = 1;
+        RequestContractStart(kGiver); UpdatePendingContractStart();
+        world.giverAlive = living; world.giverSpotMatches = false;
+        world.nowMs = pendingContractStart.nextAttemptMs; UpdatePendingContractStart();
+        Check(world.contractStarts == 2 && !pendingContractStart.player && C.cardOpenPending && world.handoffCalls == 0,
+            "a missing clerk or a handle that no longer matches its station falls back to the prepared card");
+    }
+    Reset(); world.forcedStartFailure = static_cast<int>(ContractStartFailure::CleanupPending);
+    RequestContractStart(0); UpdatePendingContractStart();
+    Check(pendingContractStart.player && world.failureReports == 0, "cleanup discovered inside startup also retains the pending request");
+    world.forcedStartFailure = -1; world.nowMs = pendingContractStart.nextAttemptMs; UpdatePendingContractStart();
+    Check(C.cardOpenPending && !pendingContractStart.player, "delayed cleanup can eventually finish the original request");
+
+    for (ContractStartFailure failure : {ContractStartFailure::InvalidModel, ContractStartFailure::ModelLoadTimeout,
+        ContractStartFailure::PedCreationFailed, ContractStartFailure::PortraitFailed, ContractStartFailure::PedPoolFull})
+    {
+        Reset(); world.forcedStartFailure = static_cast<int>(failure);
+        RequestContractStart(0); UpdatePendingContractStart();
+        Check(pendingContractStart.player && world.failureReports == 0 && !C.cardOpenPending,
+            "model, pool, creation and portrait failures retain the original request quietly");
+        world.nowMs += 2999; UpdatePendingContractStart();
+        Check(world.contractStarts == 1, "resource failures receive a longer three-second backoff");
+        ++world.nowMs; UpdatePendingContractStart();
+        Check(world.contractStarts == 2 && pendingContractStart.player && world.failureReports == 0 && world.messages.size() == 1,
+            "repeated resource failures do not stack requests or failure subtitles");
+        world.forcedStartFailure = -1; world.nowMs = pendingContractStart.nextAttemptMs;
+        ownedPed.cleanupPending = true; UpdatePendingContractStart();
+        Check(world.contractStarts == 2, "resource retries still wait for owned provisional cleanup");
+        ownedPed.cleanupPending = false; UpdatePendingContractStart(); UpdatePendingContractStart();
+        Check(world.contractStarts == 3 && !pendingContractStart.player && C.cardOpenPending && world.messages.size() == 2,
+            "transient resource failure eventually yields exactly one prepared card");
+    }
+    for (ContractStartFailure failure : {ContractStartFailure::PhotoCacheExhausted,
+        ContractStartFailure::PhotoDiagnosticComplete, ContractStartFailure::None})
+    {
+        Reset(); world.forcedStartFailure = static_cast<int>(failure);
+        world.contractActive = true; g_state = CONTRACT_FOUND;
+        RequestContractStart(0); UpdatePendingContractStart(); UpdatePendingContractStart();
+        Check(!pendingContractStart.player && world.contractStarts == 1 && world.failureReports == 1 &&
+            world.reportedFailure == static_cast<int>(failure) && !C.cardOpenPending && g_state == CONTRACT_FOUND && world.contractActive,
+            "cache exhaustion, diagnostic completion and an unclassified failure report once without replacing the old hunt");
+    }
 }
 
 static void TestContractPreflight()
@@ -703,6 +894,9 @@ int main()
     TestModelFailures();
     TestPlayerInterruption();
     TestRemoteStart();
+    TestPendingLocationStarts();
+    TestPendingStartGuardsAndCancellation();
+    TestPendingCleanupAndGiverDelivery();
     TestPauseDuringWait();
     TestContractPreflight();
     TestDeferredRemoteInput();

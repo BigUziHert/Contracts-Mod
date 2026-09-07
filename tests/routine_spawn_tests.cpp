@@ -270,15 +270,45 @@ int main() {
     SceneTraceBracketsOwnedNativeCalls();
     SceneTracePreservesForeignAndLoadedPaths();
     using namespace RoutineData;
+    Check(kWanderRadius==35.0f,"routine wandering policy is exactly 35 metres");
+    for(const Location& place:kLocations)
+        Check(place.wanderRadius==kWanderRadius,"every catalogue entry uses the shared 35 metre wander radius");
+    const auto findLocation=[](const char* id)->const Location* {
+        for(const Location& place:kLocations)if(std::strcmp(place.id,id)==0)return &place;
+        return nullptr;
+    };
+    Check(findLocation("vht_north_road")==nullptr,"Van Horn northwest road is removed from the catalogue");
+    Check(findLocation("rhd_north_camp")==nullptr,"Rhodes northern camp is removed from the catalogue");
+    Check(findLocation("sd_stables")==nullptr,"Saint Denis stable entrance is removed from the catalogue");
+    Check(findLocation("str_stable_door")==nullptr,"Strawberry stable entrance is removed from the catalogue");
+    const Location* easternDock=findLocation("sd_docks_east");
+    Check(easternDock && easternDock->enabled && easternDock->town==TownId::SaintDenis &&
+        easternDock->kind==PlaceKind::Work && SamePoint(easternDock->anchor,{2822.0f,-1415.0f,45.5f}) &&
+        easternDock->occupations==(Laborer|DockWorker) && easternDock->openMinute==360 && easternDock->closeMinute==1080 &&
+        std::strstr(easternDock->source,"owner-provided coordinates"),
+        "second Saint Denis dock preserves the supplied coordinates and daytime dock-worker/laborer work role");
+    const Location* southLoop=findLocation("str_south_loop");
+    Check(southLoop && southLoop->enabled && southLoop->town==TownId::Strawberry && southLoop->kind==PlaceKind::Rest &&
+        SamePoint(southLoop->anchor,{-1827.0f,-415.0f,161.0f}) && southLoop->openMinute==southLoop->closeMinute &&
+        std::strstr(southLoop->source,"owner-provided coordinates"),
+        "Strawberry south loop uses the replacement owner coordinates and remains an all-day rest stop");
+    for(unsigned occupation:{Local,Laborer,LivestockHand}) {
+        unsigned kinds=0; bool fallback=false;
+        for(const Location& place:kLocations) {
+            if(place.town!=TownId::Strawberry || !place.enabled || !(place.occupations&occupation))continue;
+            kinds|=1u<<static_cast<unsigned>(place.kind);
+            fallback|=place.kind==PlaceKind::Rest && place.openMinute==place.closeMinute;
+        }
+        Check(kinds==15 && fallback,"Strawberry occupations retain every routine phase and an all-day fallback after stable removal");
+    }
     for(const Town& town:kTowns) {
+        Check(town.searchRadius==kWanderRadius,"every town search radius matches the 35 metre routine radius");
         unsigned kinds=0; bool fallback=false;
         for(int i=0;i<kLocationCount;++i) {
             const auto& place=kLocations[i]; if(place.town!=town.id || !place.enabled)continue;
             kinds|=1u<<static_cast<unsigned>(place.kind);
             fallback|=place.kind==PlaceKind::Rest && place.openMinute==place.closeMinute;
-            const float dx=town.searchCenter.x-place.anchor.x,dy=town.searchCenter.y-place.anchor.y;
-            Check(std::sqrt(dx*dx+dy*dy)+place.candidateRadius+place.wanderRadius<=town.searchRadius,"fixed search circle contains authored routine locations");
-            Check(place.source[0] && place.candidateRadius>0 && place.wanderRadius>0 && place.maxHeightDelta<=2.5f,"location has provenance and bounded separate radii");
+            Check(place.source[0] && place.candidateRadius>0 && place.maxHeightDelta<=2.5f,"location has provenance and bounded candidate and height limits");
             for(int j=i+1;j<kLocationCount;++j)Check(std::strcmp(place.id,kLocations[j].id)!=0,"location ids unique");
         }
         Check(kinds==15 && fallback,"every town has all four phases and an all-day fallback");

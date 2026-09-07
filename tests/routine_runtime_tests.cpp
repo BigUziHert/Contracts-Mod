@@ -78,10 +78,14 @@ struct World
 {
     unsigned now = 1000, waits = 0, cancelAfter = 999999;
     unsigned loadedAfter = 0, targetDiesAfter = 999999, settleAfterWaits = 999999, ownershipLostAfter = 999999;
+    unsigned interactionStopsAfter = 999999;
     int minute = 720, clockRate = 2000, taskStatus = 0;
     bool canInteract = true, collision = true, nav = true, safe = true;
     bool outside = true, groundOk = true, occupied = false, hit = false, waterPresent = false;
     bool sceneActive = false, startOk = true;
+    bool rejectPreparedCandidate = false;
+    int rejectInitialCandidates = 0, rejectTown = -1;
+    std::vector<const char*> attemptedLocations;
     int interior = 0, probeStatus = 2, starts = 0, stops = 0, safeCalls = 0;
     int requests = 0, failFirstSafeCalls = 0, probes = 0;
     int placementCalls = 0;
@@ -108,7 +112,7 @@ static ULONGLONG RuntimeNowMs() { return w.now; }
 static ULONGLONG GetTickCount64() { return w.now; }
 static bool PlayerAvailable() { return w.waits < w.cancelAfter; }
 static bool LivingPed(Ped ped) { return ped != 0 && w.waits < w.targetDiesAfter; }
-static bool CanStartInteraction() { return PlayerAvailable() && w.canInteract; }
+static bool CanStartInteraction() { return PlayerAvailable() && w.canInteract && w.waits < w.interactionStopsAfter; }
 template<typename Predicate> static bool WaitUntil(DWORD timeout, Predicate predicate)
 {
     const unsigned start = w.now;
@@ -158,7 +162,7 @@ static bool GET_GROUND_Z_AND_NORMAL_FOR_3D_COORD(Vector3 query, float* ground, V
 static bool IS_POSITION_OCCUPIED(Vector3 point, float, bool, bool, bool, bool, bool, Ped ignore, bool)
 {
     ++w.occupancyReads;
-    w.lastIgnored = ignore; return w.occupied || (w.occupiedNear && Within(point, w.occupiedAt, 20.0f));
+    w.lastIgnored = ignore; return w.occupied || w.rejectPreparedCandidate || (w.occupiedNear && Within(point, w.occupiedAt, 20.0f));
 }
 }
 namespace INTERIOR
@@ -240,6 +244,34 @@ static bool IS_PED_USING_ANY_SCENARIO(Ped ped)
 
 #include "../rdr2 scripting environment/samples/Pools/routine_runtime.h"
 
+static void ObservePreparation(const StartupTrace::Event& event)
+{
+    if (std::strcmp(event.stage, "candidate_prepare_begin") != 0) return;
+    for (const char* previous : w.attemptedLocations)
+        Check(std::strcmp(previous, event.detail) != 0, "each startup pass tries an authored location at most once");
+    w.attemptedLocations.push_back(event.detail);
+    w.rejectPreparedCandidate = w.attemptedLocations.size() <= static_cast<std::size_t>(w.rejectInitialCandidates);
+    for (const auto& location : RoutineData::kLocations)
+        if (std::strcmp(location.id, event.detail) == 0 && static_cast<int>(location.town) == w.rejectTown)
+            w.rejectPreparedCandidate = true;
+}
+
+static void CheckPreparedCard(const RoutineRuntime& prepared)
+{
+    Check(prepared.enabled && RoutinePlan::Valid(prepared.plan), "accepted alternate retains a complete compatible routine plan");
+    const auto& location = RoutineData::kLocations[prepared.destination];
+    const int phase = static_cast<int>(location.kind);
+    Check(prepared.plan.route[phase] == prepared.destination &&
+        prepared.cardLines[phase + 2].find(RoutinePlan::CardLocationName(location)) != std::string::npos,
+        "accepted alternate is inserted into its matching advertised card habit before publication");
+    Check(location.town == RoutineData::kTowns[prepared.plan.townIndex].id &&
+        prepared.definition.models.list == RoutineModels(prepared.plan.townIndex, prepared.plan.occupation).list &&
+        std::strcmp(prepared.definition.targetDesc, RoutinePlan::OccupationName(prepared.plan.occupation)) == 0,
+        "alternate town, occupation and model pool all agree with the prepared identity");
+    Check(prepared.definition.searchRadius == location.wanderRadius && prepared.wanderRadius == RoutineData::kWanderRadius,
+        "the prepared search area matches the shared 35-metre wander radius");
+}
+
 static RoutineRuntime MakePrepared()
 {
     w = {}; std::srand(23);
@@ -258,7 +290,8 @@ static void TestPreparedDefinition()
     const auto& location = RoutineData::kLocations[prepared.destination];
     Check(Within(prepared.definition.spawn, prepared.centre, .001f), "definition spawn is the validated point");
     Check(prepared.wanderRadius == location.wanderRadius, "normal wander radius belongs to the selected destination");
-    Check(prepared.definition.searchRadius == Tune::kReAggroSightDist, "AI sight radius remains separate from wandering");
+    Check(prepared.definition.searchRadius == prepared.wanderRadius && prepared.wanderRadius == RoutineData::kWanderRadius,
+        "prepared investigation radius matches the uniform destination wander radius");
     Check(std::strcmp(prepared.definition.targetDesc, RoutinePlan::OccupationName(prepared.plan.occupation)) == 0,
         "definition occupation matches the immutable clue plan");
     Check(prepared.definition.behavior == &kHumanTarget && prepared.definition.onCleanup == ResetRoutine,
@@ -315,6 +348,7 @@ static void TestGeneratedTownModels()
 
 static void TestPreparationFailureAndFallback()
 {
+    StartupTrace::sink = ObservePreparation;
     const RoutineRuntime previous = R;
     for (int failure = 0; failure < 5; ++failure)
     {
@@ -329,7 +363,8 @@ static void TestPreparationFailureAndFallback()
         Check(R.enabled == previous.enabled && R.destination == previous.destination &&
             Within(R.centre, previous.centre, .001f) && R.definition.models.list == previous.definition.models.list &&
             R.plan.seed == previous.plan.seed, "failed replacement preparation leaves old runtime intact");
-        Check(w.waits <= 376, "two-location startup has a bounded streaming budget");
+        Check(w.waits <= 376 && w.attemptedLocations.size() <= 8,
+            "startup fallback retains a bounded streaming and candidate-attempt budget");
         Check(w.starts == w.stops, "failed startup releases only its successful scene requests");
         Check(w.wanderCalls == 0, "preparation does not task any ped");
     }
@@ -339,6 +374,41 @@ static void TestPreparationFailureAndFallback()
     Check(RoutineData::kLocations[fallback.destination].kind == RoutineData::PlaceKind::Rest,
         "bounded alternate is the declared overnight/public fallback");
     Check(w.requests == 0 && w.safeCalls == 6, "five failed preferred candidates permit one validated fallback without unneeded streaming");
+    CheckPreparedCard(fallback);
+
+    w = {}; std::srand(23); w.rejectInitialCandidates = 2;
+    RoutineRuntime alternate;
+    Check(PrepareRoutineContract(alternate) && w.attemptedLocations.size() == 3,
+        "failure of both selected stops continues to another compatible authored location");
+    Check(alternate.plan.townIndex == fallback.plan.townIndex,
+        "startup exhausts compatible choices in its original town before moving to another town");
+    CheckPreparedCard(alternate);
+
+    w = {}; std::srand(23); w.rejectTown = static_cast<int>(RoutineData::kTowns[fallback.plan.townIndex].id);
+    RoutineRuntime otherTown;
+    Check(PrepareRoutineContract(otherTown) && otherTown.plan.townIndex != fallback.plan.townIndex,
+        "an unavailable starting town permits a complete compatible plan in the next town");
+    CheckPreparedCard(otherTown);
+
+    w = {}; std::srand(23); w.occupied = true;
+    RoutineRuntime untouched = alternate;
+    Check(!PrepareRoutineContract(untouched) && w.attemptedLocations.size() == 8 && w.safeCalls == 40 &&
+        std::strcmp(RoutineSpawn::diagnostic.check, "candidate_budget_exhausted") == 0,
+        "all occupied authored sites end this pass after eight finite five-point searches");
+    Check(untouched.destination == alternate.destination && untouched.cardLines == alternate.cardLines &&
+        R.destination == previous.destination && R.cardLines == previous.cardLines && R.plan.seed == previous.plan.seed,
+        "exhausted startup leaves both its caller's prepared data and the existing live contract untouched");
+
+    w = {}; std::srand(23); w.canInteract = false;
+    RoutineRuntime interrupted;
+    Check(!PrepareRoutineContract(interrupted) && w.attemptedLocations.empty() &&
+        std::strcmp(RoutineSpawn::diagnostic.check, "interaction_interrupted") == 0,
+        "pause, fade, mount or combat before preparation stops all candidate work");
+    w = {}; std::srand(23); w.loadedAfter = 1100; w.interactionStopsAfter = 1;
+    Check(!PrepareRoutineContract(interrupted) && !interrupted.enabled && w.attemptedLocations.size() == 1 &&
+        w.starts == 1 && w.stops == 1 && std::strcmp(RoutineSpawn::diagnostic.check, "interaction_interrupted") == 0,
+        "an interaction interrupted while streaming cannot publish a candidate or continue to another site");
+    StartupTrace::sink = nullptr;
 }
 
 static void TestDeploymentAndWander()

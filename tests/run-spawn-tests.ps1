@@ -55,6 +55,11 @@ $bountyPatterns = @(
     '(?ms)^static bool LoadModel\(Hash model\)\s*\{.*?^\}',
     '(?ms)^static Ped SpawnPed\(Hash model, const Vector3& pos\)\s*\{.*?^\}',
     '(?ms)^static bool CanPrepareContract\(\)\s*\{.*?^\}',
+    '(?ms)^struct PendingContractStart\s*\{.*?^\};',
+    '(?m)^static PendingContractStart pendingContractStart;',
+    '(?ms)^static void CancelPendingContractStart\(\)\s*\{.*?^\}',
+    '(?ms)^static void RequestContractStart\(Ped giver\)\s*\{.*?^\}',
+    '(?ms)^static void UpdatePendingContractStart\(\)\s*\{.*?^\}',
     '(?ms)^static void StartRemoteContract\(\)\s*\{.*?^\}',
     '(?m)^static Ped remoteRequestPlayer[^\r\n]+;',
     '(?m)^static ULONGLONG remoteRequestUntilMs[^\r\n]+;',
@@ -68,6 +73,14 @@ foreach ($bountyPattern in $bountyPatterns) {
     $bountyLine = 1 + ([regex]::Matches($bountySource.Substring(0, $bountyMatches[0].Index), '\n')).Count
     $bountyHeader += '#line {0} "{1}"' -f $bountyLine, $bountySourcePath.Replace('\', '/')
     $bountyHeader += $bountyMatches[0].Value
+}
+$bountyGiver = [regex]::Matches($bountySource, '(?ms)^static void UpdateGiverPrompt\(\)\s*\{.*?^\}')
+if ($bountyGiver.Count -ne 1 -or [regex]::Matches($bountyGiver[0].Value, 'RequestContractStart\(giver\);\s*UpdatePendingContractStart\(\);').Count -ne 1 -or
+    [regex]::Matches($bountyGiver[0].Value, 'case CONTRACT_FOUND:\s*CancelPendingContractStart\(\);').Count -ne 1) {
+    throw 'Clerk requests must share the retry pump and explicit End Contract must cancel it.'
+}
+if ([regex]::Matches($bountySource, 'UpdateHandoff\(\);\s*UpdatePendingContractStart\(\);\s*//[^\r\n]*\s*if \(g_state != CONTRACT_PAID\) UpdateGiverPrompt\(\);').Count -ne 1) {
+    throw 'Pending starts must run once before giver handling and the existing post-interaction gate.'
 }
 [IO.File]::WriteAllText((Join-Path $bountyOutput 'spawn_under_test.h'), ($bountyHeader -join "`r`n"))
 $bountyCommands = @('@echo off', ('call "{0}" >nul' -f $bountyVcVars), 'if errorlevel 1 exit /b 1')

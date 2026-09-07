@@ -12,7 +12,7 @@ struct RoutineRuntime
     ContractDef definition{};
     int destination = -1;
     Vector3 centre{};
-    float wanderRadius = 20.0f;
+    float wanderRadius = RoutineData::kWanderRadius;
     Routine::Controller controller;
     bool selectPending = false;
     bool resumeRequested = false;
@@ -79,44 +79,76 @@ static bool PrepareRoutineContract(RoutineRuntime& prepared)
 {
     ResetRoutineStartDiagnostic();
     routineStartDiagnostic.stage = "select_location";
+    if (!CanStartInteraction()) return RoutineSpawn::Reject("interaction_interrupted");
     const unsigned seed = (static_cast<unsigned>(rand()) << 16) ^ static_cast<unsigned>(rand());
-    const int town = static_cast<int>(seed % RoutineData::kTownCount);
-    const unsigned occupation = RoutinePlan::GeneratedOccupation(town, seed);
-    if (!RoutinePlan::Build(prepared.plan, town, occupation, seed)) return false;
-    Routine::Candidate candidates[4];
-    if (!RoutinePlan::Candidates(prepared.plan, candidates)) return false;
-    // Only one preferred site and the explicit all-day fallback: no unlimited town rerolls.
-    for (int attempt = 0; attempt < 2 && PlayerAvailable(); ++attempt)
+    const int firstTown = static_cast<int>(seed % RoutineData::kTownCount);
+    constexpr unsigned kMaximumCandidatePrepares = 8;
+    constexpr ULONGLONG kCandidatePassMs = 6000;
+    const ULONGLONG started = GetTickCount64();
+    unsigned attempts = 0;
+    bool attempted[RoutineData::kLocationCount]{};
+    // Exhaust distinct authored choices before retrying in a later startup pass.
+    // Each pass has finite native work; individual streaming waits remain bounded.
+    for (int townStep = 0; townStep < RoutineData::kTownCount; ++townStep)
     {
-        const int minute = RoutineMinute();
-        const int id = Routine::SelectDestination(candidates, 4,
-            Routine::PhaseAt(minute, prepared.plan.offsetMinutes), occupation, minute, 15, seed);
-        if (id < 0) break;
-        const auto& location = RoutineData::kLocations[id];
-        routineStartDiagnostic.location = location.id;
-        routineStartDiagnostic.expected = location.anchor;
-        StartupTrace::Record("candidate_prepare_begin", 0, 0, &location.anchor, -1, location.id);
-        Vector3 point;
-        if (RoutineSpawn::Prepare(location.anchor, location.candidateRadius, location.maxHeightDelta, seed, point) &&
-            Routine::CanArriveAndStay({location.openMinute, location.closeMinute}, RoutineMinute(), 0, 15))
+        const int town = (firstTown + townStep) % RoutineData::kTownCount;
+        const unsigned townSeed = townStep == 0 ? seed : RoutinePlan::Mix(seed ^ static_cast<unsigned>(townStep));
+        const unsigned occupation = RoutinePlan::GeneratedOccupation(town, townSeed);
+        RoutineRuntime candidate;
+        if (!RoutinePlan::Build(candidate.plan, town, occupation, townSeed)) continue;
+        const int first = static_cast<int>(townSeed % RoutineData::kLocationCount);
+        int minute = RoutineMinute();
+        for (int choice = 0; choice < RoutineData::kLocationCount + 2; ++choice)
         {
-            prepared.enabled = true;
-            prepared.cardLines = RoutinePlan::CardLines(prepared.plan);
-            prepared.destination = id;
-            prepared.centre = point;
-            routineStartDiagnostic.expected = point;
-            prepared.wanderRadius = location.wanderRadius;
-            const auto& area = RoutineData::kTowns[town];
-            prepared.definition = { area.name, RoutinePlan::OccupationName(occupation), area.name,
-                point, Tune::kReAggroSightDist, RoutineModels(town, occupation), &kHumanTarget, nullptr, ResetRoutine };
-            StartupTrace::Record("candidate_prepared", 0, 0, &point, -1, location.id);
-            return true;
+            const int phase = static_cast<int>(Routine::PhaseAt(minute, candidate.plan.offsetMinutes));
+            const int id = choice == 0 ? candidate.plan.route[phase] : choice == 1
+                ? candidate.plan.route[static_cast<int>(Routine::Phase::Rest)]
+                : (first + choice - 2) % RoutineData::kLocationCount;
+            const auto& location = RoutineData::kLocations[id];
+            const bool allDayRest = location.kind == RoutineData::PlaceKind::Rest && location.openMinute == location.closeMinute;
+            if (attempted[id] || !location.enabled || location.town != RoutineData::kTowns[town].id ||
+                (location.occupations & occupation) == 0 ||
+                (static_cast<int>(location.kind) != phase && !allDayRest) ||
+                !Routine::CanArriveAndStay({location.openMinute, location.closeMinute}, minute, 0, 15)) continue;
+            if (!CanStartInteraction()) return RoutineSpawn::Reject("interaction_interrupted");
+            if (attempts >= kMaximumCandidatePrepares || Routine::Elapsed(GetTickCount64(), started) >= kCandidatePassMs)
+                return RoutineSpawn::Reject("candidate_budget_exhausted");
+            attempted[id] = true;
+            ++attempts;
+            routineStartDiagnostic.location = location.id;
+            routineStartDiagnostic.expected = location.anchor;
+            StartupTrace::Record("candidate_prepare_begin", 0, 0, &location.anchor, -1, location.id);
+            Vector3 point;
+            const bool safe = RoutineSpawn::Prepare(location.anchor, location.candidateRadius,
+                location.maxHeightDelta, townSeed, point);
+            if (!CanStartInteraction()) return RoutineSpawn::Reject("interaction_interrupted");
+            minute = RoutineMinute(); // Streaming can advance the clock before validation finishes.
+            const bool stillScheduled = allDayRest || static_cast<int>(location.kind) ==
+                static_cast<int>(Routine::PhaseAt(minute, candidate.plan.offsetMinutes));
+            if (safe && stillScheduled &&
+                Routine::CanArriveAndStay({location.openMinute, location.closeMinute}, minute, 0, 15))
+            {
+                // Startup may replace a habit only before publishing the immutable
+                // route, so the card always names the destination actually accepted.
+                candidate.plan.route[static_cast<int>(location.kind)] = id;
+                candidate.enabled = true;
+                candidate.cardLines = RoutinePlan::CardLines(candidate.plan);
+                candidate.destination = id;
+                candidate.centre = point;
+                routineStartDiagnostic.expected = point;
+                candidate.wanderRadius = location.wanderRadius;
+                const auto& area = RoutineData::kTowns[town];
+                candidate.definition = { area.name, RoutinePlan::OccupationName(occupation), area.name,
+                    point, location.wanderRadius, RoutineModels(town, occupation), &kHumanTarget, nullptr, ResetRoutine };
+                prepared = candidate;
+                StartupTrace::Record("candidate_prepared", 0, 0, &point, -1, location.id);
+                return true;
+            }
+            if (safe) RoutineSpawn::Reject(stillScheduled ? "visiting_window_closed" : "schedule_changed");
+            StartupTrace::Record("candidate_rejected", 0, 0, &location.anchor, -1, RoutineSpawn::diagnostic.check);
         }
-        StartupTrace::Record("candidate_rejected", 0, 0, &location.anchor, -1,
-            std::strcmp(RoutineSpawn::diagnostic.check, "ok") == 0 ? "visiting_window_closed" : RoutineSpawn::diagnostic.check);
-        for (auto& candidate : candidates) if (candidate.id == id) candidate.available = false;
     }
-    return false;
+    return RoutineSpawn::Reject("no_available_locations");
 }
 
 static bool ValidateRoutineDeployment(Ped ped, const ContractDef& def)
