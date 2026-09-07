@@ -26,6 +26,7 @@
     <ClInclude Include="routine_runtime.h" />
     <ClInclude Include="routine_card.h" />
     <ClInclude Include="routine_debug.h" />
+    <ClInclude Include="startup_trace.h" />
     <ClInclude Include="routine_debug_view.h" />
     <ClInclude Include="routine_debug_blips.h" />
     <ClInclude Include="target_ai_logic.h" />

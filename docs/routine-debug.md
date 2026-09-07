@@ -65,9 +65,11 @@ and schedule labeling, and bounded formatting. They cannot verify the marker col
 text placement/readability or native AI behavior on the player's display; those remain
 the purpose of this build's in-game test.
 
-All nineteen suites passed, including 41 display-format checks, 437 marker checks and
+At the original debug delivery (`26c1cca`), all nineteen suites passed, including 41 display-format checks, 437 marker checks and
 1,192 debug-bridge checks. Release/x64 built successfully using the README's explicit
 workspace output overrides. All eighteen protected portrait/card/handoff/payment
 functions and `contract_data.h` match `9642060`; the routine, spawn and combat policy
 files are unchanged. The downloadable ASI is 305,152 bytes, SHA-256
 `40E37DA5D390756FAB0B85B922F3E8349EDF5C86A8C53BEF60B2A762F6AC7284`.
+That artifact is superseded by the [startup safeguard and trace build](startup-crash-investigation.md),
+which retains these debug features.

@@ -45,3 +45,4 @@ if ($LASTEXITCODE -ne 0) { throw 'Regression tests failed.' }
 & (Join-Path $PSScriptRoot 'run-routine-debug-view-tests.ps1') -VisualStudio $VisualStudio
 & (Join-Path $PSScriptRoot 'run-routine-debug-blips-tests.ps1') -VisualStudio $VisualStudio
 & (Join-Path $PSScriptRoot 'run-routine-debug-bridge-tests.ps1') -VisualStudio $VisualStudio
+& (Join-Path $PSScriptRoot 'run-startup-trace-writer-tests.ps1') -VisualStudio $VisualStudio

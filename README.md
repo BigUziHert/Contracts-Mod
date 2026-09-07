@@ -62,6 +62,15 @@ To photograph a corpse, enter the handheld camera view within 25 metres with a c
 
 ScriptHookRDR2 and Lenny's Mod Loader are not included. The LML resource supplies only the card-title text; it does not provide the portrait or bounty gameplay. The code attempts a fallback without that resource, but the native title may be missing. The no-LML configuration has not yet been tested in-game.
 
+Fully exit RDR2 when changing this ASI. An in-game ASI reload resets the mod's ownership
+and portrait-slot tracking while game-side resources may survive; it is not a clean
+test session. Contract preflight now rejects a full NPC pool before requesting a town
+or target model, retaining the current hunt. `BountyContracts-startup-trace.log` beside
+the ASI records flushed startup stages, process/module-session IDs and known resource
+state, including successful progress before a possible native crash. It adds no extra
+game-native queries inside the logger. The FFFFFFFF crash cause remains unconfirmed;
+see [the startup investigation](docs/startup-crash-investigation.md).
+
 The portrait fix was confirmed working in-game from the user's screenshots of dev-10-sp, and repeated contracts through **U** were confirmed in-game with the slot rotation and opaque-handle fix. The handoff and AI changes compile and pass the native-free regression tests but still require in-game validation. The hand-contact phase is an estimate in `Tune::kHandoffTransferPhase`; exact hand alignment must be checked at the different clerks.
 
 ## Building
@@ -116,7 +125,7 @@ Every failed consumer, reopen, or capture stops the sequence. A completed sequen
 
 Use `dev` for ongoing work. Update `main` when explicitly requested.
 
-Run `./tests/run-tests.ps1` from PowerShell to compile and execute nineteen suites: deterministic AI, handoff, keyboard, card-texture, spawn/input/pause, portrait-startup, portrait-cache, owned-ped cleanup, diagnostic-driver, native AI bridge, contract lifecycle, routine spawn, routine scheduling logic, routine plans, native routine runtime, routine card drawing, debug display, debug blips and the debug observation bridge. The native-shim tests exercise actual production functions. Source review and simulated native responses establish the code's decisions, but cannot verify in-game ground placement, pathfinding, scenario props, animation, card readability or rendering. Build output stays under `tmp/tests`.
+Run `./tests/run-tests.ps1` from PowerShell to compile and execute twenty suites: deterministic AI, handoff, keyboard, card-texture, spawn/input/pause, portrait-startup, portrait-cache, owned-ped cleanup, diagnostic-driver, native AI bridge, contract lifecycle, routine spawn, routine scheduling logic, routine plans, native routine runtime, routine card drawing, debug display, debug blips, debug observation bridge, and startup trace file writer. The native-shim tests exercise actual production functions. Source review and simulated native responses establish the code's decisions, but cannot verify in-game ground placement, pathfinding, scenario props, animation, card readability or rendering. Build output stays under `tmp/tests`.
 
 [Town target routines](docs/target-routines.md) explains schedules, fallback, separate search/spawn/wander areas and how to add towns and locations. [Location sources](docs/routine-location-sources.md) records the coordinate evidence and omitted sites. [Activities and transit evidence](docs/routine-activities-and-transit.md) documents smoking/drinking, venue availability, the specific blockers for games/theatre/trams and the remaining in-game checks.
 

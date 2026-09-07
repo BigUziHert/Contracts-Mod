@@ -93,6 +93,7 @@ static bool PrepareRoutineContract(RoutineRuntime& prepared)
         const auto& location = RoutineData::kLocations[id];
         routineStartDiagnostic.location = location.id;
         routineStartDiagnostic.expected = location.anchor;
+        StartupTrace::Record("candidate_prepare_begin", 0, 0, &location.anchor, -1, location.id);
         Vector3 point;
         if (RoutineSpawn::Prepare(location.anchor, location.candidateRadius, location.maxHeightDelta, seed, point) &&
             Routine::CanArriveAndStay({location.openMinute, location.closeMinute}, RoutineMinute(), 0, 15))
@@ -106,8 +107,11 @@ static bool PrepareRoutineContract(RoutineRuntime& prepared)
             const auto& area = RoutineData::kTowns[town];
             prepared.definition = { area.name, RoutinePlan::OccupationName(occupation), area.name,
                 point, Tune::kReAggroSightDist, RoutineModels(town, occupation), &kHumanTarget, nullptr, ResetRoutine };
+            StartupTrace::Record("candidate_prepared", 0, 0, &point, -1, location.id);
             return true;
         }
+        StartupTrace::Record("candidate_rejected", 0, 0, &location.anchor, -1,
+            std::strcmp(RoutineSpawn::diagnostic.check, "ok") == 0 ? "visiting_window_closed" : RoutineSpawn::diagnostic.check);
         for (auto& candidate : candidates) if (candidate.id == id) candidate.available = false;
     }
     return false;

@@ -10,6 +10,7 @@ using Hash = std::uint32_t;
 using Ped = int;
 using ULONGLONG = unsigned long long;
 struct Vector3 { float x, y, z; };
+#include "../rdr2 scripting environment/samples/Pools/startup_trace.h"
 struct ContractDef { Vector3 spawn; };
 
 constexpr Hash kModel = 1234;

@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
+#include <vector>
 using Ped = int; using Entity = int; using BOOL = int; using DWORD = unsigned;
 struct Vector3 { float x, y, z; Vector3(float a=0, float b=0, float c=0):x(a),y(b),z(c) {} };
 static unsigned checks = 0;
@@ -56,6 +57,93 @@ static void REQUEST_COLLISION_AT_COORD(Vector3) { ++w.collisionRequests; }
 #include "../rdr2 scripting environment/samples/Pools/routine_locations.h"
 static bool Validate() { Vector3 out; return RoutineSpawn::Validate({100,200,10},8,2.5f,{100,200,10},out); }
 static bool SamePoint(Vector3 a,Vector3 b) { return a.x==b.x && a.y==b.y && a.z==b.z; }
+struct TraceSnapshot {
+    StartupTrace::Event event;
+    int starts, stops, collisionRequests, requiredRegions;
+};
+static std::vector<TraceSnapshot> trace;
+static void CaptureTrace(const StartupTrace::Event& event) {
+    trace.push_back({event,w.starts,w.stops,w.collisionRequests,w.requiredRegions});
+}
+static void ResetTraceWorld() { w={}; trace.clear(); StartupTrace::sink=CaptureTrace; }
+static void CheckTraceStages(std::initializer_list<const char*> expected,const Vector3& point) {
+    Check(trace.size()==expected.size(),"trace contains exactly one event for each requested preparation boundary");
+    std::size_t index=0;
+    for(const char* stage:expected) {
+        const auto& event=trace[index++].event;
+        Check(std::strcmp(event.stage,stage)==0,"preparation trace events retain their execution order");
+        Check(event.hasPoint && SamePoint(event.point,point),"each streaming breadcrumb retains the requested anchor");
+    }
+}
+static void OptionalTraceSinkCopiesPoints() {
+    Check(StartupTrace::sink==nullptr,"startup tracing is disabled by default");
+    StartupTrace::Record("no_sink");
+    Check(trace.empty(),"recording with no sink is a harmless no-op");
+    ResetTraceWorld();
+    Vector3 point(100,200,10);
+    StartupTrace::Record("point_copy",0x12345u,42,&point,3,"before_request");
+    point=Vector3(900,800,700);
+    StartupTrace::Record("defaults");
+    Check(trace.size()==2,"installed optional sink receives each explicit record once");
+    const auto& copied=trace[0].event;
+    Check(copied.hasPoint && SamePoint(copied.point,{100,200,10}),
+        "captured event owns a coordinate copy that survives changes to its source");
+    Check(copied.model==0x12345u && copied.ped==42 && copied.freePeds==3 &&
+        std::strcmp(copied.stage,"point_copy")==0 && std::strcmp(copied.detail,"before_request")==0,
+        "sink receives the supplied stage, model, actor, pool count and detail");
+    const auto& defaults=trace[1].event;
+    Check(!defaults.hasPoint && SamePoint(defaults.point,{}) && defaults.model==0 && defaults.ped==0 &&
+        defaults.freePeds==-1 && defaults.detail[0]=='\0',"omitted trace values are explicit and initialized");
+    StartupTrace::sink=nullptr;
+    StartupTrace::Record("removed_sink");
+    Check(trace.size()==2,"removing the sink immediately disables further records");
+    trace.clear();
+}
+static void SceneTraceBracketsOwnedNativeCalls() {
+    const Vector3 anchor(100,200,10);
+    for(int outcome=0;outcome<3;++outcome) {
+        ResetTraceWorld();
+        w.loadAt=1100;
+        if(outcome==1)w.collision=false;
+        if(outcome==2)w.cancelsAt=1;
+        Check(RoutineSpawn::EnsureLoaded(anchor)==(outcome==0),
+            "owned-loader trace preserves success, timeout and interruption results");
+        CheckTraceStages({"scene_start_begin","scene_start_owned","nav_region_request","collision_wait_begin",
+            outcome==0?"collision_wait_ready":"collision_wait_failed","scene_stop_begin","scene_stopped"},anchor);
+        Check(trace[0].starts==0 && trace[1].starts==1,
+            "scene-start breadcrumbs bracket the actual native return");
+        Check(trace[2].requiredRegions==0 && trace[3].requiredRegions==1 && trace[3].collisionRequests==0,
+            "nav request is traced before its native and collision wait is traced before polling");
+        Check(trace[4].collisionRequests>0 && trace[4].stops==0,
+            "collision result is recorded after polling and before owned scene cleanup");
+        Check(trace[5].stops==0 && trace[6].stops==1 && w.starts==1 && w.stops==1 && !w.sceneActive,
+            "owned scene cleanup occurs exactly once between stop breadcrumbs on every exit");
+    }
+    ResetTraceWorld();w.loadAt=1100;w.startOk=false;
+    Check(RoutineSpawn::EnsureLoaded(anchor),"refused scene load can still complete through passive collision streaming");
+    CheckTraceStages({"scene_start_begin","scene_start_refused","nav_region_request","collision_wait_begin",
+        "collision_wait_ready"},anchor);
+    Check(trace[0].starts==0 && trace[1].starts==1 && w.starts==1 && w.stops==0,
+        "refused start records its actual return without inventing an owned cleanup");
+    StartupTrace::sink=nullptr;
+}
+static void SceneTracePreservesForeignAndLoadedPaths() {
+    const Vector3 anchor(100,200,10);
+    for(bool ready:{true,false}) {
+        ResetTraceWorld();w.sceneActive=true;w.loadAt=1100;w.collision=ready;
+        Check(RoutineSpawn::EnsureLoaded(anchor)==ready,"foreign loader keeps its existing passive success or timeout result");
+        CheckTraceStages({"nav_region_request","collision_wait_begin",ready?"collision_wait_ready":"collision_wait_failed"},anchor);
+        Check(w.starts==0 && w.stops==0 && w.sceneActive,
+            "foreign loader emits neither scene-start nor scene-stop records or native calls");
+    }
+    for(bool available:{true,false}) {
+        ResetTraceWorld();w.sceneActive=true;if(!available)w.cancelsAt=0;
+        Check(RoutineSpawn::EnsureLoaded(anchor)==available,"loaded trace fast path retains player availability handling");
+        Check(trace.empty() && w.sceneQueries==0 && w.starts==0 && w.stops==0 &&
+            w.requiredRegions==0 && w.collisionRequests==0,"already loaded destination emits no streaming breadcrumbs");
+    }
+    StartupTrace::sink=nullptr;
+}
 static void CheckStage(const char* stage) {
     Check(std::strcmp(RoutineSpawn::diagnostic.check,stage)==0,"failure diagnostic identifies the actual rejecting check");
 }
@@ -148,6 +236,7 @@ static void AlreadyLoadedPointNeverTouchesSceneLoader() {
     Check(w.stops==1,"failed bounded loading releases only its own successfully started scene");
 }
 int main() {
+    OptionalTraceSinkCopiesPoints();
     Check(Validate() && w.probes==5,"ground-level clear outdoor nav point accepted");
     for(int failure=0;failure<12;++failure) {
         w={};
@@ -178,6 +267,8 @@ int main() {
     AcceptedPointDoesNotRerollNavigation();
     AcceptedPointStillRejectsUnsafeWorldChanges();
     AlreadyLoadedPointNeverTouchesSceneLoader();
+    SceneTraceBracketsOwnedNativeCalls();
+    SceneTracePreservesForeignAndLoadedPaths();
     using namespace RoutineData;
     for(const Town& town:kTowns) {
         unsigned kinds=0; bool fallback=false;

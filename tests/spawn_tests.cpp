@@ -11,6 +11,7 @@ using ULONGLONG = std::uint64_t;
 using Hash = std::uint32_t;
 using Ped = int;
 struct Vector3 { float x, y, z; };
+#include "../rdr2 scripting environment/samples/Pools/startup_trace.h"
 
 constexpr Hash kModel = 1234;
 constexpr Ped kPlayer = 42;
@@ -52,6 +53,7 @@ static struct World
     unsigned spawnVisibleFrame = 0;
     bool spawnedPending = false;
     int freePedSlots = 10;
+    unsigned poolQueries = 0;
     unsigned poolAvailableFrame = 0;
     bool creationFillsPool = false;
     unsigned creates = 0;
@@ -82,7 +84,13 @@ static struct World
     std::vector<const char*> messages;
     std::vector<unsigned> createFrames;
     std::vector<ULONGLONG> createTimes;
+    std::vector<StartupTrace::Event> startupEvents;
 } world;
+
+static void CollectStartupTrace(const StartupTrace::Event& event)
+{
+    world.startupEvents.push_back(event);
+}
 
 static ULONGLONG GetTickCount64() { return world.nowMs; }
 static void MaintainPortraitAndCard() { ++world.maintenance; }
@@ -181,6 +189,7 @@ namespace PED
 {
 static int _GET_NUM_FREE_SLOTS_IN_PED_POOL()
 {
+    ++world.poolQueries;
     return world.frame < world.poolAvailableFrame ? 0 : world.freePedSlots;
 }
 static bool IS_PED_DEAD_OR_DYING(Ped ped, bool)
@@ -275,6 +284,7 @@ static void ReportContractStartFailure()
 
 static void Reset()
 {
+    StartupTrace::sink = nullptr;
     world = World();
     pedMe = kPlayer;
     C = {};
@@ -540,20 +550,77 @@ static void TestPauseDuringWait()
 static void TestContractPreflight()
 {
     Reset();
+    world.freePedSlots = 0;
     photoSlotsBound = 0xFFFFFFFFu;
     Check(!CanPrepareContract() && lastStartFailure == ContractStartFailure::PhotoCacheExhausted,
         "all inspected slots refuse preparation before the caller clears its active contract");
     Check(photoSlotsBound == 0xFFFFFFFFu && world.creates == 0 && world.releases == 0,
         "exhaustion neither resets slot ownership nor starts capture");
+    Check(world.poolQueries == 0 && std::strcmp(lastPhotoStage, "photo_slots_exhausted") == 0,
+        "exhausted portrait slots retain priority over a full ped pool without querying it");
+    world.freePedSlots = 1;
     for (int slot = 0; slot < Card::kPhotoSlotCount; ++slot)
     {
         photoSlotsBound = 0xFFFFFFFFu & ~(1u << slot);
         Check(CanPrepareContract(), "any single remaining slot permits preparation");
     }
+    Check(world.poolQueries == Card::kPhotoSlotCount && world.requests == 0 && world.frame == 0,
+        "one free ped slot is sufficient and each eligible preflight queries the pool once without loading or waiting");
     Reset();
     world.playerDying = true;
+    world.freePedSlots = 0;
+    photoSlotsBound = 0xFFFFFFFFu;
     Check(!CanPrepareContract() && lastStartFailure == ContractStartFailure::Interrupted,
         "an unavailable player is rejected before contract reset");
+    Check(world.poolQueries == 0 && world.failureLogs == 1,
+        "player interruption retains priority over portrait exhaustion and a full pool");
+
+    for (const int capacity : {0, -1})
+    {
+        Reset();
+        world.freePedSlots = capacity;
+        world.contractActive = true;
+        world.spawnedAlive = world.missionOwned = true;
+        g_state = CONTRACT_FOUND;
+        C.cardOpenPending = true;
+        Cd = { 123, true, kPlayer };
+        photoSlotsBound = 5u;
+        ownedPed.ped = kSpawnedPed;
+        ownedPed.model = kModel;
+        StartupTrace::sink = CollectStartupTrace;
+        const ULONGLONG started = world.nowMs;
+        Check(!CanPrepareContract() && lastStartFailure == ContractStartFailure::PedPoolFull,
+            "zero or negative available ped capacity refuses preparation before replacing the hunt");
+        Check(world.contractActive && g_state == CONTRACT_FOUND && C.cardOpenPending &&
+            Cd.obj == 123 && Cd.examining && Cd.inspectingPed == kPlayer && photoSlotsBound == 5u,
+            "pool rejection preserves the active hunt, card state and bound portrait slots");
+        Check(ownedPed.ped == kSpawnedPed && ownedPed.model == kModel && !ownedPed.cleanupPending &&
+            world.spawnedAlive && world.missionOwned && world.deletes == 0 && ownedPedsReleased == 0,
+            "pool rejection leaves the existing owned target intact without cleanup");
+        Check(world.poolQueries == 1 && world.failureLogs == 1 && world.requests == 0 &&
+            world.releases == 0 && world.creates == 0 && world.placements == 0 &&
+            world.frame == 0 && world.nowMs == started && world.maintenance == 0,
+            "pool preflight rejects synchronously without model loading, spawning or yielding");
+        Check(world.startupEvents.size() == 2 &&
+            std::strcmp(world.startupEvents[0].stage, "preflight_pool_query") == 0 &&
+            std::strcmp(world.startupEvents[1].stage, "preflight_pool_result") == 0,
+            "synchronous breadcrumbs bracket the native pool query in order");
+        const auto& result = world.startupEvents[1];
+        Check(result.freePeds == capacity && result.model == 0 && result.ped == 0 && !result.hasPoint,
+            "pool breadcrumb records the exact capacity before selecting a model or spawn point");
+    }
+
+    Reset();
+    world.poolAvailableFrame = 1;
+    Check(!CanPrepareContract() && lastStartFailure == ContractStartFailure::PedPoolFull &&
+        world.frame == 0 && world.poolQueries == 1 && world.requests == 0 && world.creates == 0,
+        "preflight does not wait for a temporarily full pool to gain capacity");
+
+    Reset();
+    world.freePedSlots = 1;
+    Check(CanPrepareContract() && world.failureLogs == 0 &&
+        lastStartFailure == ContractStartFailure::None && world.startupEvents.empty(),
+        "one free slot permits preparation with the optional breadcrumb sink disabled");
 }
 
 static void TestDeferredRemoteInput()

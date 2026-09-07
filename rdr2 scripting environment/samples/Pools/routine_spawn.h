@@ -1,4 +1,5 @@
 #pragma once
+#include "startup_trace.h"
 
 // Included after the script's bounded WaitUntil helper. No entity is created here.
 // Source precedents and flag limitations are recorded in docs/target-routines.md.
@@ -115,13 +116,25 @@ inline bool EnsureLoaded(const Vector3& anchor)
     // another script replacing our request during a yield remains an engine limitation.
     bool ownsScene = false;
     if (!Loaded(anchor) && !STREAMING::IS_LOAD_SCENE_ACTIVE())
+    {
+        StartupTrace::Record("scene_start_begin", 0, 0, &anchor);
         ownsScene = STREAMING::LOAD_SCENE_START_SPHERE(anchor, 50.0f, 0) != 0;
+        StartupTrace::Record(ownsScene ? "scene_start_owned" : "scene_start_refused", 0, 0, &anchor);
+    }
+    StartupTrace::Record("nav_region_request", 0, 0, &anchor);
     PATH::ADD_NAVMESH_REQUIRED_REGION(anchor.x, anchor.y, 50.0f);
+    StartupTrace::Record("collision_wait_begin", 0, 0, &anchor);
     bool loaded = WaitUntil(3000, [&] {
         STREAMING::REQUEST_COLLISION_AT_COORD(anchor);
         return Loaded(anchor);
     });
-    if (ownsScene) STREAMING::LOAD_SCENE_STOP();
+    StartupTrace::Record(loaded ? "collision_wait_ready" : "collision_wait_failed", 0, 0, &anchor);
+    if (ownsScene)
+    {
+        StartupTrace::Record("scene_stop_begin", 0, 0, &anchor);
+        STREAMING::LOAD_SCENE_STOP();
+        StartupTrace::Record("scene_stopped", 0, 0, &anchor);
+    }
     if (!loaded) return Reject("stream_timeout_or_interrupted");
     return PlayerAvailable();
 }

@@ -18,6 +18,7 @@
 #include "contract_data.h"
 #include "target_ai_logic.h"
 #include "handoff_logic.h"
+#include "startup_trace.h"
 #include <cstdio>
 #include <cstring>
 #include <cmath>
@@ -198,9 +199,35 @@ static void WritePhotoTiming(FILE* file, const char* phase)
 		C.photoUploadMs, C.photoCleanupMs, C.photoReadbackMs, C.photoRequestCallMaxMs);
 }
 
+static ULONGLONG startupTraceSession = 0;
+static void WriteStartupTrace(const StartupTrace::Event& event)
+{
+	// Flush/close each bounded startup stage before entering the next native. Read
+	// only existing state here: a diagnostic native could itself hide the failure.
+	HMODULE module = nullptr;
+	wchar_t path[MAX_PATH] = {};
+	if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+		reinterpret_cast<LPCWSTR>(&WriteStartupTrace), &module)) return;
+	DWORD length = GetModuleFileNameW(module, path, MAX_PATH);
+	if (!length || length >= MAX_PATH) return;
+	wchar_t* slash = std::wcsrchr(path, L'\\');
+	if (!slash || wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - path), L"BountyContracts-startup-trace.log") != 0) return;
+	FILE* file = nullptr;
+	if (_wfopen_s(&file, path, L"a") != 0 || !file) return;
+	SYSTEMTIME time;
+	GetSystemTime(&time);
+	fprintf(file, "%04u-%02u-%02uT%02u:%02u:%02uZ trace-v1 build=pool-preflight-v1 pid=%lu session=%llu stage=%s detail=%s model=%08X ped=%d freePeds=%d hasPoint=%d point=%.3f,%.3f,%.3f owned=%d slot=%d download=%d photoStage=%s\n",
+		time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond,
+		GetCurrentProcessId(), startupTraceSession, event.stage, event.detail, event.model, event.ped,
+		event.freePeds, event.hasPoint ? 1 : 0, event.point.x, event.point.y, event.point.z,
+		ownedPed.ped, C.photoSlot, C.photoDownload, lastPhotoStage);
+	fclose(file);
+}
+
 static void WriteRoutineStartDiagnostic(FILE* file);
 static void LogContractStartFailure(Hash model, int attempt)
 {
+	StartupTrace::Record("handled_failure", model, C.target);
 	HMODULE module = nullptr;
 	wchar_t path[MAX_PATH] = {};
 	if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -408,11 +435,13 @@ static Ped SpawnPed(Hash model, const Vector3& pos)
 		lastStartFailure = ContractStartFailure::InvalidModel;
 		return 0;
 	}
+	StartupTrace::Record("model_load_begin", model);
 	if (!LoadModel(model))
 	{
 		lastStartFailure = PlayerAvailable() ? ContractStartFailure::ModelLoadTimeout : ContractStartFailure::Interrupted;
 		return 0;
 	}
+	StartupTrace::Record("model_load_ready", model);
 
 	Ped ped = 0;
 	ULONGLONG nextAttemptMs = 0;
@@ -426,7 +455,9 @@ static Ped SpawnPed(Hash model, const Vector3& pos)
 		if (now < nextAttemptMs) return false;
 		nextAttemptMs = now + Tune::kPedSpawnRetryDelayMs;
 		if (PED::_GET_NUM_FREE_SLOTS_IN_PED_POOL() <= 0) return false;
+		StartupTrace::Record("ped_create_begin", model, 0, &pos);
 		ped = PED::CREATE_PED(model, pos, 0.0f, false, true, true, true);
+		StartupTrace::Record("ped_create_returned", model, ped, &pos);
 		TrackOwnedPed(ped, model);
 		return ped && ENTITY::DOES_ENTITY_EXIST(ped);
 	});
@@ -876,6 +907,7 @@ static Ped SpawnTargetWithPhoto(Hash model, const ContractDef& def)
 	bool photographed = false;
 	for (int attempt = 1; attempt <= Card::kPhotoAttempts; ++attempt)
 	{
+		StartupTrace::Record("portrait_attempt", model, ped);
 		// Capture yields: a completed texture does not prove its subject/player still exists.
 		if (PlayerAvailable() && LivingPed(ped) && PhotographPed(ped) && PlayerAvailable() && LivingPed(ped))
 		{
@@ -894,6 +926,8 @@ static Ped SpawnTargetWithPhoto(Hash model, const ContractDef& def)
 		return 0;
 	}
 
+	StartupTrace::Record("portrait_ready", model, ped);
+	StartupTrace::Record("destination_revalidate_begin", model, ped, &def.spawn);
 	if (!ValidateRoutineDeployment(ped, def))
 	{
 		lastStartFailure = PlayerAvailable() ? ContractStartFailure::LocationUnavailable : ContractStartFailure::Interrupted;
@@ -903,9 +937,11 @@ static Ped SpawnTargetWithPhoto(Hash model, const ContractDef& def)
 	}
 	// Move once while hidden, then allow collision/physics to settle before revealing.
 	// Do not clear ambient entities from the destination. Active routine travel never teleports.
+	StartupTrace::Record("deployment_begin", model, ped, &def.spawn);
 	ENTITY::SET_ENTITY_COORDS(ped, def.spawn.x, def.spawn.y, def.spawn.z, false, false, false, false);
 	ENTITY::SET_ENTITY_COLLISION(ped, true, false);
 	ENTITY::FREEZE_ENTITY_POSITION(ped, false);
+	StartupTrace::Record("settling_begin", model, ped, &def.spawn);
 	if (!WaitForRoutinePlacement(ped, def))
 	{
 		lastStartFailure = PlayerAvailable() ? ContractStartFailure::LocationUnavailable : ContractStartFailure::Interrupted;
@@ -920,6 +956,7 @@ static Ped SpawnTargetWithPhoto(Hash model, const ContractDef& def)
 		return 0;
 	}
 	ENTITY::SET_ENTITY_VISIBLE(ped, true);
+	StartupTrace::Record("target_revealed", model, ped, &def.spawn);
 	return ped;
 }
 
@@ -1540,7 +1577,17 @@ static bool CanPrepareContract()
 		return false;
 	}
 	for (int i = 0; i < Card::kPhotoSlotCount; ++i)
-		if (!(photoSlotsBound & (1u << i))) return true;
+		if (!(photoSlotsBound & (1u << i)))
+		{
+			// Check before remote scene/model loading, while the existing hunt is intact.
+			StartupTrace::Record("preflight_pool_query");
+			const int freePeds = PED::_GET_NUM_FREE_SLOTS_IN_PED_POOL();
+			StartupTrace::Record("preflight_pool_result", 0, 0, nullptr, freePeds);
+			if (freePeds > 0) return true;
+			lastStartFailure = ContractStartFailure::PedPoolFull;
+			LogContractStartFailure(0, 0);
+			return false;
+		}
 	lastStartFailure = ContractStartFailure::PhotoCacheExhausted;
 	lastPhotoStage = "photo_slots_exhausted";
 	LogContractStartFailure(0, 0);
@@ -1550,22 +1597,26 @@ static bool CanPrepareContract()
 // Rolls a random contract, photographs and spawns its target. False if nothing could be spawned.
 static bool StartContract()
 {
+	StartupTrace::Record("request_begin");
 	lastStartFailure = ContractStartFailure::None;
 	lastPhotoStage = "none";
 	if (!CanPrepareContract()) return false;
 	RoutineRuntime prepared;
+	StartupTrace::Record("destination_prepare_begin");
 	if (!PrepareRoutineContract(prepared))
 	{
 		lastStartFailure = PlayerAvailable() ? ContractStartFailure::LocationUnavailable : ContractStartFailure::Interrupted;
 		LogContractStartFailure(0, 0);
 		return false;
 	}
+	StartupTrace::Record("destination_prepared", 0, 0, &prepared.definition.spawn);
 	if (!CanStartInteraction())
 	{
 		lastStartFailure = ContractStartFailure::Interrupted;
 		LogContractStartFailure(0, 0);
 		return false;
 	}
+	StartupTrace::Record("replace_previous_begin");
 	ClearContract(true);
 	R = prepared;
 	for (int attempt = 0; attempt < Tune::kSpawnAttempts; ++attempt)
@@ -1604,11 +1655,13 @@ static bool StartContract()
 		C.target = ped;
 		C.targetPos = def.spawn;
 		C.startMs = RuntimeNowMs();
+		StartupTrace::Record("target_setup_begin", model, ped, &def.spawn);
 		def.behavior->setup(ped, def);
 		if (def.onSpawned) def.onSpawned(def);
 		AddSearchBlip();
 		g_state = CONTRACT_UNKNOWN;
 		lastStartFailure = ContractStartFailure::None;
+		StartupTrace::Record("contract_ready", model, ped, &def.spawn);
 		return true;
 	}
 	ResetRoutine();
@@ -2023,6 +2076,7 @@ static void UpdatePlayer()
 
 static void StartRemoteContract()
 {
+	StartupTrace::Record("remote_requested");
 	Ped requestedPlayer = pedMe;
 	DisplaySubtitle(ContractActive() ? "REPLACING CONTRACT" : "PREPARING CONTRACT");
 	// Run creation on a fresh game frame after the keyboard event, then refresh the player snapshot.
@@ -2088,6 +2142,9 @@ static bool ConsumeRemoteContractRequest(bool pressed)
 
 void ScriptMain()
 {
+	startupTraceSession = GetTickCount64();
+	StartupTrace::sink = WriteStartupTrace;
+	StartupTrace::Record("module_start");
 	srand((unsigned)GetTickCount64());
 	CreateGiverPrompt();
 	while (true)
