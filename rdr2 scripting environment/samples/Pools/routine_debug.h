@@ -28,15 +28,12 @@ static const char* ObserveRoutineDebugActivity(RoutineDebugView::Snapshot& snaps
     if (!snapshot.loaded) return "Paused: area not loaded";
     if (R.controller.state == Routine::State::Suspended) return "Routine paused";
     if (R.selectPending || R.resumeRequested) return "Choosing destination";
-    if (R.controller.state == Routine::State::Activity)
+    if (PED::IS_PED_USING_ANY_SCENARIO(ped))
     {
-        const bool usingActivity = R.activityName && PED::IS_PED_USING_SCENARIO_HASH(ped, R.activityHash);
-        snapshot.taskActive = usingActivity;
-        if (!usingActivity) return "Activity starting / recovery";
-        if (RuntimeNowMs() >= R.activityUntilMs) return "Finishing activity";
-        if (R.activityHash == Joaat("WORLD_HUMAN_SMOKE")) return "Smoking";
-        if (R.activityHash == Joaat("WORLD_HUMAN_DRINKING")) return "Drinking";
-        return "Ambient activity";
+        snapshot.taskActive = RoutineTaskActive(ped);
+        if (PED::IS_PED_USING_SCENARIO_HASH(ped, Joaat("WORLD_HUMAN_SMOKE"))) return "Smoking (ambient)";
+        if (PED::IS_PED_USING_SCENARIO_HASH(ped, Joaat("WORLD_HUMAN_DRINKING"))) return "Drinking (ambient)";
+        return "Ambient scenario";
     }
     if (R.controller.state == Routine::State::Waiting) return "Waiting for a usable destination";
     snapshot.taskActive = RoutineTaskActive(ped);

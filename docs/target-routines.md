@@ -2,9 +2,9 @@
 
 ## Stage 1: sourced locations and initial deployment
 
-New contracts choose an occupation and a four-destination plan in one of five towns.
-`routine_locations.h` contains 27 public exterior candidate areas, including stable,
-livestock, market, dock, shop-front and newspaper/campfire areas. Coordinate provenance
+New contracts choose an occupation and a four-destination plan in one of seven towns.
+`routine_locations.h` contains public exterior candidate areas, including stable,
+livestock, market, dock, shop-front, station, theatre-front and camp areas. Coordinate provenance
 and omissions are in [routine-location-sources.md](routine-location-sources.md).
 Construction, lumber yards and other world-state-dependent sites without a verified
 availability check are omitted. A source coordinate is a candidate, not proof of safety.
@@ -53,10 +53,10 @@ clerk/payment paths retain their existing implementation.
 
 ## Separate areas
 
-- Town search: a fixed 180–260 m investigation circle covering the curated sites and their
+- Town search: a fixed 180–310 m investigation circle covering the curated sites and their
   wandering areas. It does not follow the target or disclose its selected destination.
-- Candidate radius: 7–12 m around a sourced coordinate, used only for validation.
-- Wander radius: 18–26 m around a fixed validated destination point.
+- Candidate radius: 4–12 m around a sourced coordinate, used only for validation.
+- Wander radius: 12–26 m around a fixed validated destination point.
 - Discovery: 45 m plus existing aim/LOS rules; direct interaction, damage or combat still
   discovers the target. Broadening the search circle does not broaden aim discovery.
 
@@ -77,6 +77,9 @@ Add a town's search centre/radius and sourced `Location` rows, each with a uniqu
 occupation mask, phase, bounded candidate/height/wander dimensions and a source reference.
 Every supported occupation needs one compatible site per phase and an all-day Rest
 fallback. Add matching archetypes in `RoutineModels`; reject unsupported town/role pairs.
+Update `GeneratedOccupation` too: every enabled location must be reachable by an actual
+generated occupation, not merely by a profile that only tests construct. Saint Denis
+generates laborers as well as dock workers so its market/stable day areas are reachable.
 Never enable construction or interiors merely because a marker exists. Record the world
 state/venue checks first, then add tests and validate the accepted points in game.
 
@@ -148,25 +151,25 @@ all 18 checked protected functions and the complete Card constants block were id
 
 ## Stages 4 and 5: ambient activities; transit deferred
 
-On arrival, suitable targets can take a smoking/drinking stop scheduled for 40–75 seconds
-(the normal 1.5-second task-loss grace applies at expiry). Entry checks
-the scenario type is enabled and the actual ped position is free and outdoors. The
-controller confirms the ped is using the requested scenario, allows a startup grace,
-and falls back to local wandering if entry fails, the activity ends, its type is disabled
-or the capped visit expires. Priority interruptions issue no routine tasks. Scenario
-props are managed by the native task; there are no mod-created bottles/chairs or borrowed
-actors to delete. Prop appearance and exit cleanup still need in-game verification.
-During an activity and for five seconds after its exit task, residency checks replace
-full destination clearance probes so the target's own retiring props do not reject its
-standing area. Opening windows, scenario availability and encounter priorities still apply.
+Arrival starts `TASK_WANDER_IN_AREA` immediately. The former forced 40–75-second
+smoking/drinking stops have been removed following in-game feedback about stops in the
+road. The game may choose ambient behavior while wandering; the mod does not choose a
+smoking point, impose a duration, or start a scenario on arrival. Natural pauses can
+still occur and need observation in game.
 
-Smoking follows `ambush_pnk_type1.c:958`; drinking follows
-`beat_duel_boaster.c:1965-1966`. Type-enabled queries follow `abigail2_1.c:13327`.
-To add an activity, first establish its native signature, source flag usage, location and
-occupation suitability, entry confirmation, hours/active-event availability, ownership,
-normal and interrupted exits. Add its choice to `RoutineActivityName` and bridge handling
-with native-shim tests. Add matching factual card wording only if actual participation is
-supported. Furniture, tools and private minigames require more than an animation name.
+While Wandering, an observed `IS_PED_USING_ANY_SCENARIO` counts as a healthy task, so the
+task-loss watchdog does not repeatedly cancel an ambient pause. Travel still requires
+its navigation task and retains bounded recovery. Residency checks replace destination
+clearance probes during an observed ambient scenario and for five seconds afterward,
+so the target's own props do not invalidate the stop. Phase changes, visiting windows,
+streaming and encounter priorities retain precedence. Debug text observes actual
+smoking, drinking or another scenario; it does not infer activity from the destination.
+
+`beat_town_robbery.c:3097` uses area wandering inside Keane's saloon; the current native
+arguments also follow `beat_public_hanging.c:16270`. These examples support normal
+wandering and interior access, not guaranteed shop interaction or minigame enrollment.
+Any future explicit venue activity still needs verified access, hours/event state,
+entry confirmation, ownership and interruption handling, plus truthful card wording.
 
 Genuine poker, blackjack, five-finger fillet and theatre participation remain disabled.
 Those scripts maintain private participants, seats and/or show state; no safe registration

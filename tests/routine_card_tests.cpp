@@ -85,7 +85,7 @@ static void CheckDrawnCard(const RoutinePlan::Plan& plan)
         previousY = draw.y;
         const auto lower = Lowercase(draw.text);
         for (const char* unsupported : {"poker", "blackjack", "five-finger", "five finger", "haircut",
-            "shopping", "purchases", "buys ", "plays ", "watching a show", "drinks ", "tram", "theatre"})
+            "shopping", "purchases", "buys ", "plays ", "watching a show", "drinks ", "tram", "attending"})
             Check(lower.find(unsupported) == std::string::npos,
                 "enabled exterior routine card does not promise unsupported commerce, games, shows or transport");
     }
@@ -108,7 +108,7 @@ static void EverySupportedRouteDrawsItsOwnClues()
                 ++validPlans;
                 CheckDrawnCard(plan);
             }
-    Check(validPlans == 480, "renderer coverage includes all fifteen supported town/occupation profiles");
+    Check(validPlans == 640, "renderer coverage includes all twenty supported town/occupation profiles");
 }
 static void InvalidIdentityNeverDrawsStaleInformation()
 {

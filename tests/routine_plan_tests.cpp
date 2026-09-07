@@ -55,12 +55,13 @@ static void TownRoleSeedCoverageAndTruthfulCards()
 {
     // Columns: Local, Laborer, DockWorker, LivestockHand. Every supported role
     // must have a complete route; an occupation label cannot substitute a missing job area.
-    const bool supported[5][4] = {
+    const bool supported[7][4] = {
         {true, true, false, true}, {true, true, false, true}, {true, true, false, true},
-        {true, true, false, true}, {true, true, true, false}
+        {true, true, false, true}, {true, true, true, false},
+        {true, true, true, false}, {true, true, false, false}
     };
     const char* prefixes[4] = {"Day: ", "Afternoon: ", "Evening: ", "Late: "};
-    Check(RoutineData::kTownCount == 5, "coverage table includes every authored town");
+    Check(RoutineData::kTownCount == 7, "coverage table includes every authored town");
     for (int town = 0; town < RoutineData::kTownCount; ++town)
         for (int role = 0; role < 4; ++role)
         {
@@ -128,6 +129,23 @@ static void TownRoleSeedCoverageAndTruthfulCards()
                 }
         }
 }
+static void IssuedContractsCanReachEveryCatalogSite()
+{
+    Check(GeneratedOccupation(-1, 0) == 0 && GeneratedOccupation(RoutineData::kTownCount, 0) == 0,
+        "unknown towns do not inherit an unrelated occupation");
+    std::set<int> visited;
+    for (int town = 0; town < RoutineData::kTownCount; ++town)
+        for (std::uint32_t seed = 0; seed < 2048; ++seed)
+        {
+            Plan plan;
+            Check(Build(plan, town, GeneratedOccupation(town, seed), seed),
+                "actual contract generation always supplies a supported complete profile");
+            for (int location : plan.route) visited.insert(location);
+        }
+    for (int index = 0; index < RoutineData::kLocationCount; ++index)
+        if (RoutineData::kLocations[index].enabled)
+            Check(visited.contains(index), "every enabled map dot can be selected by an actually generated contract");
+}
 static void CorruptOrStalePlanCannotPrintClues()
 {
     Plan plan;
@@ -156,6 +174,7 @@ int main()
 {
     DefaultsAndInvalidInputs();
     TownRoleSeedCoverageAndTruthfulCards();
+    IssuedContractsCanReachEveryCatalogSite();
     CorruptOrStalePlanCannotPrintClues();
     std::printf("routine_plan: %u checks passed\n", checks);
 }

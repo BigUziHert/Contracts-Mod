@@ -77,8 +77,8 @@ inline int SelectDestination(const Candidate* candidates, std::size_t count, Pha
     return -1;
 }
 
-enum class State { Travelling, Activity, Wandering, Waiting, Suspended };
-enum class Action { None, Travel, Activity, Wander, Wait };
+enum class State { Travelling, Wandering, Waiting, Suspended };
+enum class Action { None, Travel, Wander, Wait };
 struct Config
 {
     float arrivalDistance = 4.0f;
@@ -101,7 +101,6 @@ struct Observation
     bool destinationOpen = true;
     float distance = 0.0f;
     bool taskActive = false;
-    bool canDoActivity = false; // Only verified and currently usable activities.
     // OR of combat, search, native combat/task, restraint/get-up/ragdoll,
     // unavailable player, unloaded navigation and any active interaction priority.
     bool blocked = false;
@@ -193,7 +192,7 @@ struct Controller
         {
             if (retries >= config.maxRetries) return Fail(config, observation.nowMs);
             ++retries;
-            // An ended/unavailable activity falls back to ordinary local wandering.
+            // Recover a dropped area-wander task after the usual absence grace.
             state = State::Wandering;
             lastTaskAtMs = observation.nowMs;
             missingTask = false;
@@ -222,11 +221,11 @@ private:
     }
     Decision Arrive(const Observation& observation)
     {
-        state = observation.canDoActivity ? State::Activity : State::Wandering;
+        state = State::Wandering;
         lastTaskAtMs = observation.nowMs;
         missingTask = false;
         retries = 0;
-        return {observation.canDoActivity ? Action::Activity : Action::Wander, false, -1};
+        return {Action::Wander, false, -1};
     }
     Decision Wait(const Config& config, std::uint64_t nowMs)
     {

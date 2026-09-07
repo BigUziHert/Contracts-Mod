@@ -39,6 +39,23 @@ inline const char* OccupationName(unsigned occupation)
     default: return "Unknown";
     }
 }
+inline unsigned GeneratedOccupation(int townIndex, std::uint32_t seed)
+{
+    if (townIndex < 0 || townIndex >= RoutineData::kTownCount) return 0;
+    switch (RoutineData::kTowns[townIndex].id)
+    {
+    case RoutineData::TownId::SaintDenis:
+        return ((seed >> 8) & 1u) ? RoutineData::Laborer : RoutineData::DockWorker;
+    case RoutineData::TownId::VanHorn: return RoutineData::DockWorker;
+    case RoutineData::TownId::Annesburg: return RoutineData::Laborer;
+    case RoutineData::TownId::Rhodes:
+    case RoutineData::TownId::Blackwater:
+    case RoutineData::TownId::Valentine:
+    case RoutineData::TownId::Strawberry:
+        return ((seed >> 8) & 1u) ? RoutineData::Laborer : RoutineData::LivestockHand;
+    }
+    return 0;
+}
 inline std::uint32_t Mix(std::uint32_t value)
 {
     value ^= value >> 16;

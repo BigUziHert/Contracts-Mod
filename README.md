@@ -2,7 +2,7 @@
 
 A Red Dead Redemption 2 single-player mod written in C++ with Alexander Blade's ScriptHookRDR2. Station clerks offer bounty contracts with a physical photo card showing the target.
 
-Targets now follow daily walking routes in Rhodes, Blackwater, Valentine, Strawberry and Saint Denis. Each contract selects four regular haunts from 27 sourced outdoor areas, including yards, docks, markets and shop frontages. The card lists the target's occupation, town and usual day, afternoon, evening and late-hour destinations. Targets wander around each destination and can pause for ambient smoking or drinking for roughly 40–75 seconds, then resume wandering; failed activities fall back to wandering.
+Targets follow daily walking routes in Rhodes, Blackwater, Valentine, Strawberry, Saint Denis, Van Horn and Annesburg. Each contract selects four regular haunts from 63 outdoor candidate areas, including yards, docks, markets, stations, theatre entrances and shop frontages. The card lists the target's occupation, town and usual day, afternoon, evening and late-hour destinations. Arrival starts native area wandering; the game can choose ambient pauses such as smoking. The mod no longer forces smoking or drinking stops or imposes their duration. See [the expansion and testing notes](docs/routine-expansion-2026-09-06.md).
 
 The destination windows are authored outdoor visiting hours, not verified business opening hours. Actual shopping, haircuts, work animations, poker, blackjack, five-finger fillet, theatre attendance and tram travel remain disabled. Construction and other changing sites without verified availability checks are omitted. Spawn points receive ground, navigation, exterior and clearance checks, but the new locations, routes and activities still need in-game validation.
 
@@ -14,8 +14,8 @@ The destination windows are authored outdoor visiting hours, not verified busine
 Press **I** to inspect the current contract card again. Use the game's own **Zoom**, **Flip**, and **Put Away** prompts while inspecting it.
 
 This testing build starts with **routine debugging enabled**. Press **F8** to hide or
-show both the red map markers and the on-screen panel. Red dots label all 27 authored
-spawn/travel areas across the five towns, plus separate markers for the current
+show both the red map markers and the on-screen panel. Red dots label all authored
+spawn/travel areas across the seven towns, plus separate markers for the current
 contract's exact initial spawn and validated destination. Authored area markers are
 reference points; runtime ground checks can choose a nearby safe position.
 

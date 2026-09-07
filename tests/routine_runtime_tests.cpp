@@ -95,11 +95,10 @@ struct World
     float wanderRadius = 0, avoidRadius = 0;
     int wanderCalls = 0, keepCalls = 0, avoidCalls = 0, waterCalls = 0;
     int travelCalls = 0, standCalls = 0, statusCalls = 0;
-    int activityCalls = 0, activityConfirmations = 0;
+    int activityCalls = 0, scenarioReads = 0;
     int travelTimeout = 0;
     Hash lastTaskHash = 0;
-    Hash scenarioInUse = 0, startedScenario = 0;
-    bool scenarioEnabled = false, scenarioStarts = true, enterAnimation = false;
+    Hash scenarioInUse = 0;
     bool mayEnterWater = true;
 } w;
 static struct OwnedPedFixture { Ped ped = 77; } ownedPed;
@@ -206,22 +205,19 @@ static void TASK_STAND_STILL(Ped, int duration)
 {
     Check(duration == -1, "waiting persists until a later explicit routine decision"); ++w.standCalls;
 }
-static bool IS_SCENARIO_TYPE_ENABLED(const char*) { return w.scenarioEnabled; }
-static void TASK_START_SCENARIO_IN_PLACE_HASH(Ped ped, Hash scenario, int duration, bool enter, Hash condition, float heading, bool finalFlag)
+[[maybe_unused]] static void TASK_START_SCENARIO_IN_PLACE_HASH(Ped, Hash, int, bool, Hash, float, bool)
 {
-    Check(ped == 77 && duration == -1 && condition == 0 && heading == -1.0f && !finalFlag,
-        "ambient activity keeps verified in-place parameters on the existing target");
-    ++w.activityCalls; w.startedScenario = scenario; w.enterAnimation = enter;
-    if (w.scenarioStarts) w.scenarioInUse = scenario;
+    ++w.activityCalls;
+    Check(false, "routine must never force an in-place scenario");
 }
 }
 namespace PED
 {
 static void SET_PED_KEEP_TASK(Ped, bool keep) { Check(keep, "routine task is kept"); ++w.keepCalls; }
-static bool IS_PED_USING_SCENARIO_HASH(Ped ped, Hash hash)
+static bool IS_PED_USING_ANY_SCENARIO(Ped ped)
 {
-    Check(ped == 77, "scenario confirmation examines the same target"); ++w.activityConfirmations;
-    return w.scenarioInUse == hash;
+    Check(ped == 77, "ambient scenario observation examines the existing target"); ++w.scenarioReads;
+    return w.scenarioInUse != 0;
 }
 }
 
@@ -260,6 +256,44 @@ static void TestPreparedDefinition()
         "discarding provisional storage does not invalidate active definition data");
     const auto clues = RoutinePlan::CardLines(R.plan);
     Check(!clues[0].empty() && !clues[5].empty(), "published route supports every habit card line");
+}
+
+static void TestGeneratedTownModels()
+{
+    for (int town = 0; town < RoutineData::kTownCount; ++town)
+        for (const unsigned seed : {0u, 256u})
+        {
+            const unsigned occupation = RoutinePlan::GeneratedOccupation(town, seed);
+            RoutinePlan::Plan plan;
+            Check(RoutinePlan::Build(plan, town, occupation, seed),
+                "each generated town and occupation has a complete compatible route");
+            const ModelSet models = RoutineModels(town, occupation);
+            Check(models.list && models.count > 0 && models.list[0] != 0,
+                "every generated town supplies a nonempty target model set");
+            Check(RoutineModels(town, occupation).list == models.list,
+                "selected town models retain stable storage after preparation");
+            switch (RoutineData::kTowns[town].id)
+            {
+            case RoutineData::TownId::VanHorn:
+                Check(occupation == RoutineData::DockWorker && models.list[0] == Joaat("a_m_m_vhtboatcrew_01"),
+                    "Van Horn dock-worker clues use its verified boat-crew archetype");
+                break;
+            case RoutineData::TownId::Annesburg:
+                Check(occupation == RoutineData::Laborer && models.list[0] == Joaat("a_m_m_asbtownfolk_01_laborer"),
+                    "Annesburg laborer clues use its verified local laborer archetype");
+                break;
+            case RoutineData::TownId::SaintDenis:
+                Check(occupation == RoutineData::Laborer
+                    ? models.list[0] == Joaat("a_m_m_sdlaborers_02") && models.list != SD_DOCK
+                    : occupation == RoutineData::DockWorker && models.list == SD_DOCK,
+                    "Saint Denis laborer and dock-worker clues select their respective verified model pools");
+                break;
+            default: break;
+            }
+        }
+    Check(!RoutineModels(-1, RoutineData::Laborer).list &&
+        RoutineModels(RoutineData::kTownCount, RoutineData::Laborer).count == 0,
+        "invalid town indices cannot silently substitute a Saint Denis model");
 }
 
 static void TestPreparationFailureAndFallback()
@@ -564,122 +598,157 @@ static void TestTravelRecovery()
 static void TravelToLeisure(unsigned seed)
 {
     SetDaytimeFixture();
-    R.plan.seed = seed; w.minute = 1100; w.scenarioEnabled = true;
+    R.plan.seed = seed; w.minute = 1100;
     BeginTravel();
-    Check(R.destination == R.plan.route[2], "activity fixture physically travels to a real leisure destination");
+    Check(R.destination == R.plan.route[2], "ambient fixture physically travels to a real leisure destination");
     w.pedPosition = R.centre;
 }
-static void TestActivityEntryAndConfirmation()
+static void TestAmbientWanderingAndRecovery()
 {
-    for (unsigned seed : {28u, 29u})
+    for (unsigned seed : {28u, 29u, 30u})
     {
         TravelToLeisure(seed); Tick();
-        const Hash expected = Joaat(seed & 1u ? "WORLD_HUMAN_DRINKING" : "WORLD_HUMAN_SMOKE");
-        Check(R.controller.state == Routine::State::Activity && w.activityCalls == 1 && w.startedScenario == expected,
-            "leisure arrival selects the verified smoking or drinking activity");
-        Check(w.enterAnimation == ((seed & 1u) != 0) && R.activityHash == expected && R.activityName,
-            "only drinking requests the source-backed entrance animation");
-        Check(R.activityUntilMs >= w.now + 40000 && R.activityUntilMs <= w.now + 75000,
-            "activity has a bounded forty-to-seventy-five-second dwell");
+        Check(R.controller.state == Routine::State::Wandering && w.wanderCalls == 1 && w.activityCalls == 0,
+            "every leisure seed starts area wandering without forcing smoking or drinking");
         const Vector3 fixed = R.centre;
-        for (int frame = 0; frame < 15; ++frame) Tick();
-        Check(w.activityCalls == 1 && w.activityConfirmations >= 15 && w.wanderCalls == 0 && Within(R.centre, fixed, .001f),
-            "active scenario is confirmed without restart or centre drift every frame");
-        const int tasks = TaskCount(), confirmations = w.activityConfirmations;
-        Tick(16, false); Tick(10000, false);
-        Check(TaskCount() == tasks && w.activityConfirmations == confirmations && R.controller.state == Routine::State::Suspended,
-            "combat or restraint owns the ped without activity restarts or recovery checks");
+        // The native area-wander task may pause at a world scenario and cease to
+        // report its top-level task as active. Observe rather than replace it.
+        w.taskStatus = 7;
+        w.scenarioInUse = Joaat(seed == 28 ? "WORLD_HUMAN_SMOKE" : seed == 29 ? "WORLD_HUMAN_DRINKING" : "WORLD_HUMAN_STARE_STOIC");
+        const int tasks = TaskCount();
+        for (int frame = 0; frame < 20; ++frame) Tick(5000);
+        Check(TaskCount() == tasks && w.scenarioReads >= 20 && Within(R.centre, fixed, .001f) &&
+            R.controller.state == Routine::State::Wandering && !R.controller.IsCoolingDown(R.destination, w.now),
+            "actual native scenarios remain uninterrupted beyond the former forced-activity duration");
+        w.scenarioInUse = 0;
+        Tick(16); Tick(1400);
+        Check(TaskCount() == tasks, "ambient exit starts the normal missing-task grace without immediate retasking");
+        Tick(100);
+        Check(w.wanderCalls == 2 && w.activityCalls == 0 && R.controller.state == Routine::State::Wandering,
+            "an ended ambient scenario with no surviving wander task receives one delayed recovery");
+        w.taskStatus = 1;
+        Tick(10000);
+        Check(w.wanderCalls == 2, "a recovered native wander task is left running");
         ResetRoutine();
-        Check(!R.activityName && R.activityHash == 0 && R.activityUntilMs == 0 && TaskCount() == tasks,
-            "cleanup forgets activity metadata without deleting scenario props or borrowing actors");
+        Check(R.ambientClearanceUntilMs == 0 && !R.enabled && w.activityCalls == 0,
+            "cleanup retires ambient observation data without touching scenario props");
     }
+    SetDaytimeFixture(); R.plan.seed = 30;
+    BeginTravel(); w.pedPosition = R.centre; Tick();
+    Check(w.activityCalls == 0 && w.wanderCalls == 1, "work destinations also delegate all local behavior to native wandering");
+
+    w.scenarioInUse = Joaat("WORLD_HUMAN_SMOKE"); Tick(5000);
+    const int tasks = TaskCount();
+    w.scenarioInUse = 0; w.taskStatus = 0;
+    Tick(10000);
+    Check(TaskCount() == tasks, "ambient exit needs no recovery when native area wandering remains active");
 }
-static void TestActivityAvailabilityAndFallback()
+
+static void TestAmbientPriorityAndTravelRecovery()
 {
-    for (int unavailable = 0; unavailable < 4; ++unavailable)
-    {
-        TravelToLeisure(29);
-        if (unavailable == 0) w.scenarioEnabled = false;
-        if (unavailable == 1) w.occupied = true;
-        if (unavailable == 2) w.outside = false;
-        if (unavailable == 3) w.interior = 123;
-        Tick();
-        Check(w.activityCalls == 0 && w.wanderCalls == 1 && R.controller.state == Routine::State::Wandering,
-            "disabled, occupied or interior arrival starts ordinary wandering without an activity");
-    }
-    TravelToLeisure(29); w.scenarioStarts = false;
+    TravelToLeisure(29); Tick();
+    w.scenarioInUse = Joaat("WORLD_HUMAN_DRINKING"); w.taskStatus = 7;
+    Tick(5000);
+    const int tasks = TaskCount(), reads = w.scenarioReads;
+    Tick(16, false); Tick(30000, false);
+    Check(TaskCount() == tasks && w.scenarioReads == reads && R.controller.state == Routine::State::Suspended,
+        "combat, search, restraint or handoff priority suspends without routine tasks or ambient reads");
     Tick();
-    Check(w.activityCalls == 1 && R.controller.state == Routine::State::Activity,
-        "requested scenario waits for actual engine confirmation");
-    Tick(100); Tick(1500);
-    Check(w.activityCalls == 1 && w.wanderCalls == 0,
-        "failed startup observes task grace and recovery interval without spam");
-    Tick(2500);
-    Check(w.activityCalls == 1 && w.wanderCalls == 1 && R.controller.state == Routine::State::Wandering &&
-        !R.activityName && R.activityHash == 0 && R.activityUntilMs == 0,
-        "failed startup falls back once to wandering and retires activity metadata");
+    Check(R.selectPending && TaskCount() == tasks, "post-priority resume reselects the current schedule before tasking");
 
     TravelToLeisure(28); Tick();
-    const auto expiry = R.activityUntilMs;
-    Tick(static_cast<unsigned>(expiry - w.now));
-    Check(w.activityCalls == 1 && w.wanderCalls == 0, "activity expiry starts bounded recovery grace");
-    Tick(1500);
-    Check(w.activityCalls == 1 && w.wanderCalls == 1 && R.controller.state == Routine::State::Wandering,
-        "expired activity ends through one ordinary wandering transition");
+    w.scenarioInUse = Joaat("WORLD_HUMAN_SMOKE"); w.taskStatus = 7;
+    Tick(5000); const int beforePhase = TaskCount();
+    w.minute = 60; Tick();
+    Check(R.selectPending && TaskCount() == beforePhase, "a native scenario cannot suppress a new scheduled phase");
+    Tick();
+    Check(R.destination == R.plan.route[3] && w.travelCalls == 2 && R.ambientClearanceUntilMs == 0,
+        "phase change travels to the new destination without carrying old-stop prop clearance grace");
 
-    TravelToLeisure(29); Tick(); w.scenarioEnabled = false;
-    Tick(100); Tick(4100);
-    Check(w.activityCalls == 1 && w.wanderCalls == 1, "a type disabled after entry falls back without re-enabling it");
+    TravelToLeisure(28); Tick();
+    w.scenarioInUse = Joaat("WORLD_HUMAN_SMOKE"); Tick();
+    const int beforeUnload = TaskCount(), beforeReads = w.scenarioReads;
+    w.nav = false; Tick(30000);
+    Check(R.controller.state == Routine::State::Suspended && TaskCount() == beforeUnload && w.scenarioReads == beforeReads,
+        "an active ambient scenario cannot mask unavailable navigation");
 
-    SetDaytimeFixture(); w.scenarioEnabled = true; R.plan.seed = 30;
-    BeginTravel(); w.pedPosition = R.centre; Tick();
-    Check(w.startedScenario == Joaat("WORLD_HUMAN_SMOKE") && !w.enterAnimation,
-        "compatible non-leisure destination supports only a verified smoking break");
-    SetDaytimeFixture(); w.scenarioEnabled = true; R.plan.seed = 28;
-    BeginTravel(); w.pedPosition = R.centre; Tick();
-    Check(w.activityCalls == 0 && w.wanderCalls == 1, "other seeded work visits simply wander without invented work animations");
+    SetDaytimeFixture(); BeginTravel();
+    w.scenarioInUse = Joaat("WORLD_HUMAN_SMOKE"); w.taskStatus = 7;
+    const int failed = R.destination;
+    Tick(100); Tick(4100); Tick(100); Tick(4100); Tick(100); Tick(4100);
+    Check(w.travelCalls == 3 && w.standCalls == 1 && R.controller.IsCoolingDown(failed, w.now) && w.scenarioReads == 0,
+        "a scenario during travel cannot mask dropped nav tasks or their bounded failure cooldown");
 }
 
-static void TestOwnedActivityPropClearance()
+static void TestAmbientPropClearance()
 {
     TravelToLeisure(29); Tick();
     const int destination = R.destination;
     // The engine's own bottle/cigarette is external to the ped collision ignore.
     // Simulate a shape/occupancy hit after entry without changing world availability.
+    w.scenarioInUse = Joaat("WORLD_HUMAN_DRINKING"); w.taskStatus = 7;
     w.occupied = true; w.hit = true;
     const int validatedProbes = w.probes;
     Tick(1100);
-    Check(R.destination == destination && R.destinationValid && R.controller.state == Routine::State::Activity &&
-        w.activityCalls == 1 && w.standCalls == 0 && w.probes == validatedProbes,
-        "owned activity prop cannot invalidate its already-validated destination while the scenario runs");
+    Check(R.destination == destination && R.destinationValid && R.controller.state == Routine::State::Wandering &&
+        w.wanderCalls == 1 && w.standCalls == 0 && w.probes == validatedProbes,
+        "an observed ambient prop cannot invalidate the already-validated destination while its scenario runs");
+    const ULONGLONG clearanceUntil = R.ambientClearanceUntilMs;
     w.scenarioInUse = 0;
-    Tick(100); Tick(4100);
-    Check(R.controller.state == Routine::State::Wandering && R.destinationValid && w.wanderCalls == 1 &&
-        R.activityClearanceGraceUntilMs == static_cast<ULONGLONG>(w.now) + 5000,
-        "activity exit starts a bounded grace period for scenario prop retirement");
+    Tick(100); Tick(4000);
+    Check(R.controller.state == Routine::State::Wandering && R.destinationValid && w.wanderCalls == 2 &&
+        R.ambientClearanceUntilMs == clearanceUntil,
+        "scenario exit preserves a bounded grace period while missing-task recovery resumes wandering");
     const int afterExitProbes = w.probes;
-    Tick(1100); Tick(1100); Tick(1100); Tick(1100);
+    w.taskStatus = 0; Tick(500);
     Check(R.destinationValid && R.destination == destination && w.standCalls == 0 &&
-        w.probes == afterExitProbes && w.wanderCalls == 1,
-        "lingering prop clearance hits do not strand the target within the five-second exit tail");
+        w.probes == afterExitProbes && w.wanderCalls == 2,
+        "lingering prop clearance hits remain ignored during the five-second exit tail");
     Tick(1100);
     Check(!R.destinationValid && R.controller.state == Routine::State::Waiting && R.selectPending && w.standCalls == 1,
         "full occupied-space validation resumes after the bounded prop-exit grace");
     ResetRoutine();
-    Check(R.activityClearanceGraceUntilMs == 0, "contract cleanup resets the prop-clearance grace timer");
+    Check(R.ambientClearanceUntilMs == 0, "contract cleanup resets the observed ambient clearance timer");
+}
+
+static void TestAmbientFallbackRecheck()
+{
+    SetDaytimeFixture();
+    w.occupiedNear = true; w.occupiedAt = RoutineData::kLocations[R.plan.route[0]].anchor;
+    StartRoutineWander(77, R.definition); Tick(); Tick();
+    Check(R.destination == R.plan.route[3], "unavailable workplace selects the actual all-day fallback");
+    w.pedPosition = R.centre; Tick();
+    Check(R.controller.state == Routine::State::Wandering && w.wanderCalls == 1,
+        "fallback arrival begins normal area wandering");
+    w.scenarioInUse = Joaat("WORLD_HUMAN_SMOKE"); w.taskStatus = 7;
+    const int tasks = TaskCount();
+    const ULONGLONG retryDue = R.fallbackRecheckMs;
+    Tick(65000); Tick(5000);
+    Check(TaskCount() == tasks && !R.selectPending && R.controller.state == Routine::State::Wandering &&
+        R.fallbackRecheckMs == retryDue && retryDue < w.now,
+        "expired fallback availability retry stays pending without interrupting a healthy native scenario");
+    w.scenarioInUse = 0;
+    Tick();
+    Check(R.selectPending && TaskCount() == tasks && R.fallbackRecheckMs > w.now,
+        "ending the native scenario permits the pending fallback retry without submitting a stale task");
+    Tick();
+    Check(R.destination == R.plan.route[3] && R.controller.state == Routine::State::Wandering && w.wanderCalls == 2,
+        "an unavailable preferred stop still falls back through one fresh native wander task");
 }
 
 int main()
 {
     TestPreparedDefinition();
+    TestGeneratedTownModels();
     TestPreparationFailureAndFallback();
     TestDeploymentAndWander();
     TestPedOriginAndBoundedPlacement();
     TestTravelAndClock();
     TestSuspensionAndAvailability();
     TestTravelRecovery();
-    TestActivityEntryAndConfirmation();
-    TestActivityAvailabilityAndFallback();
-    TestOwnedActivityPropClearance();
+    TestAmbientWanderingAndRecovery();
+    TestAmbientPriorityAndTravelRecovery();
+    TestAmbientPropClearance();
+    TestAmbientFallbackRecheck();
     std::printf("Routine runtime bridge: %u checks passed.\n", checks);
 }

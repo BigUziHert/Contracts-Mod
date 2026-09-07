@@ -19,10 +19,7 @@ struct RoutineRuntime
     ULONGLONG nextValidationMs = 0;
     ULONGLONG nextStreamRequestMs = 0, fallbackRecheckMs = 0;
     ULONGLONG pauseSnapshotMs = 0;
-    const char* activityName = nullptr;
-    Hash activityHash = 0;
-    ULONGLONG activityUntilMs = 0;
-    ULONGLONG activityClearanceGraceUntilMs = 0;
+    ULONGLONG ambientClearanceUntilMs = 0;
     bool destinationValid = true;
 };
 static RoutineRuntime R;
@@ -61,15 +58,22 @@ static ModelSet RoutineModels(int town, unsigned occupation)
     static constexpr Hash valStock[] = { Joaat("s_m_m_valcowpoke_01"), Joaat("a_m_m_valfarmer_01") };
     static constexpr Hash strLabor[] = { Joaat("a_m_m_strlaborer_01") };
     static constexpr Hash strStock[] = { Joaat("s_m_m_strcowpoke_01"), Joaat("s_m_m_liveryworker_01") };
+    static constexpr Hash sdLabor[] = { Joaat("a_m_m_sdlaborers_02"), Joaat("a_m_m_nbxlaborers_01") };
+    static constexpr Hash vhtDock[] = { Joaat("a_m_m_vhtboatcrew_01") };
+    static constexpr Hash asbLabor[] = { Joaat("a_m_m_asbtownfolk_01_laborer") };
+    if (town < 0 || town >= RoutineData::kTownCount) return { nullptr, 0 };
     const bool stock = occupation == RoutineData::LivestockHand;
-    switch (town)
+    switch (RoutineData::kTowns[town].id)
     {
-    case 0: return stock ? Models(rhdStock) : Models(rhdLabor);
-    case 1: return stock ? Models(blwStock) : Models(blwLabor);
-    case 2: return stock ? Models(valStock) : Models(valLabor);
-    case 3: return stock ? Models(strStock) : Models(strLabor);
-    default: return Models(SD_DOCK);
+    case RoutineData::TownId::Rhodes: return stock ? Models(rhdStock) : Models(rhdLabor);
+    case RoutineData::TownId::Blackwater: return stock ? Models(blwStock) : Models(blwLabor);
+    case RoutineData::TownId::Valentine: return stock ? Models(valStock) : Models(valLabor);
+    case RoutineData::TownId::Strawberry: return stock ? Models(strStock) : Models(strLabor);
+    case RoutineData::TownId::SaintDenis: return occupation == RoutineData::Laborer ? Models(sdLabor) : Models(SD_DOCK);
+    case RoutineData::TownId::VanHorn: return Models(vhtDock);
+    case RoutineData::TownId::Annesburg: return Models(asbLabor);
     }
+    return { nullptr, 0 };
 }
 
 static bool PrepareRoutineContract(RoutineRuntime& prepared)
@@ -78,8 +82,7 @@ static bool PrepareRoutineContract(RoutineRuntime& prepared)
     routineStartDiagnostic.stage = "select_location";
     const unsigned seed = (static_cast<unsigned>(rand()) << 16) ^ static_cast<unsigned>(rand());
     const int town = static_cast<int>(seed % RoutineData::kTownCount);
-    const unsigned occupation = town == 4 ? RoutineData::DockWorker :
-        ((seed >> 8) & 1) ? RoutineData::Laborer : RoutineData::LivestockHand;
+    const unsigned occupation = RoutinePlan::GeneratedOccupation(town, seed);
     if (!RoutinePlan::Build(prepared.plan, town, occupation, seed)) return false;
     Routine::Candidate candidates[4];
     if (!RoutinePlan::Candidates(prepared.plan, candidates)) return false;
@@ -211,6 +214,7 @@ static void SelectRoutineDestination(Ped ped, const Vector3& position, int minut
     }
     R.destination = -1;
     R.destinationValid = false;
+    R.ambientClearanceUntilMs = 0; // Prop grace belongs only to the previous validated stop.
     // At most the authored phase and its all-day fallback. No waits or scene takeover
     // in the per-frame bridge; an unloaded preferred area receives a collision request.
     for (int attempt = 0; attempt < 2; ++attempt)
@@ -242,24 +246,13 @@ static void SelectRoutineDestination(Ped ped, const Vector3& position, int minut
 
 static bool RoutineTaskActive(Ped ped)
 {
-    if (R.controller.state == Routine::State::Activity)
-        return R.activityName && RuntimeNowMs() < R.activityUntilMs &&
-            TASK::IS_SCENARIO_TYPE_ENABLED(R.activityName) && PED::IS_PED_USING_SCENARIO_HASH(ped, R.activityHash);
+    // Area wandering can use world scenarios. That pause is healthy only after
+    // arrival; an unrelated scenario must not hide failed travel indefinitely.
+    if (R.controller.state == Routine::State::Wandering && PED::IS_PED_USING_ANY_SCENARIO(ped)) return true;
     const Hash task = R.controller.state == Routine::State::Travelling
         ? joaat("SCRIPT_TASK_FOLLOW_NAV_MESH_TO_COORD") : joaat("SCRIPT_TASK_WANDER_IN_AREA");
     const int status = TASK::GET_SCRIPT_TASK_STATUS(ped, task, true);
     return status == 0 || status == 1;
-}
-
-static const char* RoutineActivityName()
-{
-    if (R.destination < 0) return nullptr;
-    const auto kind = RoutineData::kLocations[R.destination].kind;
-    if (kind == RoutineData::PlaceKind::Leisure)
-        return (R.plan.seed & 1u) ? "WORLD_HUMAN_DRINKING" : "WORLD_HUMAN_SMOKE";
-    // A short break at other exterior locations; no claim of a working animation,
-    // purchase, haircut, table game or access to a venue's service.
-    return (R.plan.seed & 2u) ? "WORLD_HUMAN_SMOKE" : nullptr;
 }
 
 static void UpdateRoutine(Ped ped, const ContractDef& def, bool mayAct)
@@ -270,7 +263,6 @@ static void UpdateRoutine(Ped ped, const ContractDef& def, bool mayAct)
     observation.nowMs = RuntimeNowMs();
     observation.minute = RoutineMinute();
     observation.scheduleOffset = R.plan.offsetMinutes;
-    const char* proposedActivity = nullptr;
     const Vector3 position = ENTITY::GET_ENTITY_COORDS(ped, true, false);
     const bool loaded = RoutineSpawn::Loaded(position);
     observation.blocked = !mayAct || !PlayerAvailable() || !loaded;
@@ -282,6 +274,8 @@ static void UpdateRoutine(Ped ped, const ContractDef& def, bool mayAct)
     }
     if (!observation.blocked)
     {
+        const bool ambientScenario = R.controller.state == Routine::State::Wandering && PED::IS_PED_USING_ANY_SCENARIO(ped);
+        if (ambientScenario) R.ambientClearanceUntilMs = observation.nowMs + 5000;
         if (R.selectPending) SelectRoutineDestination(ped, position, observation.minute, observation.nowMs);
         observation.reevaluate = R.resumeRequested || R.pauseSnapshotMs != pausedDurationMs;
         R.pauseSnapshotMs = pausedDurationMs;
@@ -291,10 +285,11 @@ static void UpdateRoutine(Ped ped, const ContractDef& def, bool mayAct)
             const auto& location = RoutineData::kLocations[R.destination];
             if (observation.nowMs >= R.nextValidationMs)
             {
-                // The activity already owns its small standing space. Scenario props
-                // must not make the traveller's own bottle fail destination clearance.
-                R.destinationValid = location.enabled && (R.controller.state == Routine::State::Activity ||
-                    observation.nowMs < R.activityClearanceGraceUntilMs
+                // Native ambient scenarios may hold bottles or other props. Preserve
+                // the already-validated stop during that pause and its bounded exit
+                // tail; opening hours and streaming still apply every update.
+                R.destinationValid = location.enabled && (ambientScenario ||
+                    observation.nowMs < R.ambientClearanceUntilMs
                     ? RoutineSpawn::Loaded(R.centre)
                     : RoutineSpawn::ValidatePoint(location.anchor, location.candidateRadius,
                         location.maxHeightDelta, R.centre, ped));
@@ -303,7 +298,9 @@ static void UpdateRoutine(Ped ped, const ContractDef& def, bool mayAct)
             observation.destinationOpen = Routine::CanArriveAndStay({location.openMinute, location.closeMinute},
                 observation.minute, R.controller.state == Routine::State::Travelling ? RoutineTravelMinutes(position, R.centre) : 0, 0);
             const int preferred = R.plan.route[static_cast<int>(Routine::PhaseAt(observation.minute, R.plan.offsetMinutes))];
-            if (R.destination != preferred && R.controller.state != Routine::State::Travelling &&
+            // Optional availability retries can wait for a native ambient pause to
+            // end. Real schedule changes, closed hours and priority still win.
+            if (R.destination != preferred && R.controller.state != Routine::State::Travelling && !ambientScenario &&
                 observation.nowMs >= R.fallbackRecheckMs)
             {
                 observation.reevaluate = true;
@@ -311,29 +308,12 @@ static void UpdateRoutine(Ped ped, const ContractDef& def, bool mayAct)
             }
         }
         observation.taskActive = RoutineTaskActive(ped);
-        if (R.destination >= 0 && (R.controller.state == Routine::State::Travelling || R.controller.state == Routine::State::Waiting) &&
-            Within(position, R.centre, config.arrivalDistance))
-        {
-            proposedActivity = RoutineActivityName();
-            // Query enabled state as in abigail2_1.c:13327, without enabling a type
-            // another script disabled. Confirm free exterior space at the actual ped.
-            observation.canDoActivity = proposedActivity && TASK::IS_SCENARIO_TYPE_ENABLED(proposedActivity) &&
-                INTERIOR::IS_COLLISION_MARKED_OUTSIDE(position) && !INTERIOR::GET_INTERIOR_FROM_COLLISION(position) &&
-                RoutineSpawn::ClearBody(position, ped);
-        }
     }
     observation.destinationId = R.destination;
     observation.destinationAvailable = R.destinationValid;
     observation.distance = std::sqrt(DistSq(position, R.centre));
     const Routine::Decision decision = R.controller.Tick(config, observation);
     if (decision.reevaluate) R.selectPending = true;
-    if (decision.action == Routine::Action::Travel || decision.action == Routine::Action::Wander || decision.action == Routine::Action::Wait)
-    {
-        if (R.activityName) R.activityClearanceGraceUntilMs = observation.nowMs + 5000;
-        R.activityName = nullptr;
-        R.activityHash = 0;
-        R.activityUntilMs = 0;
-    }
     switch (decision.action)
     {
     case Routine::Action::Travel:
@@ -347,21 +327,14 @@ static void UpdateRoutine(Ped ped, const ContractDef& def, bool mayAct)
     case Routine::Action::Wander:
         TASK::SET_PED_PATH_PREFER_TO_AVOID_WATER(ped, true, R.wanderRadius);
         TASK::SET_PED_PATH_MAY_ENTER_WATER(ped, false);
+        // Native area wandering decides its own pauses and ambient opportunities;
+        // never force a smoking or drinking scenario at the arrival coordinate.
+        // beat_public_hanging.c:16270 retains this 0/0/1 tail after navmesh travel.
         TASK::TASK_WANDER_IN_AREA(ped, R.centre, R.wanderRadius, 0.0f, 0.0f, 1);
         PED::SET_PED_KEEP_TASK(ped, true);
         break;
     case Routine::Action::Wait:
         TASK::TASK_STAND_STILL(ped, -1); // act_hunting_2.c:9931; replaced by the next valid routine task
-        break;
-    case Routine::Action::Activity:
-        R.activityName = proposedActivity;
-        R.activityHash = joaat(proposedActivity);
-        R.activityUntilMs = observation.nowMs + 40000 + (R.plan.seed % 36u) * 1000;
-        // ambush_pnk_type1.c:958 (smoke), beat_duel_boaster.c:1965-1966 (drink).
-        // Scenario-managed props; never reserve furniture or borrow another actor.
-        TASK::TASK_START_SCENARIO_IN_PLACE_HASH(ped, R.activityHash, -1,
-            R.activityHash == Joaat("WORLD_HUMAN_DRINKING"), 0, -1.0f, false);
-        PED::SET_PED_KEEP_TASK(ped, true);
         break;
     case Routine::Action::None: break;
     }

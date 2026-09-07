@@ -54,9 +54,6 @@ struct RuntimeFixture
     float wanderRadius = 22.0f;
     Routine::Controller controller;
     bool selectPending = false, resumeRequested = false, destinationValid = true;
-    const char* activityName = nullptr;
-    Hash activityHash = 0;
-    ULONGLONG activityUntilMs = 0;
 } R;
 struct World
 {
@@ -64,7 +61,7 @@ struct World
     int minute = 600;
     bool exists = true, dead = false, loaded = true, inside = false;
     bool hogtied = false, hogtying = false, lassoed = false, ragdoll = false, gettingUp = false;
-    bool combatAnyone = false, combatPlayer = false, vehicle = false, scenarioEnabled = true;
+    bool combatAnyone = false, combatPlayer = false, vehicle = false;
     Hash usingScenario = 0;
     int combatStatus = 7, routineStatus = 0;
     Vector3 player{}, target{3, 4, 0};
@@ -75,7 +72,6 @@ struct World
 static bool ContractActive() { return g_state == CONTRACT_UNKNOWN || g_state == CONTRACT_FOUND || g_state == CONTRACT_DEAD; }
 static bool IsRoutine(const ContractDef& def) { return R.enabled && &def == &R.definition; }
 static bool TargetExists() { return C.target != 0 && w.exists; }
-static ULONGLONG RuntimeNowMs() { return w.now; }
 static ULONGLONG GetTickCount64() { return w.now; }
 static int RoutineMinute() { ++w.clockReads; return w.minute; }
 static void ReadLiving(Ped ped)
@@ -101,6 +97,7 @@ static bool IS_PED_RAGDOLL(Ped ped) { ReadLiving(ped); return w.ragdoll; }
 static bool IS_PED_IN_COMBAT(Ped ped, Ped other) { ReadLiving(ped); return other == 0 ? w.combatAnyone : w.combatPlayer; }
 static bool IS_PED_IN_ANY_VEHICLE(Ped ped, bool) { ReadLiving(ped); return w.vehicle; }
 static bool IS_PED_USING_SCENARIO_HASH(Ped ped, Hash hash) { ReadLiving(ped); return hash != 0 && w.usingScenario == hash; }
+static bool IS_PED_USING_ANY_SCENARIO(Ped ped) { ReadLiving(ped); return w.usingScenario != 0; }
 }
 namespace TASK
 {
@@ -110,7 +107,6 @@ static int GET_SCRIPT_TASK_STATUS(Ped ped, Hash task, bool)
     ReadLiving(ped);
     return task == Joaat("SCRIPT_TASK_COMBAT") ? w.combatStatus : w.routineStatus;
 }
-static bool IS_SCENARIO_TYPE_ENABLED(const char*) { return w.scenarioEnabled; }
 }
 namespace RoutineSpawn { static bool Loaded(Vector3) { ReadLiving(C.target); return w.loaded; } }
 namespace INTERIOR
@@ -160,7 +156,7 @@ static void ExistenceDeathAndFreshCoordinates()
     Fixture(); w.exists = false;
     Check(!ObserveRoutineDebug().targetExists && w.coordinates == 0 && w.deathReads == 0 && w.liveReads == 0,
         "vanished target exits before any entity/death/activity native");
-    Fixture(); w.dead = true; R.controller.state = Routine::State::Activity; R.activityName = "WORLD_HUMAN_SMOKE";
+    Fixture(); w.dead = true; R.controller.state = Routine::State::Wandering; w.usingScenario = Joaat("WORLD_HUMAN_SMOKE");
     const auto corpse = ObserveRoutineDebug();
     Check(corpse.targetDead && corpse.targetExists && w.coordinates == 2 && w.deathReads == 1 && w.liveReads == 0,
         "dead target can report fresh position but never stale routine activity");
@@ -181,7 +177,7 @@ static void PriorityAndScenarioLabels()
     for (const auto& priority : std::array<Priority, 5>{{{&World::hogtied,"Hogtied"}, {&World::hogtying,"Being hogtied"},
         {&World::lassoed,"Lassoed"}, {&World::ragdoll,"Ragdoll"}, {&World::gettingUp,"Getting up"}}})
     {
-        Fixture(); R.controller.state = Routine::State::Activity; R.activityName = "WORLD_HUMAN_SMOKE";
+        Fixture(); R.controller.state = Routine::State::Wandering; w.usingScenario = Joaat("WORLD_HUMAN_SMOKE");
         C.ai.state = TargetAI::State::Engaged; w.*(priority.field) = true;
         Check(Activity() == priority.label, "physical restraint/recovery wins over stale routine and engagement state");
     }
@@ -194,16 +190,25 @@ static void PriorityAndScenarioLabels()
     w.combatPlayer = true; Check(Activity() == "Walking to destination", "lingering player combat flag alone does not invent active combat");
     Fixture(); w.vehicle = true; Check(Activity() == "In a vehicle", "vehicle blocks routine activity label");
     Fixture(); w.loaded = false; Check(Activity() == "Paused: area not loaded", "unloaded area is identified");
-    Fixture(); R.controller.state = Routine::State::Suspended; R.activityName = "WORLD_HUMAN_SMOKE";
-    Check(Activity() == "Routine paused", "suspension cannot show retained smoking metadata as active");
+    Fixture(); R.controller.state = Routine::State::Suspended; w.usingScenario = Joaat("WORLD_HUMAN_SMOKE");
+    Check(Activity() == "Routine paused", "suspension takes priority over an observed scenario");
     Fixture(); R.selectPending = true; Check(Activity() == "Choosing destination", "pending selection never advertises stale travel");
-    Fixture(); R.controller.state = Routine::State::Activity; R.activityName = "WORLD_HUMAN_SMOKE";
-    R.activityHash = Joaat(R.activityName); R.activityUntilMs = w.now + 40000;
-    Check(Activity() == "Activity starting / recovery", "unconfirmed scenario is not labelled smoking");
-    w.usingScenario = R.activityHash; Check(Activity() == "Smoking", "matching actual scenario confirms smoking");
-    R.activityName = "WORLD_HUMAN_DRINKING"; R.activityHash = Joaat(R.activityName); w.usingScenario = R.activityHash;
-    Check(Activity() == "Drinking", "matching actual scenario confirms drinking");
-    w.now = R.activityUntilMs; Check(Activity() == "Finishing activity", "expired but still active scenario reports exit phase");
+    Fixture(); R.controller.state = Routine::State::Wandering; w.routineStatus = 7;
+    Check(Activity() == "Wander task pending / recovery", "without actual scenario evidence debug never invents smoking");
+    w.usingScenario = Joaat("WORLD_HUMAN_SMOKE");
+    Check(Activity() == "Smoking (ambient)" && ObserveRoutineDebug().taskActive,
+        "actual native smoking is identified as a healthy ambient pause during wandering");
+    w.usingScenario = Joaat("WORLD_HUMAN_DRINKING");
+    Check(Activity() == "Drinking (ambient)", "actual native drinking is identified without assigned activity metadata");
+    w.now += 100000;
+    Check(Activity() == "Drinking (ambient)", "debug does not invent expiry for a native ambient scenario");
+    w.usingScenario = Joaat("WORLD_HUMAN_STARE_STOIC");
+    Check(Activity() == "Ambient scenario", "other actual scenarios use a truthful generic label");
+    R.controller.state = Routine::State::Travelling;
+    Check(Activity() == "Ambient scenario" && !ObserveRoutineDebug().taskActive,
+        "observed scenario during travel does not claim its missing nav task is healthy");
+    w.usingScenario = 0; R.controller.state = Routine::State::Wandering;
+    Check(Activity() == "Wander task pending / recovery", "ending native scenario immediately clears its debug label");
     Fixture(); w.routineStatus = 7; Check(Activity() == "Travel task pending / recovery", "missing travel task is not reported as healthy movement");
     R.controller.state = Routine::State::Wandering;
     Check(Activity() == "Wander task pending / recovery", "missing wander task is visible");

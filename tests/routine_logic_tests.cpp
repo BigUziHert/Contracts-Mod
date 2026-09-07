@@ -81,7 +81,7 @@ static void CandidateSelection()
     Check(SelectDestination(nullptr, 4, Phase::Work, 1, 600, 15, 0) == -1, "null catalog is bounded failure");
     Check(SelectDestination(candidates, 0, Phase::Work, 1, 600, 15, 0) == -1, "empty catalog is bounded failure");
 }
-static void TravelArrivalAndActivities()
+static void TravelArrivalAndWandering()
 {
     const Config config;
     Controller controller;
@@ -96,22 +96,33 @@ static void TravelArrivalAndActivities()
     }
     observation.nowMs = 12000;
     observation.distance = 4.0f;
-    observation.canDoActivity = true;
-    Check(controller.Tick(config, observation).action == Action::Activity, "arrival chooses verified activity");
-    Check(controller.state == State::Activity && controller.destinationId == 7, "activity retains fixed destination identity");
+    Check(controller.Tick(config, observation).action == Action::Wander, "arrival always delegates behavior to native area wandering");
+    Check(controller.state == State::Wandering && controller.destinationId == 7, "wandering retains fixed destination identity");
     observation.nowMs = 16000;
-    Check(controller.Tick(config, observation).action == Action::None, "healthy activity stays uninterrupted");
+    Check(controller.Tick(config, observation).action == Action::None, "healthy wandering or its observed ambient pause stays uninterrupted");
     observation.taskActive = false;
     observation.nowMs = 17000;
-    Check(controller.Tick(config, observation).action == Action::None, "activity completion gets task absence grace");
+    Check(controller.Tick(config, observation).action == Action::None, "dropped wandering gets task absence grace");
     observation.nowMs = 18500;
-    Check(controller.Tick(config, observation).action == Action::Wander, "ended activity falls back to local wandering");
+    Check(controller.Tick(config, observation).action == Action::Wander, "dropped native wandering gets bounded local recovery");
     observation.taskActive = true;
     observation.nowMs = 19000;
     Check(controller.Tick(config, observation).action == Action::None, "wander recovery does not restart a healthy task");
     controller.Reset();
     observation = Observe(0, 2.0f);
-    Check(controller.Tick(config, observation).action == Action::Wander, "arrival without supported activity chooses wandering");
+    Check(controller.Tick(config, observation).action == Action::Wander, "nearby initial destination also chooses wandering");
+
+    observation.taskActive = true; // The bridge also supplies this for an observed native scenario.
+    observation.destinationOpen = false;
+    Check(controller.Tick(config, observation).action == Action::Wait && controller.state == State::Waiting,
+        "closing hours override a healthy ambient pause after arrival");
+    controller.Reset();
+    observation = Observe(0, 2.0f);
+    controller.Tick(config, observation);
+    observation.taskActive = true;
+    observation.destinationAvailable = false;
+    Check(controller.Tick(config, observation).action == Action::Wait,
+        "an unavailable destination overrides a healthy ambient pause after arrival");
 }
 static void BoundedFailureAndCooldown()
 {
@@ -217,7 +228,7 @@ int main()
 {
     OpeningWindowsAndArrival();
     CandidateSelection();
-    TravelArrivalAndActivities();
+    TravelArrivalAndWandering();
     BoundedFailureAndCooldown();
     PriorityResumeClockAndClosure();
     std::printf("routine_logic: %u checks passed\n", checks);

@@ -15,8 +15,9 @@ specific native or establish that the debug overlay caused the crash.
 - The failure-only startup log had no new entry after the old 21:07 placement failures.
   A hard failure before a handled return cannot be located from that log.
 - No matching Windows application crash entry was found in the queried interval.
-  Later ScriptHook output showed a fresh game session at 21:47, but the result of its
-  next contract attempt was not established during this investigation.
+  Later ScriptHook output showed a fresh game session at 21:47. In subsequent feedback,
+  the owner confirmed that pressing U worked after fully relaunching the game. This
+  establishes a successful restart test, not the cause of the earlier crash.
 
 `main.cpp` unregisters the script and keyboard callback on DLL detach. It does not
 explicitly retire contract/card/prompt/debug resources or preserve the session's bound

@@ -6,7 +6,7 @@ restart. Replace the previous ASI while the game is closed, then restart story m
 
 ## Red map markers
 
-All 27 enabled entries in `routine_locations.h` receive named red dots on the map and
+All enabled entries in `routine_locations.h` receive named red dots on the map and
 radar, including sites outside the active contract's town. These mark authored candidate
 areas, not a claim that every anchor is safe in every world state. The initial spawn
 and each arrival still pass the existing ground, exterior and clearance checks.
@@ -34,7 +34,7 @@ update, without changing card render-target selection or portrait code.
 | --- | --- |
 | Clock / town / occupation | Current game time and the current contract's selected identity. |
 | Target distance | Straight-line player-to-target distance from fresh entity coordinates, in metres. |
-| Doing | Combat, search, restraint, vehicle and unloaded-area priorities override the routine controller. Smoking/drinking requires a confirmed matching scenario. Missing tasks show pending/recovery rather than claiming movement. |
+| Doing | Combat, search, restraint, vehicle and unloaded-area priorities override the routine controller. Smoking/drinking requires a confirmed matching scenario and is labelled ambient; other observed scenarios say Ambient scenario. The mod does not start them. Missing tasks show pending/recovery rather than claiming movement. |
 | Stop and distance | Assigned destination and straight-line target-to-stop distance. A fallback label identifies the all-day public destination used outside its normal phase. |
 | Next planned | The following schedule phase's authored destination and transition time, including this contract's clock offset. Availability can change the actual next stop. |
 | Wander / indoors | Configured wander radius and current interior classification. This does not prevent a target from walking indoors. |
