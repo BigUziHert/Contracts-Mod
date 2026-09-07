@@ -43,7 +43,7 @@ inline bool ClearBody(const Vector3& point, Ped ignore)
 }
 
 inline bool ValidateSurface(const Vector3& anchor, float radius, float heightTolerance,
-    Vector3 safe, Vector3& out, Ped ignore, float groundTolerance)
+    Vector3 safe, Vector3& out, Ped ignore, float groundTolerance, bool checkClearance = true)
 {
     diagnostic.projected = safe;
     const float dx = safe.x - anchor.x, dy = safe.y - anchor.y;
@@ -63,7 +63,7 @@ inline bool ValidateSurface(const Vector3& anchor, float radius, float heightTol
     if (!INTERIOR::IS_COLLISION_MARKED_OUTSIDE(safe) || INTERIOR::GET_INTERIOR_FROM_COLLISION(safe)) return Reject("interior");
     float water = 0;
     if (WATER::GET_WATER_HEIGHT(Vector3(safe.x, safe.y, safe.z + 2.0f), &water) && water >= safe.z - .2f) return Reject("water");
-    if (!ClearBody(safe, ignore)) return false;
+    if (checkClearance && !ClearBody(safe, ignore)) return false;
     out = safe;
     diagnostic.check = "ok";
     return true;
@@ -82,14 +82,14 @@ inline bool Validate(const Vector3& anchor, float radius, float heightTolerance,
 }
 
 inline bool ValidatePoint(const Vector3& anchor, float radius, float heightTolerance,
-    const Vector3& point, Ped ignore = 0)
+    const Vector3& point, Ped ignore = 0, bool checkClearance = true)
 {
     diagnostic = {};
     diagnostic.candidate = point;
     Vector3 checked;
     // A previously accepted ground point is checked directly. Do not choose a new
     // nav coordinate and reject this one merely because that answer moved sideways.
-    return ValidateSurface(anchor, radius, heightTolerance, point, checked, ignore, .35f);
+    return ValidateSurface(anchor, radius, heightTolerance, point, checked, ignore, .35f, checkClearance);
 }
 
 inline bool Find(const Vector3& anchor, float radius, float heightTolerance, unsigned seed, Vector3& out, Ped ignore = 0)

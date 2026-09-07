@@ -80,7 +80,7 @@ struct World
     unsigned loadedAfter = 0, targetDiesAfter = 999999, settleAfterWaits = 999999, ownershipLostAfter = 999999;
     int minute = 720, clockRate = 2000, taskStatus = 0;
     bool canInteract = true, collision = true, nav = true, safe = true;
-    bool outside = true, groundOk = true, occupied = false, hit = false;
+    bool outside = true, groundOk = true, occupied = false, hit = false, waterPresent = false;
     bool sceneActive = false, startOk = true;
     int interior = 0, probeStatus = 2, starts = 0, stops = 0, safeCalls = 0;
     int requests = 0, failFirstSafeCalls = 0, probes = 0;
@@ -95,7 +95,8 @@ struct World
     float wanderRadius = 0, avoidRadius = 0;
     int wanderCalls = 0, keepCalls = 0, avoidCalls = 0, waterCalls = 0;
     int travelCalls = 0, standCalls = 0, statusCalls = 0;
-    int activityCalls = 0, scenarioReads = 0;
+    int activityCalls = 0, scenarioReads = 0, scenarioExits = 0, occupancyReads = 0;
+    bool scenarioExitPending = false;
     int travelTimeout = 0;
     Hash lastTaskHash = 0;
     Hash scenarioInUse = 0;
@@ -156,6 +157,7 @@ static bool GET_GROUND_Z_AND_NORMAL_FOR_3D_COORD(Vector3 query, float* ground, V
 }
 static bool IS_POSITION_OCCUPIED(Vector3 point, float, bool, bool, bool, bool, bool, Ped ignore, bool)
 {
+    ++w.occupancyReads;
     w.lastIgnored = ignore; return w.occupied || (w.occupiedNear && Within(point, w.occupiedAt, 20.0f));
 }
 }
@@ -164,7 +166,7 @@ namespace INTERIOR
 static bool IS_COLLISION_MARKED_OUTSIDE(Vector3) { return w.outside; }
 static int GET_INTERIOR_FROM_COLLISION(Vector3) { return w.interior; }
 }
-namespace WATER { static bool GET_WATER_HEIGHT(Vector3, float*) { return false; } }
+namespace WATER { static bool GET_WATER_HEIGHT(Vector3 point, float* height) { *height = point.z; return w.waterPresent; } }
 namespace SHAPETEST
 {
 static int START_EXPENSIVE_SYNCHRONOUS_SHAPE_TEST_LOS_PROBE(Vector3, Vector3, int, Entity ignore, int)
@@ -199,10 +201,20 @@ static void TASK_FOLLOW_NAV_MESH_TO_COORD(Ped, Vector3 centre, float speed, int 
 {
     Check(speed == 1.0f && range == 2.0f && flags == 0 && heading == 40000.0f,
         "travel uses verified walking flags with bounded target range");
+    if (w.scenarioExitPending)
+    {
+        Check(w.scenarioExits > 0, "routine requests scenario exit before scheduled travel");
+        w.scenarioExitPending = false;
+    }
     ++w.travelCalls; w.travelCentre = centre; w.travelTimeout = timeout;
 }
 static void TASK_STAND_STILL(Ped, int duration)
 {
+    if (w.scenarioExitPending)
+    {
+        Check(w.scenarioExits > 0, "routine requests scenario exit before waiting");
+        w.scenarioExitPending = false;
+    }
     Check(duration == -1, "waiting persists until a later explicit routine decision"); ++w.standCalls;
 }
 [[maybe_unused]] static void TASK_START_SCENARIO_IN_PLACE_HASH(Ped, Hash, int, bool, Hash, float, bool)
@@ -213,6 +225,11 @@ static void TASK_STAND_STILL(Ped, int duration)
 }
 namespace PED
 {
+static void SET_PED_SHOULD_PLAY_NORMAL_SCENARIO_EXIT(Ped ped)
+{
+    Check(ped == 77 && w.scenarioInUse != 0, "normal scenario exit applies only to the observed ambient target");
+    ++w.scenarioExits;
+}
 static void SET_PED_KEEP_TASK(Ped, bool keep) { Check(keep, "routine task is kept"); ++w.keepCalls; }
 static bool IS_PED_USING_ANY_SCENARIO(Ped ped)
 {
@@ -525,10 +542,21 @@ static void TestTravelAndClock()
     Check(R.selectPending && TaskCount() == beforePause,
         "pause or fade wholly skipped by the outer loop forces fresh selection before another task");
     Tick();
-    Check(R.destination == R.plan.route[0] && w.travelCalls == 2 && R.pauseSnapshotMs == pausedDurationMs,
-        "resumption publishes the new pause snapshot and restarts current valid travel once");
+    Check(R.destination == R.plan.route[0] && w.travelCalls == 1 && R.pauseSnapshotMs == pausedDurationMs,
+        "resumption publishes the new pause snapshot and preserves healthy current travel");
     Tick();
-    Check(w.travelCalls == 2 && !R.selectPending, "unchanged pause duration does not retrigger resumption");
+    Check(w.travelCalls == 1 && !R.selectPending, "unchanged pause duration does not retrigger resumption");
+
+    w.pedPosition = R.centre; Tick();
+    const Vector3 held = R.centre;
+    const float radius = R.wanderRadius;
+    const int safeCalls = w.safeCalls, beforeAmbientPause = TaskCount();
+    w.scenarioInUse = Joaat("WORLD_HUMAN_SMOKE"); w.taskStatus = 7;
+    w.occupied = true; w.hit = true; pausedDurationMs += 45000;
+    Tick(); Tick();
+    Check(TaskCount() == beforeAmbientPause && R.controller.state == Routine::State::Wandering &&
+        Within(R.centre, held, .001f) && R.wanderRadius == radius && w.safeCalls == safeCalls && w.scenarioExits == 0,
+        "pause while in a scenario preserves the exact destination and healthy ambient task without candidate projection");
 }
 static void TestSuspensionAndAvailability()
 {
@@ -594,6 +622,31 @@ static void TestTravelRecovery()
     UpdateRoutine(77, R.definition, true);
     Check(TaskCount() == count, "disabled runtime never revives a cleaned-up target");
 }
+static void TestTravelEstimateAndLongDeadline()
+{
+    SetDaytimeFixture();
+    Check(RoutineTravelMinutes({}, {40, 0, 0}) == 24,
+        "short-route ETA uses the issued walking speed and shared detour allowance without the old extra delay");
+    Check(RoutineTravelMinutes({}, {}) == 0, "a zero-distance visit needs no travel allowance");
+    w.minute = 60;
+    w.pedPosition = RoutineData::kLocations[R.plan.route[3]].anchor;
+    w.pedPosition.x += 500;
+    BeginTravel();
+    const auto estimate = Routine::TravelEstimateMs(std::sqrt(static_cast<double>(DistSq(w.pedPosition, R.centre))));
+    Check(w.travelTimeout == static_cast<int>(estimate) && w.travelTimeout > 300000 &&
+        R.controller.TripTimeoutMs() == estimate,
+        "a long same-town route shares its walking estimate with both native and controller deadlines");
+    const int eta = RoutineTravelMinutes(w.pedPosition, R.centre);
+    Check(eta == static_cast<int>(std::ceil(static_cast<double>(estimate) / w.clockRate)),
+        "long-route ETA and deadline are derived from the same distance and speed");
+    w.pedPosition = R.centre; w.pedPosition.x += 200;
+    Tick(300000);
+    Check(R.controller.state == Routine::State::Travelling && w.travelCalls == 1 && w.standCalls == 0,
+        "progressing long travel survives 300 seconds without failure or restarting its task");
+    w.pedPosition = R.centre; Tick();
+    Check(R.controller.state == Routine::State::Wandering && w.wanderCalls == 1,
+        "the admitted long route can arrive within its extended deadline");
+}
 
 static void TravelToLeisure(unsigned seed)
 {
@@ -629,8 +682,16 @@ static void TestAmbientWanderingAndRecovery()
         w.taskStatus = 1;
         Tick(10000);
         Check(w.wanderCalls == 2, "a recovered native wander task is left running");
+        for (int recovery = 0; recovery < 3; ++recovery)
+        {
+            w.taskStatus = 7; w.scenarioInUse = Joaat("WORLD_HUMAN_SMOKE"); Tick(5000);
+            w.scenarioInUse = 0; Tick(); Tick(1500);
+            Check(w.wanderCalls == 3 + recovery && w.standCalls == 0 && !R.controller.IsCoolingDown(R.destination, w.now),
+                "independent ambient pauses regain wandering without exhausting a lifetime retry budget");
+            w.taskStatus = 1; Tick();
+        }
         ResetRoutine();
-        Check(R.ambientClearanceUntilMs == 0 && !R.enabled && w.activityCalls == 0,
+        Check(!R.enabled && w.activityCalls == 0,
             "cleanup retires ambient observation data without touching scenario props");
     }
     SetDaytimeFixture(); R.plan.seed = 30;
@@ -661,9 +722,17 @@ static void TestAmbientPriorityAndTravelRecovery()
     Tick(5000); const int beforePhase = TaskCount();
     w.minute = 60; Tick();
     Check(R.selectPending && TaskCount() == beforePhase, "a native scenario cannot suppress a new scheduled phase");
+    w.scenarioExitPending = true; Tick();
+    Check(R.destination == R.plan.route[3] && w.travelCalls == 2 && w.scenarioExits == 1 && !w.scenarioExitPending,
+        "phase change requests a normal scenario exit before travelling to the new destination");
     Tick();
-    Check(R.destination == R.plan.route[3] && w.travelCalls == 2 && R.ambientClearanceUntilMs == 0,
-        "phase change travels to the new destination without carrying old-stop prop clearance grace");
+    Check(w.scenarioExits == 1, "scenario exit remains transition-only during travel");
+
+    TravelToLeisure(28); Tick();
+    w.scenarioInUse = Joaat("WORLD_HUMAN_SMOKE"); w.outside = false;
+    w.scenarioExitPending = true; Tick(1100);
+    Check(R.controller.state == Routine::State::Waiting && w.standCalls == 1 && w.scenarioExits == 1 && !w.scenarioExitPending,
+        "a held stop becoming invalid requests a normal scenario exit before waiting");
 
     TravelToLeisure(28); Tick();
     w.scenarioInUse = Joaat("WORLD_HUMAN_SMOKE"); Tick();
@@ -693,22 +762,40 @@ static void TestAmbientPropClearance()
     Check(R.destination == destination && R.destinationValid && R.controller.state == Routine::State::Wandering &&
         w.wanderCalls == 1 && w.standCalls == 0 && w.probes == validatedProbes,
         "an observed ambient prop cannot invalidate the already-validated destination while its scenario runs");
-    const ULONGLONG clearanceUntil = R.ambientClearanceUntilMs;
     w.scenarioInUse = 0;
     Tick(100); Tick(4000);
-    Check(R.controller.state == Routine::State::Wandering && R.destinationValid && w.wanderCalls == 2 &&
-        R.ambientClearanceUntilMs == clearanceUntil,
-        "scenario exit preserves a bounded grace period while missing-task recovery resumes wandering");
+    Check(R.controller.state == Routine::State::Wandering && R.destinationValid && w.wanderCalls == 2,
+        "scenario exit leaves the held destination valid while missing-task recovery resumes wandering");
     const int afterExitProbes = w.probes;
     w.taskStatus = 0; Tick(500);
     Check(R.destinationValid && R.destination == destination && w.standCalls == 0 &&
         w.probes == afterExitProbes && w.wanderCalls == 2,
-        "lingering prop clearance hits remain ignored during the five-second exit tail");
+        "lingering props cannot invalidate a destination after area wandering resumes");
     Tick(1100);
-    Check(!R.destinationValid && R.controller.state == Routine::State::Waiting && R.selectPending && w.standCalls == 1,
-        "full occupied-space validation resumes after the bounded prop-exit grace");
-    ResetRoutine();
-    Check(R.ambientClearanceUntilMs == 0, "contract cleanup resets the observed ambient clearance timer");
+    Check(R.destinationValid && R.controller.state == Routine::State::Wandering && !R.selectPending && w.standCalls == 0 &&
+        w.probes == afterExitProbes,
+        "occupied-space validation stays disabled at an arrived stop after the former five-second tail");
+
+    for (const int invalid : {0, 1, 2})
+    {
+        TravelToLeisure(29); Tick();
+        w.outside = invalid != 0;
+        w.interior = invalid == 1 ? 1 : 0;
+        w.waterPresent = invalid == 2;
+        Tick(1100);
+        Check(!R.destinationValid && R.controller.state == Routine::State::Waiting && w.standCalls == 1,
+            "held destinations still reject exterior, interior and water changes after arrival");
+    }
+
+    TravelToLeisure(29); Tick();
+    w.occupied = true; w.hit = true;
+    const int arrivedOccupancy = w.occupancyReads, arrivedProbes = w.probes;
+    Tick(6000);
+    Check(R.destinationValid && w.standCalls == 0 && w.occupancyReads == arrivedOccupancy && w.probes == arrivedProbes,
+        "a bystander at the centre never cancels healthy wandering even without a preceding scenario");
+    w.nav = false; Tick();
+    Check(R.controller.state == Routine::State::Suspended && w.standCalls == 0,
+        "unloaded navigation still suspends an occupied held destination without a task");
 }
 
 static void TestAmbientFallbackRecheck()
@@ -727,13 +814,15 @@ static void TestAmbientFallbackRecheck()
     Check(TaskCount() == tasks && !R.selectPending && R.controller.state == Routine::State::Wandering &&
         R.fallbackRecheckMs == retryDue && retryDue < w.now,
         "expired fallback availability retry stays pending without interrupting a healthy native scenario");
-    w.scenarioInUse = 0;
+    const Vector3 held = R.centre;
+    w.scenarioInUse = 0; w.taskStatus = 1;
     Tick();
     Check(R.selectPending && TaskCount() == tasks && R.fallbackRecheckMs > w.now,
         "ending the native scenario permits the pending fallback retry without submitting a stale task");
     Tick();
-    Check(R.destination == R.plan.route[3] && R.controller.state == Routine::State::Wandering && w.wanderCalls == 2,
-        "an unavailable preferred stop still falls back through one fresh native wander task");
+    Check(R.destination == R.plan.route[3] && R.controller.state == Routine::State::Wandering && w.wanderCalls == 1 &&
+        Within(R.centre, held, .001f),
+        "an unavailable preferred stop preserves the same fallback centre and healthy native wander task");
 }
 
 int main()
@@ -746,6 +835,7 @@ int main()
     TestTravelAndClock();
     TestSuspensionAndAvailability();
     TestTravelRecovery();
+    TestTravelEstimateAndLongDeadline();
     TestAmbientWanderingAndRecovery();
     TestAmbientPriorityAndTravelRecovery();
     TestAmbientPropClearance();

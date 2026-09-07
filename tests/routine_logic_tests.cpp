@@ -108,6 +108,19 @@ static void TravelArrivalAndWandering()
     observation.taskActive = true;
     observation.nowMs = 19000;
     Check(controller.Tick(config, observation).action == Action::None, "wander recovery does not restart a healthy task");
+    for (unsigned recovery = 0; recovery < 4; ++recovery)
+    {
+        observation.taskActive = false;
+        observation.nowMs += 5000;
+        Check(controller.Tick(config, observation).action == Action::None, "each independent dropped wander receives absence grace");
+        observation.nowMs += config.taskGraceMs;
+        Check(controller.Tick(config, observation).action == Action::Wander,
+            "healthy intervening wandering resets the retry budget for later ambient exits");
+        observation.taskActive = true;
+        ++observation.nowMs;
+        Check(controller.Tick(config, observation).action == Action::None && !controller.IsCoolingDown(7, observation.nowMs),
+            "independent wander recoveries never cool down a healthy stop");
+    }
     controller.Reset();
     observation = Observe(0, 2.0f);
     Check(controller.Tick(config, observation).action == Action::Wander, "nearby initial destination also chooses wandering");
@@ -163,6 +176,19 @@ static void BoundedFailureAndCooldown()
     observation.nowMs = 60000;
     Check(controller.Tick(config, observation).failedDestination == 7, "permanently stuck native task fails destination");
     controller.Reset();
+    observation = Observe(0);
+    observation.taskActive = true;
+    controller.Tick(config, observation);
+    observation.nowMs = 20000;
+    observation.distance = 140.0f;
+    Check(controller.Tick(config, observation).action == Action::Travel, "detour stall receives a bounded retry");
+    observation.nowMs = 39999;
+    observation.distance = 130.0f;
+    Check(controller.Tick(config, observation).action == Action::None, "new detour progress is measured from the retry position");
+    observation.nowMs = 40000;
+    Check(controller.Tick(config, observation).action == Action::None,
+        "progress on a detour does not retry again because of an obsolete best distance");
+    controller.Reset();
     config.noProgressMs = 600000;
     observation = Observe(0);
     observation.taskActive = true;
@@ -170,6 +196,77 @@ static void BoundedFailureAndCooldown()
     observation.nowMs = config.travelTimeoutMs;
     observation.distance = 5.0f;
     Check(controller.Tick(config, observation).failedDestination == 7, "absolute deadline bounds slow or looping travel");
+
+    controller.Reset();
+    observation = Observe(0, 500.0f);
+    observation.taskActive = true;
+    controller.Tick(config, observation);
+    const auto deadline = controller.TripTimeoutMs();
+    Check(deadline == TravelEstimateMs(500.0) && deadline > config.travelTimeoutMs,
+        "a long route receives the walking estimate as its deadline above the 300-second floor");
+    observation.nowMs = config.travelTimeoutMs;
+    observation.distance = 250.0f;
+    Check(controller.Tick(config, observation).action == Action::None, "healthy long travel survives the old absolute deadline");
+    observation.nowMs = deadline;
+    observation.distance = 5.0f;
+    Check(controller.Tick(config, observation).failedDestination == 7,
+        "the derived long-route deadline remains absolute and bounded");
+
+    controller.Reset();
+    observation = Observe(0, 2.0f);
+    controller.Tick(config, observation);
+    for (unsigned retry = 1; retry <= config.maxRetries; ++retry)
+    {
+        observation.nowMs = retry * config.retryMs - config.taskGraceMs;
+        Check(controller.Tick(config, observation).action == Action::None, "unhealthy wander retry restarts absence grace");
+        observation.nowMs += config.taskGraceMs;
+        Check(controller.Tick(config, observation).action == Action::Wander, "continuously missing wander keeps a bounded retry budget");
+    }
+    observation.nowMs += config.retryMs - config.taskGraceMs;
+    controller.Tick(config, observation);
+    observation.nowMs += config.taskGraceMs;
+    Check(controller.Tick(config, observation).failedDestination == 7,
+        "wander recovery still fails when no healthy task is observed between retries");
+}
+static void UnchangedDestinationReevaluation()
+{
+    const Config config;
+    for (const float distance : {2.0f, 100.0f})
+    {
+        Controller controller;
+        auto observation = Observe(0, distance);
+        controller.Tick(config, observation);
+        const State previous = controller.state;
+        observation.taskActive = true;
+        observation.nowMs = 100;
+        observation.reevaluate = true;
+        Check(controller.Tick(config, observation).reevaluate && controller.state == previous,
+            "reevaluation keeps the live task state observable until selection returns");
+        observation.reevaluate = false;
+        ++observation.nowMs;
+        Check(controller.Tick(config, observation).action == Action::None && controller.state == previous,
+            "same healthy destination preserves travelling or wandering without another task");
+        observation.reevaluate = true;
+        controller.Tick(config, observation);
+        observation.reevaluate = false;
+        observation.destinationId = 8;
+        observation.distance = 100.0f;
+        Check(controller.Tick(config, observation).action == Action::Travel,
+            "selection of a different destination still issues new travel");
+    }
+    Controller controller;
+    auto observation = Observe(0);
+    observation.taskActive = true;
+    controller.Tick(config, observation);
+    observation.nowMs = config.travelTimeoutMs - 2;
+    observation.distance = 5.0f;
+    observation.reevaluate = true;
+    controller.Tick(config, observation);
+    observation.reevaluate = false;
+    ++observation.nowMs;
+    Check(controller.Tick(config, observation).action == Action::None, "same-destination recheck retains the original trip");
+    ++observation.nowMs;
+    Check(controller.Tick(config, observation).failedDestination == 7, "reevaluation cannot extend the original travel deadline");
 }
 static void PriorityResumeClockAndClosure()
 {
@@ -230,6 +327,7 @@ int main()
     CandidateSelection();
     TravelArrivalAndWandering();
     BoundedFailureAndCooldown();
+    UnchangedDestinationReevaluation();
     PriorityResumeClockAndClosure();
     std::printf("routine_logic: %u checks passed\n", checks);
 }

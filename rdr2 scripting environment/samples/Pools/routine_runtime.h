@@ -19,7 +19,6 @@ struct RoutineRuntime
     ULONGLONG nextValidationMs = 0;
     ULONGLONG nextStreamRequestMs = 0, fallbackRecheckMs = 0;
     ULONGLONG pauseSnapshotMs = 0;
-    ULONGLONG ambientClearanceUntilMs = 0;
     bool destinationValid = true;
 };
 static RoutineRuntime R;
@@ -197,7 +196,7 @@ static int RoutineTravelMinutes(const Vector3& from, const Vector3& to)
     const int rate = CLOCK::GET_MILLISECONDS_PER_GAME_MINUTE();
     if (rate <= 0) return Routine::kMinutesPerDay; // only all-day fallbacks remain eligible
     const double distance = std::sqrt(static_cast<double>(DistSq(from, to)));
-    const double estimate = std::ceil(distance * 1500.0 / rate) + 5.0; // walking + detour allowance
+    const double estimate = std::ceil(static_cast<double>(Routine::TravelEstimateMs(distance)) / rate);
     return static_cast<int>(estimate > Routine::kMinutesPerDay ? Routine::kMinutesPerDay : estimate);
 }
 
@@ -212,9 +211,9 @@ static void SelectRoutineDestination(Ped ped, const Vector3& position, int minut
         candidate.available = candidate.available && !R.controller.IsCoolingDown(candidate.id, now);
         candidate.travelMinutes = RoutineTravelMinutes(position, location.anchor);
     }
+    const int previousDestination = R.destination;
     R.destination = -1;
     R.destinationValid = false;
-    R.ambientClearanceUntilMs = 0; // Prop grace belongs only to the previous validated stop.
     // At most the authored phase and its all-day fallback. No waits or scene takeover
     // in the per-frame bridge; an unloaded preferred area receives a collision request.
     for (int attempt = 0; attempt < 2; ++attempt)
@@ -228,8 +227,16 @@ static void SelectRoutineDestination(Ped ped, const Vector3& position, int minut
             STREAMING::REQUEST_COLLISION_AT_COORD(location.anchor);
             PATH::ADD_NAVMESH_REQUIRED_REGION(location.anchor.x, location.anchor.y, 50.0f);
         }
+        if (id == previousDestination && RoutineSpawn::ValidatePoint(location.anchor, location.candidateRadius,
+            location.maxHeightDelta, R.centre, ped, R.controller.state != Routine::State::Wandering))
+        {
+            R.destination = id;
+            R.destinationValid = true;
+            break; // Keep the exact centre/radius and the healthy task using them.
+        }
         Vector3 point;
-        if (RoutineSpawn::Find(location.anchor, location.candidateRadius, location.maxHeightDelta, R.plan.seed, point, ped))
+        if (id != previousDestination &&
+            RoutineSpawn::Find(location.anchor, location.candidateRadius, location.maxHeightDelta, R.plan.seed, point, ped))
         {
             R.destination = id;
             R.centre = point;
@@ -266,6 +273,7 @@ static void UpdateRoutine(Ped ped, const ContractDef& def, bool mayAct)
     const Vector3 position = ENTITY::GET_ENTITY_COORDS(ped, true, false);
     const bool loaded = RoutineSpawn::Loaded(position);
     observation.blocked = !mayAct || !PlayerAvailable() || !loaded;
+    bool ambientScenario = false;
     if (!loaded && observation.nowMs >= R.nextStreamRequestMs)
     {
         STREAMING::REQUEST_COLLISION_AT_COORD(position);
@@ -274,8 +282,7 @@ static void UpdateRoutine(Ped ped, const ContractDef& def, bool mayAct)
     }
     if (!observation.blocked)
     {
-        const bool ambientScenario = R.controller.state == Routine::State::Wandering && PED::IS_PED_USING_ANY_SCENARIO(ped);
-        if (ambientScenario) R.ambientClearanceUntilMs = observation.nowMs + 5000;
+        ambientScenario = R.controller.state == Routine::State::Wandering && PED::IS_PED_USING_ANY_SCENARIO(ped);
         if (R.selectPending) SelectRoutineDestination(ped, position, observation.minute, observation.nowMs);
         observation.reevaluate = R.resumeRequested || R.pauseSnapshotMs != pausedDurationMs;
         R.pauseSnapshotMs = pausedDurationMs;
@@ -285,14 +292,11 @@ static void UpdateRoutine(Ped ped, const ContractDef& def, bool mayAct)
             const auto& location = RoutineData::kLocations[R.destination];
             if (observation.nowMs >= R.nextValidationMs)
             {
-                // Native ambient scenarios may hold bottles or other props. Preserve
-                // the already-validated stop during that pause and its bounded exit
-                // tail; opening hours and streaming still apply every update.
-                R.destinationValid = location.enabled && (ambientScenario ||
-                    observation.nowMs < R.ambientClearanceUntilMs
-                    ? RoutineSpawn::Loaded(R.centre)
-                    : RoutineSpawn::ValidatePoint(location.anchor, location.candidateRadius,
-                        location.maxHeightDelta, R.centre, ped));
+                // Once arrived, temporary bystanders or scenario props at the fixed
+                // centre cannot cancel this stop. Residency and geometry still apply.
+                R.destinationValid = location.enabled && RoutineSpawn::ValidatePoint(location.anchor,
+                    location.candidateRadius, location.maxHeightDelta, R.centre, ped,
+                    R.controller.state != Routine::State::Wandering);
                 R.nextValidationMs = observation.nowMs + 1000;
             }
             observation.destinationOpen = Routine::CanArriveAndStay({location.openMinute, location.closeMinute},
@@ -314,6 +318,8 @@ static void UpdateRoutine(Ped ped, const ContractDef& def, bool mayAct)
     observation.distance = std::sqrt(DistSq(position, R.centre));
     const Routine::Decision decision = R.controller.Tick(config, observation);
     if (decision.reevaluate) R.selectPending = true;
+    if (ambientScenario && (decision.action == Routine::Action::Travel || decision.action == Routine::Action::Wait))
+        PED::SET_PED_SHOULD_PLAY_NORMAL_SCENARIO_EXIT(ped);
     switch (decision.action)
     {
     case Routine::Action::Travel:
@@ -321,7 +327,8 @@ static void UpdateRoutine(Ped ped, const ContractDef& def, bool mayAct)
         TASK::SET_PED_PATH_MAY_ENTER_WATER(ped, false);
         // act_hunting_2.c:10128 uses speed1, flags0, heading40000. The controller
         // supplies the finite deadline and bounded recovery for this longer town route.
-        TASK::TASK_FOLLOW_NAV_MESH_TO_COORD(ped, R.centre, 1.0f, static_cast<int>(config.travelTimeoutMs), 2.0f, 0, 40000.0f);
+        TASK::TASK_FOLLOW_NAV_MESH_TO_COORD(ped, R.centre, Routine::kWalkMetresPerSecond,
+            static_cast<int>(R.controller.TripTimeoutMs()), 2.0f, 0, 40000.0f);
         PED::SET_PED_KEEP_TASK(ped, true);
         break;
     case Routine::Action::Wander:

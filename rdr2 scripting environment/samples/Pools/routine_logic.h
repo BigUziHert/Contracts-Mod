@@ -1,13 +1,26 @@
 #pragma once
 
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 // Native-free policy. The bridge owns coordinates, opening-hour evidence and tasks.
 namespace Routine
 {
 constexpr int kMinutesPerDay = 1440;
+constexpr float kWalkMetresPerSecond = 1.0f;
+constexpr double kWalkDetourFactor = 1.2;
+constexpr std::uint64_t kMinimumTravelMs = 300000;
+inline std::uint64_t TravelEstimateMs(double distance)
+{
+    if (!(distance > 0.0)) return 0;
+    const double estimate = std::ceil(distance * 1000.0 * kWalkDetourFactor / kWalkMetresPerSecond);
+    // The native walking task accepts a signed millisecond timeout.
+    const auto maximum = static_cast<std::uint64_t>((std::numeric_limits<int>::max)());
+    return estimate >= static_cast<double>(maximum) ? maximum : static_cast<std::uint64_t>(estimate);
+}
 struct Window { int startMinute = 0; int endMinute = 0; }; // Equal endpoints mean 24 hours.
 enum class Phase { Work, Shops, Leisure, Rest };
 constexpr unsigned PhaseMask(Phase phase) { return 1u << static_cast<unsigned>(phase); }
@@ -86,7 +99,7 @@ struct Config
     std::uint64_t taskGraceMs = 1500;
     std::uint64_t retryMs = 4000;
     std::uint64_t noProgressMs = 20000;
-    std::uint64_t travelTimeoutMs = 300000;
+    std::uint64_t travelTimeoutMs = kMinimumTravelMs; // Floor; long trips use the shared walking estimate.
     std::uint64_t cooldownMs = 60000;
     std::uint64_t selectionRetryMs = 5000;
     unsigned maxRetries = 2;
@@ -123,6 +136,7 @@ struct Controller
     int destinationId = -1;
 
     void Reset() { *this = Controller{}; }
+    std::uint64_t TripTimeoutMs() const { return tripTimeoutMs; }
     bool IsCoolingDown(int id, std::uint64_t nowMs) const
     {
         for (const auto& cooldown : cooldowns)
@@ -141,12 +155,17 @@ struct Controller
         {
             state = State::Suspended;
             missingTask = false;
+            selectionPending = false;
             return {}; // Higher priority owns the ped; never even issue a wait task.
         }
         if (state == State::Suspended || clockChanged || observation.reevaluate)
         {
-            state = State::Waiting;
-            destinationId = -1;
+            // Keep the task's state observable while the bridge reselects. A pause
+            // or fallback recheck may return this exact destination next frame.
+            selectionState = state;
+            selectionDestination = destinationId;
+            selectionPending = true;
+            if (state == State::Suspended) { state = State::Waiting; destinationId = -1; }
             waiting = false;
             missingTask = false;
             return {Action::None, true, -1};
@@ -155,12 +174,27 @@ struct Controller
             !observation.destinationOpen || IsCoolingDown(observation.destinationId, observation.nowMs))
             return Wait(config, observation.nowMs);
 
+        if (selectionPending)
+        {
+            selectionPending = false;
+            if (selectionDestination == observation.destinationId && observation.taskActive &&
+                (selectionState == State::Wandering || selectionState == State::Travelling))
+            {
+                state = selectionState;
+                destinationId = selectionDestination;
+                if (state == State::Wandering) retries = 0;
+                return {};
+            }
+            state = State::Waiting;
+        }
         if (destinationId != observation.destinationId || state == State::Waiting)
         {
             destinationId = observation.destinationId;
             state = State::Travelling;
             startedAtMs = progressAtMs = lastTaskAtMs = observation.nowMs;
             bestDistance = observation.distance;
+            const auto estimate = TravelEstimateMs(observation.distance);
+            tripTimeoutMs = estimate > config.travelTimeoutMs ? estimate : config.travelTimeoutMs;
             retries = 0;
             waiting = missingTask = false;
             if (observation.distance <= config.arrivalDistance) return Arrive(observation);
@@ -169,7 +203,7 @@ struct Controller
         if (state == State::Travelling)
         {
             if (observation.distance <= config.arrivalDistance) return Arrive(observation);
-            if (Elapsed(observation.nowMs, startedAtMs) >= config.travelTimeoutMs)
+            if (Elapsed(observation.nowMs, startedAtMs) >= tripTimeoutMs)
                 return Fail(config, observation.nowMs);
             if (observation.distance + config.progressDistance <= bestDistance)
             {
@@ -183,11 +217,13 @@ struct Controller
                 if (retries >= config.maxRetries) return Fail(config, observation.nowMs);
                 ++retries;
                 progressAtMs = lastTaskAtMs = observation.nowMs;
+                bestDistance = observation.distance;
                 missingTask = false;
                 return {Action::Travel, false, -1};
             }
             return {};
         }
+        if (observation.taskActive) retries = 0;
         if (TaskMissing(config, observation) && Elapsed(observation.nowMs, lastTaskAtMs) >= config.retryMs)
         {
             if (retries >= config.maxRetries) return Fail(config, observation.nowMs);
@@ -207,11 +243,15 @@ private:
     std::size_t nextCooldown = 0;
     std::uint64_t startedAtMs = 0, progressAtMs = 0, lastTaskAtMs = 0;
     std::uint64_t missingSinceMs = 0, lastSelectionMs = 0;
+    std::uint64_t tripTimeoutMs = kMinimumTravelMs;
     float bestDistance = 0.0f;
     unsigned retries = 0;
     int lastMinute = -1;
     Phase lastPhase = Phase::Rest;
     bool missingTask = false, waiting = false;
+    bool selectionPending = false;
+    State selectionState = State::Waiting;
+    int selectionDestination = -1;
 
     bool TaskMissing(const Config& config, const Observation& observation)
     {
@@ -233,6 +273,7 @@ private:
         state = State::Waiting;
         destinationId = -1;
         missingTask = false;
+        selectionPending = false;
         const bool retry = !waiting || Elapsed(nowMs, lastSelectionMs) >= config.selectionRetryMs;
         if (retry) lastSelectionMs = nowMs;
         waiting = true;
