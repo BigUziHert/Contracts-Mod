@@ -12,7 +12,7 @@ $bountySourcePath = Join-Path $bountyRoot 'rdr2 scripting environment\samples\Po
 $bountyDataPath = Join-Path $bountyRoot 'rdr2 scripting environment\samples\Pools\contract_data.h'
 $bountySource = [IO.File]::ReadAllText($bountySourcePath)
 $bountyData = [IO.File]::ReadAllText($bountyDataPath)
-$bountyHeader = @('#pragma once', '// Extracted production card collision/camera maintenance; do not edit.', 'namespace Card {')
+$bountyHeader = @('#pragma once', '// Extracted production read-only card inspection trace; do not edit.', 'namespace Card {')
 $bountyMatches = [regex]::Matches($bountyData, 'constexpr\s+Hash\s+kPrimaryItem\s*=[^;]+;')
 if ($bountyMatches.Count -ne 1) { throw 'Expected exactly one production primary-item constant.' }
 $bountyHeader += $bountyMatches[0].Value
@@ -20,10 +20,12 @@ $bountyHeader += '}'
 foreach ($bountyPattern in @(
     '(?ms)^struct CardRuntime\s*\{.*?^\};',
     '(?m)^static CardRuntime\s+Cd;',
+    '(?ms)^struct CardInspectionTraceRuntime\s*\{.*?^\};',
+    '(?m)^static CardInspectionTraceRuntime\s+cardInspectionTrace;',
     '(?m)^static bool LivingPed\(Ped ped\)[^\r\n]+',
     '(?m)^static bool PlayerAvailable\(\)[^\r\n]+',
     '(?ms)^static bool OwnCardTaskRunning\(\)\s*\{.*?^\}',
-    '(?ms)^static void MaintainCardInspectionCamera\(\)\s*\{.*?^\}',
+    '(?ms)^static void TraceCardInspection\(\)\s*\{.*?^\}',
     '(?ms)^template<typename Pred> static bool WaitUntil\(DWORD timeoutMs, Pred pred\)\s*\{.*?^\}'
 )) {
     $bountyMatches = [regex]::Matches($bountySource, $bountyPattern)
@@ -33,14 +35,14 @@ foreach ($bountyPattern in @(
     $bountyHeader += $bountyMatches[0].Value
 }
 $bountyWait = [regex]::Matches($bountySource, '(?ms)^template<typename Pred> static bool WaitUntil\(DWORD timeoutMs, Pred pred\)\s*\{.*?^\}')
-if ([regex]::Matches($bountyWait[0].Value, 'MaintainCardInspectionCamera\(\);\s*MaintainPortraitAndCard\(\);').Count -ne 1) {
-    throw 'Startup wait must protect card collision before portrait maintenance.'
+if ([regex]::Matches($bountyWait[0].Value, 'TraceCardInspection\(\);\s*MaintainPortraitAndCard\(\);').Count -ne 1) {
+    throw 'Startup wait must sample card inspection before portrait maintenance.'
 }
 $bountyMain = [regex]::Matches($bountySource, '(?ms)^void ScriptMain\(\)\s*\{.*?^\}')
-if ($bountyMain.Count -ne 1) { throw 'Expected exactly one ScriptMain for card camera integration.' }
+if ($bountyMain.Count -ne 1) { throw 'Expected exactly one ScriptMain for card trace integration.' }
 $bountyTail = [regex]::Matches($bountyMain[0].Value,
-    '(?s)(?<calls>MaintainCardInspectionCamera\(\);\s*UpdateRoutineDebug\(\);\s*UpdateCard\(\);[^\r\n]*\s*WAIT\(0\);)\s*\}\s*\}$')
-if ($bountyTail.Count -ne 1) { throw 'Card camera maintenance must preserve the final protected debug/card/WAIT tail.' }
+    '(?s)(?<calls>TraceCardInspection\(\);\s*UpdateRoutineDebug\(\);\s*UpdateCard\(\);[^\r\n]*\s*WAIT\(0\);)\s*\}\s*\}$')
+if ($bountyTail.Count -ne 1) { throw 'Card trace must preserve the final protected debug/card/WAIT tail.' }
 $bountyHeader += 'static void RunProductionCardFrameTail() {'
 $bountyHeader += $bountyTail[0].Groups['calls'].Value
 $bountyHeader += '}'
@@ -56,4 +58,4 @@ $bountyCommands += 'exit /b 0'
 $bountyCommandFile = Join-Path $bountyOutput 'run-card-inspection-camera-tests.cmd'
 [IO.File]::WriteAllLines($bountyCommandFile, $bountyCommands, [Text.Encoding]::Default)
 & $env:ComSpec /d /c $bountyCommandFile
-if ($LASTEXITCODE -ne 0) { throw 'Card inspection camera regression tests failed.' }
+if ($LASTEXITCODE -ne 0) { throw 'Card inspection trace regression tests failed.' }

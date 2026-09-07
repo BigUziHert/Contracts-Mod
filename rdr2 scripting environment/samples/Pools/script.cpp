@@ -394,7 +394,7 @@ static void ResetPrompt(Prompt prompt)
 	HUD::_UI_PROMPT_RESTART_MODES(prompt);
 }
 
-static void MaintainCardInspectionCamera();
+static void TraceCardInspection();
 static void MaintainPortraitAndCard();
 static void ApplyCardCustomTexture();
 static void RefreshCardTextureAfterTransition();
@@ -408,7 +408,7 @@ template<typename Pred> static bool WaitUntil(DWORD timeoutMs, Pred pred)
 		MaintainOwnedPedCleanup();
 		SetRuntimePaused(!PlayerAvailable() || HUD::IS_PAUSE_MENU_ACTIVE() || CAMERA::IS_SCREEN_FADED_OUT());
 		if (!PlayerAvailable()) return false;
-		MaintainCardInspectionCamera();
+		TraceCardInspection();
 		MaintainPortraitAndCard();
 		if (pred()) return true;
 		if (GetTickCount64() >= deadline) return false;
@@ -1026,20 +1026,70 @@ static bool OwnCardTaskRunning()
 		TASK::_GET_ITEM_INTERACTION_ENTITY_FROM_PED(Cd.inspectingPed, Card::kPrimaryItem) == Cd.obj;
 }
 
-// Camera framing candidate: borrowed-document inspections exclude their prop from
-// gameplay-camera collision (beat_murder_campfire.c:1245). Preserve native posing;
-// this only protects our pending owned prop or the current matching inspection.
-static void MaintainCardInspectionCamera()
+struct CardInspectionTraceRuntime
 {
+	Object object = 0;
+	Ped inspector = 0;
+	ULONGLONG startedMs = 0, nextSampleMs = 0;
+	unsigned samples = 0;
+};
+static CardInspectionTraceRuntime cardInspectionTrace;
+
+// The collision safeguard did not resolve framing in game. Retire its mutations
+// and observe only our pending/matching inspection, including startup yields.
+// At most 64 samples at 250 ms intervals, for the first 15 seconds of each open.
+static void TraceCardInspection()
+{
+	auto finish = [](const char* reason) {
+		if (cardInspectionTrace.object)
+		{
+			char detail[128];
+			sprintf_s(detail, "card-v1;card=%d;inspector=%d;samples=%u;reason=%s",
+				cardInspectionTrace.object, cardInspectionTrace.inspector, cardInspectionTrace.samples, reason);
+			StartupTrace::Record("card_inspection_end", 0, 0, nullptr, -1, detail);
+		}
+		cardInspectionTrace = CardInspectionTraceRuntime();
+	};
 	if (!Cd.obj || !Cd.inspectingPed || Cd.inspectingPed != pedMe || !PlayerAvailable() ||
-		!ENTITY::DOES_ENTITY_EXIST(Cd.obj)) return;
+		!ENTITY::DOES_ENTITY_EXIST(Cd.obj)) { finish("unavailable_or_retired"); return; }
 	if (TASK::IS_PED_RUNNING_TASK_ITEM_INTERACTION(pedMe))
 	{
-		if (!OwnCardTaskRunning()) return;
+		if (!OwnCardTaskRunning()) { finish("different_item_task"); return; }
 	}
-	else if (!Cd.ownsObj || Cd.examining) return;
-	ENTITY::SET_ENTITY_COLLISION(Cd.obj, false, false);
-	CAMERA::SET_GAMEPLAY_CAM_IGNORE_ENTITY_COLLISION_THIS_UPDATE(Cd.obj);
+	else if (!Cd.ownsObj || Cd.examining) { finish("task_ended"); return; }
+	ULONGLONG now = GetTickCount64();
+	if (cardInspectionTrace.object != Cd.obj || cardInspectionTrace.inspector != pedMe)
+	{
+		finish("replaced");
+		cardInspectionTrace.object = Cd.obj;
+		cardInspectionTrace.inspector = pedMe;
+		cardInspectionTrace.startedMs = now;
+	}
+	if (cardInspectionTrace.samples >= 64 || now < cardInspectionTrace.nextSampleMs ||
+		now - cardInspectionTrace.startedMs > 15000) return;
+	cardInspectionTrace.nextSampleMs = now + 250;
+	Vector3 cardPosition = ENTITY::GET_ENTITY_COORDS(Cd.obj, true, false);
+	Vector3 cardRotation = ENTITY::GET_ENTITY_ROTATION(Cd.obj, 2);
+	Vector3 inspectorPosition = ENTITY::GET_ENTITY_COORDS(pedMe, true, false);
+	Vector3 inspectorRotation = ENTITY::GET_ENTITY_ROTATION(pedMe, 2);
+	Vector3 gameplayPosition = CAMERA::GET_GAMEPLAY_CAM_COORD();
+	Vector3 gameplayRotation = CAMERA::GET_GAMEPLAY_CAM_ROT(2);
+	Vector3 renderedPosition = CAMERA::GET_FINAL_RENDERED_CAM_COORD();
+	Vector3 renderedRotation = CAMERA::GET_FINAL_RENDERED_CAM_ROT(2);
+	float screenX = 0.0f, screenY = 0.0f;
+	bool projected = GRAPHICS::GET_SCREEN_COORD_FROM_WORLD_COORD(cardPosition, &screenX, &screenY) != 0;
+	char detail[1024];
+	std::snprintf(detail, sizeof detail, "card-v1;card=%d;inspector=%d;sample=%u;elapsed=%llu;owned=%d;examining=%d;item=%08X;state=%08X;inspection=%d;attachedTo=%d;visible=%d;textureValid=%d;pedPos=%.3f,%.3f,%.3f;pedRot=%.2f,%.2f,%.2f;cardRot=%.2f,%.2f,%.2f;gamePos=%.3f,%.3f,%.3f;gameRot=%.2f,%.2f,%.2f;gameFov=%.2f;renderPos=%.3f,%.3f,%.3f;renderRot=%.2f,%.2f,%.2f;renderFov=%.2f;projected=%d;screen=%.3f,%.3f",
+		Cd.obj, pedMe, cardInspectionTrace.samples++, now - cardInspectionTrace.startedMs,
+		Cd.ownsObj ? 1 : 0, Cd.examining ? 1 : 0, TASK::GET_ITEM_INTERACTION_ITEM_ID(pedMe),
+		TASK::GET_ITEM_INTERACTION_STATE(pedMe), TASK::IS_PED_RUNNING_INSPECTION_TASK(pedMe) ? 1 : 0,
+		ENTITY::GET_ENTITY_ATTACHED_TO(Cd.obj), ENTITY::IS_ENTITY_VISIBLE(Cd.obj) ? 1 : 0, C.photoTextureValid ? 1 : 0,
+		inspectorPosition.x, inspectorPosition.y, inspectorPosition.z, inspectorRotation.x, inspectorRotation.y, inspectorRotation.z,
+		cardRotation.x, cardRotation.y, cardRotation.z, gameplayPosition.x, gameplayPosition.y, gameplayPosition.z,
+		gameplayRotation.x, gameplayRotation.y, gameplayRotation.z, CAMERA::GET_GAMEPLAY_CAM_FOV(),
+		renderedPosition.x, renderedPosition.y, renderedPosition.z, renderedRotation.x, renderedRotation.y, renderedRotation.z,
+		CAMERA::GET_FINAL_RENDERED_CAM_FOV(), projected ? 1 : 0, screenX, screenY);
+	StartupTrace::Record("card_inspection_sample", ENTITY::GET_ENTITY_MODEL(Cd.obj), C.target, &cardPosition, -1, detail);
 }
 
 static void DestroyCardObject(bool cancelInspection = false)
@@ -2301,7 +2351,7 @@ void ScriptMain()
 		// re-triggering aggression through walls for the rest of the contract.
 		if (C.damagedByPlayer && TargetExists()) ENTITY::CLEAR_ENTITY_LAST_DAMAGE_ENTITY(C.target);
 		C.damagedByPlayer = false;
-		MaintainCardInspectionCamera();
+		TraceCardInspection();
 		UpdateRoutineDebug();
 		UpdateCard(); // render-target drawing must remain last
 		WAIT(0);
