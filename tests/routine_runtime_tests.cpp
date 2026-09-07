@@ -93,8 +93,11 @@ struct World
     float wanderRadius = 0, avoidRadius = 0;
     int wanderCalls = 0, keepCalls = 0, avoidCalls = 0, waterCalls = 0;
     int travelCalls = 0, standCalls = 0, statusCalls = 0;
+    int activityCalls = 0, activityConfirmations = 0;
     int travelTimeout = 0;
     Hash lastTaskHash = 0;
+    Hash scenarioInUse = 0, startedScenario = 0;
+    bool scenarioEnabled = false, scenarioStarts = true, enterAnimation = false;
     bool mayEnterWater = true;
 } w;
 static ULONGLONG RuntimeNowMs() { return w.now; }
@@ -190,8 +193,24 @@ static void TASK_STAND_STILL(Ped, int duration)
 {
     Check(duration == -1, "waiting persists until a later explicit routine decision"); ++w.standCalls;
 }
+static bool IS_SCENARIO_TYPE_ENABLED(const char*) { return w.scenarioEnabled; }
+static void TASK_START_SCENARIO_IN_PLACE_HASH(Ped ped, Hash scenario, int duration, bool enter, Hash condition, float heading, bool finalFlag)
+{
+    Check(ped == 77 && duration == -1 && condition == 0 && heading == -1.0f && !finalFlag,
+        "ambient activity keeps verified in-place parameters on the existing target");
+    ++w.activityCalls; w.startedScenario = scenario; w.enterAnimation = enter;
+    if (w.scenarioStarts) w.scenarioInUse = scenario;
 }
-namespace PED { static void SET_PED_KEEP_TASK(Ped, bool keep) { Check(keep, "routine wander keeps its task"); ++w.keepCalls; } }
+}
+namespace PED
+{
+static void SET_PED_KEEP_TASK(Ped, bool keep) { Check(keep, "routine task is kept"); ++w.keepCalls; }
+static bool IS_PED_USING_SCENARIO_HASH(Ped ped, Hash hash)
+{
+    Check(ped == 77, "scenario confirmation examines the same target"); ++w.activityConfirmations;
+    return w.scenarioInUse == hash;
+}
+}
 
 #include "../rdr2 scripting environment/samples/Pools/routine_runtime.h"
 
@@ -329,7 +348,7 @@ static void Tick(unsigned elapsed = 16, bool mayAct = true)
 {
     w.now += elapsed; UpdateRoutine(77, R.definition, mayAct);
 }
-static int TaskCount() { return w.travelCalls + w.wanderCalls + w.standCalls; }
+static int TaskCount() { return w.travelCalls + w.wanderCalls + w.standCalls + w.activityCalls; }
 static void BeginTravel()
 {
     Check(StartRoutineWander(77, R.definition), "routine setup requests its first schedule");
@@ -455,6 +474,114 @@ static void TestTravelRecovery()
     Check(TaskCount() == count, "disabled runtime never revives a cleaned-up target");
 }
 
+static void TravelToLeisure(unsigned seed)
+{
+    SetDaytimeFixture();
+    R.plan.seed = seed; w.minute = 1100; w.scenarioEnabled = true;
+    BeginTravel();
+    Check(R.destination == R.plan.route[2], "activity fixture physically travels to a real leisure destination");
+    w.pedPosition = R.centre;
+}
+static void TestActivityEntryAndConfirmation()
+{
+    for (unsigned seed : {28u, 29u})
+    {
+        TravelToLeisure(seed); Tick();
+        const Hash expected = Joaat(seed & 1u ? "WORLD_HUMAN_DRINKING" : "WORLD_HUMAN_SMOKE");
+        Check(R.controller.state == Routine::State::Activity && w.activityCalls == 1 && w.startedScenario == expected,
+            "leisure arrival selects the verified smoking or drinking activity");
+        Check(w.enterAnimation == ((seed & 1u) != 0) && R.activityHash == expected && R.activityName,
+            "only drinking requests the source-backed entrance animation");
+        Check(R.activityUntilMs >= w.now + 40000 && R.activityUntilMs <= w.now + 75000,
+            "activity has a bounded forty-to-seventy-five-second dwell");
+        const Vector3 fixed = R.centre;
+        for (int frame = 0; frame < 15; ++frame) Tick();
+        Check(w.activityCalls == 1 && w.activityConfirmations >= 15 && w.wanderCalls == 0 && Within(R.centre, fixed, .001f),
+            "active scenario is confirmed without restart or centre drift every frame");
+        const int tasks = TaskCount(), confirmations = w.activityConfirmations;
+        Tick(16, false); Tick(10000, false);
+        Check(TaskCount() == tasks && w.activityConfirmations == confirmations && R.controller.state == Routine::State::Suspended,
+            "combat or restraint owns the ped without activity restarts or recovery checks");
+        ResetRoutine();
+        Check(!R.activityName && R.activityHash == 0 && R.activityUntilMs == 0 && TaskCount() == tasks,
+            "cleanup forgets activity metadata without deleting scenario props or borrowing actors");
+    }
+}
+static void TestActivityAvailabilityAndFallback()
+{
+    for (int unavailable = 0; unavailable < 4; ++unavailable)
+    {
+        TravelToLeisure(29);
+        if (unavailable == 0) w.scenarioEnabled = false;
+        if (unavailable == 1) w.occupied = true;
+        if (unavailable == 2) w.outside = false;
+        if (unavailable == 3) w.interior = 123;
+        Tick();
+        Check(w.activityCalls == 0 && w.wanderCalls == 1 && R.controller.state == Routine::State::Wandering,
+            "disabled, occupied or interior arrival starts ordinary wandering without an activity");
+    }
+    TravelToLeisure(29); w.scenarioStarts = false;
+    Tick();
+    Check(w.activityCalls == 1 && R.controller.state == Routine::State::Activity,
+        "requested scenario waits for actual engine confirmation");
+    Tick(100); Tick(1500);
+    Check(w.activityCalls == 1 && w.wanderCalls == 0,
+        "failed startup observes task grace and recovery interval without spam");
+    Tick(2500);
+    Check(w.activityCalls == 1 && w.wanderCalls == 1 && R.controller.state == Routine::State::Wandering &&
+        !R.activityName && R.activityHash == 0 && R.activityUntilMs == 0,
+        "failed startup falls back once to wandering and retires activity metadata");
+
+    TravelToLeisure(28); Tick();
+    const auto expiry = R.activityUntilMs;
+    Tick(static_cast<unsigned>(expiry - w.now));
+    Check(w.activityCalls == 1 && w.wanderCalls == 0, "activity expiry starts bounded recovery grace");
+    Tick(1500);
+    Check(w.activityCalls == 1 && w.wanderCalls == 1 && R.controller.state == Routine::State::Wandering,
+        "expired activity ends through one ordinary wandering transition");
+
+    TravelToLeisure(29); Tick(); w.scenarioEnabled = false;
+    Tick(100); Tick(4100);
+    Check(w.activityCalls == 1 && w.wanderCalls == 1, "a type disabled after entry falls back without re-enabling it");
+
+    SetDaytimeFixture(); w.scenarioEnabled = true; R.plan.seed = 30;
+    BeginTravel(); w.pedPosition = R.centre; Tick();
+    Check(w.startedScenario == Joaat("WORLD_HUMAN_SMOKE") && !w.enterAnimation,
+        "compatible non-leisure destination supports only a verified smoking break");
+    SetDaytimeFixture(); w.scenarioEnabled = true; R.plan.seed = 28;
+    BeginTravel(); w.pedPosition = R.centre; Tick();
+    Check(w.activityCalls == 0 && w.wanderCalls == 1, "other seeded work visits simply wander without invented work animations");
+}
+
+static void TestOwnedActivityPropClearance()
+{
+    TravelToLeisure(29); Tick();
+    const int destination = R.destination;
+    // The engine's own bottle/cigarette is external to the ped collision ignore.
+    // Simulate a shape/occupancy hit after entry without changing world availability.
+    w.occupied = true; w.hit = true;
+    const int validatedProbes = w.probes;
+    Tick(1100);
+    Check(R.destination == destination && R.destinationValid && R.controller.state == Routine::State::Activity &&
+        w.activityCalls == 1 && w.standCalls == 0 && w.probes == validatedProbes,
+        "owned activity prop cannot invalidate its already-validated destination while the scenario runs");
+    w.scenarioInUse = 0;
+    Tick(100); Tick(4100);
+    Check(R.controller.state == Routine::State::Wandering && R.destinationValid && w.wanderCalls == 1 &&
+        R.activityClearanceGraceUntilMs == static_cast<ULONGLONG>(w.now) + 5000,
+        "activity exit starts a bounded grace period for scenario prop retirement");
+    const int afterExitProbes = w.probes;
+    Tick(1100); Tick(1100); Tick(1100); Tick(1100);
+    Check(R.destinationValid && R.destination == destination && w.standCalls == 0 &&
+        w.probes == afterExitProbes && w.wanderCalls == 1,
+        "lingering prop clearance hits do not strand the target within the five-second exit tail");
+    Tick(1100);
+    Check(!R.destinationValid && R.controller.state == Routine::State::Waiting && R.selectPending && w.standCalls == 1,
+        "full occupied-space validation resumes after the bounded prop-exit grace");
+    ResetRoutine();
+    Check(R.activityClearanceGraceUntilMs == 0, "contract cleanup resets the prop-clearance grace timer");
+}
+
 int main()
 {
     TestPreparedDefinition();
@@ -463,5 +590,8 @@ int main()
     TestTravelAndClock();
     TestSuspensionAndAvailability();
     TestTravelRecovery();
+    TestActivityEntryAndConfirmation();
+    TestActivityAvailabilityAndFallback();
+    TestOwnedActivityPropClearance();
     std::printf("Routine runtime bridge: %u checks passed.\n", checks);
 }

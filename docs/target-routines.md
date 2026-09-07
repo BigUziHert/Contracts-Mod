@@ -134,3 +134,37 @@ Only the information draw changes. The portrait capture, download handles, 32-sl
 card material retries, prop/item states, handoff, flip/zoom/put-away, final draw order,
 corpse photography and payment functions were independently compared against `733eb83`;
 all 18 checked protected functions and the complete Card constants block were identical.
+
+## Stages 4 and 5: ambient activities; transit deferred
+
+On arrival, suitable targets can take a smoking/drinking stop scheduled for 40–75 seconds
+(the normal 1.5-second task-loss grace applies at expiry). Entry checks
+the scenario type is enabled and the actual ped position is free and outdoors. The
+controller confirms the ped is using the requested scenario, allows a startup grace,
+and falls back to local wandering if entry fails, the activity ends, its type is disabled
+or the capped visit expires. Priority interruptions issue no routine tasks. Scenario
+props are managed by the native task; there are no mod-created bottles/chairs or borrowed
+actors to delete. Prop appearance and exit cleanup still need in-game verification.
+During an activity and for five seconds after its exit task, residency checks replace
+full destination clearance probes so the target's own retiring props do not reject its
+standing area. Opening windows, scenario availability and encounter priorities still apply.
+
+Smoking follows `ambush_pnk_type1.c:958`; drinking follows
+`beat_duel_boaster.c:1965-1966`. Type-enabled queries follow `abigail2_1.c:13327`.
+To add an activity, first establish its native signature, source flag usage, location and
+occupation suitability, entry confirmation, hours/active-event availability, ownership,
+normal and interrupted exits. Add its choice to `RoutineActivityName` and bridge handling
+with native-shim tests. Add matching factual card wording only if actual participation is
+supported. Furniture, tools and private minigames require more than an animation name.
+
+Genuine poker, blackjack, five-finger fillet and theatre participation remain disabled.
+Those scripts maintain private participants, seats and/or show state; no safe registration
+and withdrawal protocol for our owned target was established. Sweeping and other work
+animations, interior commerce and world-state construction sites are also deferred.
+
+Ambient tram travel remains disabled: the verified passenger examples use mission-owned
+carriages and warp recovery. A nonwarp approach/board/ride/disembark path with safe combat,
+restraint, corpse access and borrowed-vehicle cleanup has not been established. No tram
+state machine is shipped as a placeholder; targets continue walking. Detailed evidence
+and the requirements for enabling these features are in
+[routine-activities-and-transit.md](routine-activities-and-transit.md).

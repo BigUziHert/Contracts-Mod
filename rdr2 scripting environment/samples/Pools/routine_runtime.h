@@ -19,6 +19,10 @@ struct RoutineRuntime
     ULONGLONG nextValidationMs = 0;
     ULONGLONG nextStreamRequestMs = 0, fallbackRecheckMs = 0;
     ULONGLONG pauseSnapshotMs = 0;
+    const char* activityName = nullptr;
+    Hash activityHash = 0;
+    ULONGLONG activityUntilMs = 0;
+    ULONGLONG activityClearanceGraceUntilMs = 0;
     bool destinationValid = true;
 };
 static RoutineRuntime R;
@@ -169,10 +173,24 @@ static void SelectRoutineDestination(Ped ped, const Vector3& position, int minut
 
 static bool RoutineTaskActive(Ped ped)
 {
+    if (R.controller.state == Routine::State::Activity)
+        return R.activityName && RuntimeNowMs() < R.activityUntilMs &&
+            TASK::IS_SCENARIO_TYPE_ENABLED(R.activityName) && PED::IS_PED_USING_SCENARIO_HASH(ped, R.activityHash);
     const Hash task = R.controller.state == Routine::State::Travelling
         ? joaat("SCRIPT_TASK_FOLLOW_NAV_MESH_TO_COORD") : joaat("SCRIPT_TASK_WANDER_IN_AREA");
     const int status = TASK::GET_SCRIPT_TASK_STATUS(ped, task, true);
     return status == 0 || status == 1;
+}
+
+static const char* RoutineActivityName()
+{
+    if (R.destination < 0) return nullptr;
+    const auto kind = RoutineData::kLocations[R.destination].kind;
+    if (kind == RoutineData::PlaceKind::Leisure)
+        return (R.plan.seed & 1u) ? "WORLD_HUMAN_DRINKING" : "WORLD_HUMAN_SMOKE";
+    // A short break at other exterior locations; no claim of a working animation,
+    // purchase, haircut, table game or access to a venue's service.
+    return (R.plan.seed & 2u) ? "WORLD_HUMAN_SMOKE" : nullptr;
 }
 
 static void UpdateRoutine(Ped ped, const ContractDef& def, bool mayAct)
@@ -183,6 +201,7 @@ static void UpdateRoutine(Ped ped, const ContractDef& def, bool mayAct)
     observation.nowMs = RuntimeNowMs();
     observation.minute = RoutineMinute();
     observation.scheduleOffset = R.plan.offsetMinutes;
+    const char* proposedActivity = nullptr;
     const Vector3 position = ENTITY::GET_ENTITY_COORDS(ped, true, false);
     const bool loaded = RoutineSpawn::Loaded(position);
     observation.blocked = !mayAct || !PlayerAvailable() || !loaded;
@@ -204,8 +223,13 @@ static void UpdateRoutine(Ped ped, const ContractDef& def, bool mayAct)
             if (observation.nowMs >= R.nextValidationMs)
             {
                 Vector3 checked;
-                R.destinationValid = location.enabled && RoutineSpawn::Validate(location.anchor, location.candidateRadius,
-                    location.maxHeightDelta, R.centre, checked, ped) && Within(checked, R.centre, .5f);
+                // The activity already owns its small standing space. Scenario props
+                // must not make the traveller's own bottle fail destination clearance.
+                R.destinationValid = location.enabled && (R.controller.state == Routine::State::Activity ||
+                    observation.nowMs < R.activityClearanceGraceUntilMs
+                    ? RoutineSpawn::Loaded(R.centre)
+                    : RoutineSpawn::Validate(location.anchor, location.candidateRadius,
+                        location.maxHeightDelta, R.centre, checked, ped) && Within(checked, R.centre, .5f));
                 R.nextValidationMs = observation.nowMs + 1000;
             }
             observation.destinationOpen = Routine::CanArriveAndStay({location.openMinute, location.closeMinute},
@@ -219,12 +243,29 @@ static void UpdateRoutine(Ped ped, const ContractDef& def, bool mayAct)
             }
         }
         observation.taskActive = RoutineTaskActive(ped);
+        if (R.destination >= 0 && (R.controller.state == Routine::State::Travelling || R.controller.state == Routine::State::Waiting) &&
+            Within(position, R.centre, config.arrivalDistance))
+        {
+            proposedActivity = RoutineActivityName();
+            // Query enabled state as in abigail2_1.c:13327, without enabling a type
+            // another script disabled. Confirm free exterior space at the actual ped.
+            observation.canDoActivity = proposedActivity && TASK::IS_SCENARIO_TYPE_ENABLED(proposedActivity) &&
+                INTERIOR::IS_COLLISION_MARKED_OUTSIDE(position) && !INTERIOR::GET_INTERIOR_FROM_COLLISION(position) &&
+                RoutineSpawn::ClearBody(position, ped);
+        }
     }
     observation.destinationId = R.destination;
     observation.destinationAvailable = R.destinationValid;
     observation.distance = std::sqrt(DistSq(position, R.centre));
     const Routine::Decision decision = R.controller.Tick(config, observation);
     if (decision.reevaluate) R.selectPending = true;
+    if (decision.action == Routine::Action::Travel || decision.action == Routine::Action::Wander || decision.action == Routine::Action::Wait)
+    {
+        if (R.activityName) R.activityClearanceGraceUntilMs = observation.nowMs + 5000;
+        R.activityName = nullptr;
+        R.activityHash = 0;
+        R.activityUntilMs = 0;
+    }
     switch (decision.action)
     {
     case Routine::Action::Travel:
@@ -244,7 +285,16 @@ static void UpdateRoutine(Ped ped, const ContractDef& def, bool mayAct)
     case Routine::Action::Wait:
         TASK::TASK_STAND_STILL(ped, -1); // act_hunting_2.c:9931; replaced by the next valid routine task
         break;
-    case Routine::Action::Activity: // enabled only after the verified activity stage
+    case Routine::Action::Activity:
+        R.activityName = proposedActivity;
+        R.activityHash = joaat(proposedActivity);
+        R.activityUntilMs = observation.nowMs + 40000 + (R.plan.seed % 36u) * 1000;
+        // ambush_pnk_type1.c:958 (smoke), beat_duel_boaster.c:1965-1966 (drink).
+        // Scenario-managed props; never reserve furniture or borrow another actor.
+        TASK::TASK_START_SCENARIO_IN_PLACE_HASH(ped, R.activityHash, -1,
+            R.activityHash == Joaat("WORLD_HUMAN_DRINKING"), 0, -1.0f, false);
+        PED::SET_PED_KEEP_TASK(ped, true);
+        break;
     case Routine::Action::None: break;
     }
 }
