@@ -92,8 +92,8 @@ static void RoutineStartsAtItsValidatedArrival()
     Reset(); AddSearchBlip();
     Check(C.searchBlip == w.handle && w.creates == 1 && w.styles == 1,
         "a routine search creates and styles one owned circle");
-    Check(w.radius == 35.0f && w.radius == R.wanderRadius,
-        "routine search uses the same 35 metre radius as wandering");
+    Check(w.radius == 45.0f && w.radius == R.wanderRadius,
+        "routine search uses the same 45 metre radius as wandering");
     Check(SamePoint(w.centre, R.centre) && !SamePoint(w.centre, definition.spawn),
         "routine search starts at the validated arrival instead of the obsolete town anchor");
     const Vector3 stop = w.centre;
@@ -112,8 +112,8 @@ static void NewStopMovesTheSameCircleOnce()
     ++R.destination; R.centre = {2684.0f, -1399.0f, 46.7f};
     UpdateSearchArea();
     Check(C.searchBlip == original && w.moves == 1 && w.creates == 1 && w.styles == 1 &&
-        SamePoint(w.centre, R.centre) && w.radius == 35.0f,
-        "a new valid routine stop moves the original 35 metre circle once without recreating or restyling it");
+        SamePoint(w.centre, R.centre) && w.radius == 45.0f,
+        "a new valid routine stop moves the original 45 metre circle once without recreating or restyling it");
     for (int frame = 0; frame < 4; ++frame) UpdateSearchArea();
     Check(w.moves == 1 && w.creates == 1, "subsequent frames at the new stop do not repeat the map write");
     ++R.destination;
@@ -161,8 +161,8 @@ static void CachedFallbackKeepsItsAuthoredCircle()
     R.ambientFallback = true; R.destinationValid = false;
     UpdateSearchArea();
     Check(C.searchBlip == original && w.moves == 1 && w.creates == 1 &&
-        SamePoint(w.centre, R.centre) && w.radius == 35.0f,
-        "route recovery keeps the same 35 metre search circle at the cached authored fallback");
+        SamePoint(w.centre, R.centre) && w.radius == 45.0f,
+        "route recovery keeps the same 45 metre search circle at the cached authored fallback");
     for (int frame = 0; frame < 4; ++frame)
     {
         C.targetPos.x += 10;

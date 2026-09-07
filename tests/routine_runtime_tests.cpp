@@ -274,7 +274,7 @@ static void CheckPreparedCard(const RoutineRuntime& prepared)
         std::strcmp(prepared.definition.targetDesc, RoutinePlan::OccupationName(prepared.plan.occupation)) == 0,
         "alternate town, occupation and model pool all agree with the prepared identity");
     Check(prepared.definition.searchRadius == location.wanderRadius && prepared.wanderRadius == RoutineData::kWanderRadius,
-        "the prepared search area matches the shared 35-metre wander radius");
+        "the prepared search area matches the shared 45-metre wander radius");
 }
 
 static RoutineRuntime MakePrepared()
@@ -912,14 +912,14 @@ static void TestHealthyWanderKeepsAcceptedArea()
     const Vector3 centre = R.centre;
     Check(R.fallbackDestination == destination && Within(R.fallbackCentre, centre, .001f),
         "normal arrival updates the cached authored ambient area");
-    w.pedPosition.x += 35.0f;
+    w.pedPosition.x += 45.0f;
     w.groundOk = false; w.safe = false; w.outside = false; w.interior = 1;
     w.waterPresent = true; w.hit = true; w.occupied = true;
     const int tasks = TaskCount(), probes = w.probes, safeCalls = w.safeCalls;
     for (int frame = 0; frame < 12; ++frame) Tick(1100);
     Check(R.destination == destination && R.destinationValid && R.controller.state == Routine::State::Wandering &&
-        !R.ambientFallback && Within(R.centre, centre, .001f) && R.wanderRadius == 35.0f,
-        "a target at its 35-metre boundary retains its authored stop despite transient point-query failures");
+        !R.ambientFallback && Within(R.centre, centre, .001f) && R.wanderRadius == 45.0f,
+        "a target at its 45-metre boundary retains its authored stop despite transient point-query failures");
     Check(TaskCount() == tasks && w.standCalls == 0 && w.probes == probes && w.safeCalls == safeCalls,
         "healthy area wandering does not rerun spawn validation or receive replacement tasks");
     w.scenarioInUse = Joaat("WORLD_HUMAN_SMOKE"); w.taskStatus = 7;
@@ -940,7 +940,7 @@ static void TestUnavailablePhaseContinuesAmbiently()
         if (scenario) { w.scenarioInUse = Joaat("WORLD_HUMAN_DRINKING"); w.taskStatus = 7; }
         w.minute = 60; Tick(); Tick();
         Check(R.controller.state == Routine::State::Waiting && R.ambientFallback && R.destination == held &&
-            !R.destinationValid && Within(R.centre, centre, .001f) && R.wanderRadius == 35.0f,
+            !R.destinationValid && Within(R.centre, centre, .001f) && R.wanderRadius == 45.0f,
             "an unavailable new phase retains the last accepted authored area for ambient continuation");
         Check(TaskCount() == tasks && w.standCalls == 0 && w.scenarioExits == 0,
             "failure to find the next stop never clears or replaces healthy wandering or its native scenario");
@@ -980,7 +980,7 @@ static void TestFailedTravelUsesCachedArea()
     w.taskStatus = 7;
     Tick(100); Tick(4100); Tick(100); Tick(4100); Tick(100); Tick(4100);
     Check(w.travelCalls == 3 && w.wanderCalls == 1 && w.standCalls == 0 && R.ambientFallback &&
-        R.destination == fallback && Within(w.wanderCentre, centre, .001f) && w.wanderRadius == 35.0f,
+        R.destination == fallback && Within(w.wanderCentre, centre, .001f) && w.wanderRadius == 45.0f,
         "failed travel receives exactly one native wander task around its cached authored fallback");
     w.groundOk = false; w.taskStatus = 0; Tick();
     const int tasks = TaskCount();

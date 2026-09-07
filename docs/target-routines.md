@@ -60,15 +60,15 @@ after success. See [retry behavior and engine limits](routine-radius-and-startup
 
 ## Search, wander and spawn areas
 
-- Search: a 35 m circle around the current validated routine destination. It moves when
+- Search: a 45 m circle around the current validated routine destination. It moves when
   a new valid stop is assigned, using the same blip; it does not follow individual steps.
 - Candidate radius: 4–12 m around a sourced coordinate, used only for validation.
-- Wander radius: 35 m around that same fixed validated destination point, from the shared
+- Wander radius: 45 m around that same fixed validated destination point, from the shared
   `RoutineData::kWanderRadius` constant. Travel between stops can extend outside the circle.
-- Aim discovery: 35 m from the target plus LOS; direct interaction, damage or combat still
+- Aim discovery: 45 m from the target plus LOS; direct interaction, damage or combat still
   discovers the target. Combat's 45 m reacquisition and 55 m retention ranges are unchanged.
 
-Generated definitions set `ContractDef::searchRadius` to the same 35 m radius. The native
+Generated definitions set `ContractDef::searchRadius` to the same 45 m radius. The native
 wander task and map circle use the accepted destination's matching value.
 
 ## Availability policy
@@ -83,7 +83,7 @@ venue activities require separately verified opening, active event and seat avai
 
 Add a town's reference anchor and sourced `Location` rows, each with a unique id,
 occupation mask, phase, bounded candidate/height dimensions and a source reference.
-Use the shared 35 m wander/search radius for each row.
+Use the shared 45 m wander/search radius for each row.
 Every supported occupation needs one compatible site per phase and an all-day Rest
 fallback. Add matching archetypes in `RoutineModels`; reject unsupported town/role pairs.
 Update `GeneratedOccupation` too: every enabled location must be reachable by an actual
@@ -118,7 +118,7 @@ speed of 1 metre/second and a 1.2 detour factor. The deadline has a five-minute 
 long routes receive more time. Travel retains a 20-second
 no-progress threshold, a four-second recovery interval and at most two retries. Failed
 destinations cool down for 60 seconds. Navigation failure tries the selected all-day public
-fallback. If neither route is usable, the target uses native 35 m wandering around the last
+fallback. If neither route is usable, the target uses native 45 m wandering around the last
 accepted spawn/arrived stop while selection retries. The cached centre never follows the
 ped's footsteps and never comes from a failed travel endpoint. Arrival starts fixed-centre local wandering.
 Tasks are issued on transitions or bounded recovery, never once per frame.

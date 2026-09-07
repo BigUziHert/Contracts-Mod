@@ -1,5 +1,7 @@
 # Ambient fallback for unavailable routine destinations
 
+> Historical report: the owner later increased the shared wander/search radius to 45 m. The 35 m descriptions and validation results below describe the original build.
+
 The owner observed a Valentine target standing still with `Stop: None` and `Waiting for a usable destination`. The controller explicitly issued `TASK_STAND_STILL(ped, -1)` after scheduled and public-fallback destination checks failed. Selection had already cleared the assigned stop. The screenshot does not identify which native validation check failed.
 
 The runtime now retains a fixed fallback area from the accepted initial spawn and updates it on arrival at a routine destination. Failed selection keeps a real authored stop and uses native 35 m wandering there. It never invents an area around the ped's changing position, teleports the target, or uses a failed travel endpoint as its new fallback.

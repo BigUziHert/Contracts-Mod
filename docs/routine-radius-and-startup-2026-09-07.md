@@ -1,5 +1,7 @@
 # Routine radius, location and contract preparation changes
 
+> Historical report: the owner later increased the shared wander/search radius to 45 m. The 35 m descriptions and validation results below describe the original build.
+
 The owner reported short repeated wander segments, requested 35 m wandering and a matching search circle, corrected six catalogue entries, and asked for location rejection to stop requiring another contract request. They also reported that card framing had returned to normal. This change leaves card inspection and portrait capture unchanged.
 
 ## Wandering and search

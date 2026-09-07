@@ -270,9 +270,9 @@ int main() {
     SceneTraceBracketsOwnedNativeCalls();
     SceneTracePreservesForeignAndLoadedPaths();
     using namespace RoutineData;
-    Check(kWanderRadius==35.0f,"routine wandering policy is exactly 35 metres");
+    Check(kWanderRadius==45.0f,"routine wandering policy is exactly 45 metres");
     for(const Location& place:kLocations)
-        Check(place.wanderRadius==kWanderRadius,"every catalogue entry uses the shared 35 metre wander radius");
+        Check(place.wanderRadius==kWanderRadius,"every catalogue entry uses the shared 45 metre wander radius");
     const auto findLocation=[](const char* id)->const Location* {
         for(const Location& place:kLocations)if(std::strcmp(place.id,id)==0)return &place;
         return nullptr;
@@ -302,7 +302,7 @@ int main() {
         Check(kinds==15 && fallback,"Strawberry occupations retain every routine phase and an all-day fallback after stable removal");
     }
     for(const Town& town:kTowns) {
-        Check(town.searchRadius==kWanderRadius,"every town search radius matches the 35 metre routine radius");
+        Check(town.searchRadius==kWanderRadius,"every town search radius matches the 45 metre routine radius");
         unsigned kinds=0; bool fallback=false;
         for(int i=0;i<kLocationCount;++i) {
             const auto& place=kLocations[i]; if(place.town!=town.id || !place.enabled)continue;

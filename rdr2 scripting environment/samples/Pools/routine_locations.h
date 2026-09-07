@@ -6,7 +6,7 @@
 // See docs/routine-location-sources.md for the exact source context and limitations.
 namespace RoutineData
 {
-	inline constexpr float kWanderRadius = 35.0f;
+	inline constexpr float kWanderRadius = 45.0f;
 
 	enum class TownId { Rhodes, Blackwater, Valentine, Strawberry, SaintDenis, VanHorn, Annesburg };
 	enum class PlaceKind { Work, Shops, Leisure, Rest };
