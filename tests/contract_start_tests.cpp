@@ -35,8 +35,11 @@ struct ActiveContract
     Ped target = 0;
     Vector3 targetPos;
     ULONGLONG startMs = 0;
+    ULONGLONG photoMs = 0;
     bool cardOpenPending = false;
     int photoIdentity = 0;
+    bool paymentCredited = false;
+    int payoutCents = 0;
 };
 struct GiverSpot {};
 static Ped pedMe = kPlayer;
@@ -57,11 +60,14 @@ static struct World
     bool playerAlive = true, canInteract = true, paused = false, faded = false;
     bool interruptPreparation = false, changePlayerAfterSpawn = false;
     bool giverAlive = true, giverAtSpot = true, handoffSucceeds = true;
+    bool ownCardTask = false, changePlayerOnCardClose = false, reenterOnCardClose = false;
     int spawnFailures = 0;
     int preflightFailure = -1, spawnFailure = -1;
     unsigned preflights = 0, clears = 0, oldHuntsCleared = 0;
     unsigned spawns = 0, setups = 0, spawnedHooks = 0, blips = 0;
     unsigned cleanupRequests = 0, photoReleases = 0, handoffs = 0, reports = 0, readyMessages = 0;
+    unsigned cardCloses = 0, settlements = 0, paidContractClears = 0;
+    int paidCents = 0;
 } world;
 namespace StartupTrace { static void Record(const char*, unsigned = 0, int = 0, const Vector3* = nullptr) {} }
 namespace HUD { static bool IS_PAUSE_MENU_ACTIVE() { return world.paused; } }
@@ -89,6 +95,9 @@ static void RequestOwnedPedCleanup(Ped ped);
 static void ReleaseTargetPhoto();
 static void AddSearchBlip();
 static bool BeginHandoff(Ped giver, bool payout);
+static bool OwnCardTaskRunning() { return world.ownCardTask; }
+static void DestroyCardObject(bool cancel);
+static void SettlePayment();
 static void LogContractStartFailure(Hash, int) {}
 static void ReportContractStartFailure() { ++world.reports; }
 
@@ -127,13 +136,36 @@ static void RequestOwnedPedCleanup(Ped ped)
 }
 static void ClearContract(bool deleteTarget)
 {
-    Check(deleteTarget, "replacement requests cleanup through the existing contract boundary");
+    Check(deleteTarget || (g_state == CONTRACT_PAID && C.paymentCredited),
+        "replacement uses cancellation cleanup while earned-payment settlement releases its target");
     ++world.clears;
+    if (!deleteTarget) ++world.paidContractClears;
     if (C.target == kOldTarget) ++world.oldHuntsCleared;
     if (C.photoIdentity) ReleaseTargetPhoto();
     C = {};
 
     g_state = CONTRACT_NONE;
+}
+static void DestroyCardObject(bool cancel)
+{
+    Check(cancel && (Cd.obj || world.ownCardTask), "remote replacement closes only its old card or inspect task");
+    ++world.cardCloses;
+    if (world.reenterOnCardClose)
+    {
+        world.reenterOnCardClose = false;
+        UpdatePendingContractStart();
+    }
+    Cd.obj = 0;
+    world.ownCardTask = false;
+    if (world.changePlayerOnCardClose) world.player = 99;
+}
+static void SettlePayment()
+{
+    if (g_state != CONTRACT_PAID || C.paymentCredited) return;
+    C.paymentCredited = true;
+    ++world.settlements;
+    world.paidCents += C.payoutCents;
+    ClearContract(false);
 }
 static Ped SpawnTargetWithPhoto(Hash model, const ContractDef& def)
 {
@@ -260,11 +292,95 @@ static void TransientEngineFailuresRetry()
             "the retained engine-failure request eventually publishes one target and schedules its remote card");
     }
 }
+static void RemoteReplacementAfterCorpseProof()
+{
+    Reset();
+    g_state = CONTRACT_DEAD;
+    C.photoMs = 500;
+    world.preflightFailure = static_cast<int>(ContractStartFailure::PedPoolFull);
+    RequestContractStart(0);
+    UpdatePendingContractStart();
+    Check(pendingContractStart.player == kPlayer && g_state == CONTRACT_DEAD && C.target == kOldTarget &&
+        C.photoMs == 500 && C.photoIdentity == 100 && !world.clears && !world.spawns && !world.settlements,
+        "a queued remote replacement preserves corpse proof and portrait when startup preflight fails");
+    world.preflightFailure = -1;
+    world.now = pendingContractStart.nextAttemptMs;
+    UpdatePendingContractStart();
+    Check(!pendingContractStart.player && g_state == CONTRACT_UNKNOWN && C.target == kNewTarget &&
+        C.photoIdentity == 200 && !C.photoMs && C.cardOpenPending && world.oldHuntsCleared == 1 && !world.settlements,
+        "remote replacement commits one fresh hunt after corpse proof once resources are available");
+
+    for (const auto state : {CONTRACT_DEAD, CONTRACT_PAID})
+    {
+        Reset();
+        g_state = state;
+        RequestContractStart(kGiver);
+        UpdatePendingContractStart();
+        Check(!pendingContractStart.player && g_state == state && C.target == kOldTarget && !world.preflights && !world.clears,
+            "clerk starts cannot bypass corpse submission or earned-payment collection");
+    }
+}
+
+static void EarnedPaymentSettlesBeforeRetryingNewHunt()
+{
+    Reset();
+    g_state = CONTRACT_PAID;
+    C.payoutCents = 10000;
+    world.preflightFailure = static_cast<int>(ContractStartFailure::PedPoolFull);
+    RequestContractStart(0);
+    UpdatePendingContractStart();
+    Check(pendingContractStart.player == kPlayer && g_state == CONTRACT_NONE && !C.target &&
+        world.settlements == 1 && world.paidCents == 10000 && world.paidContractClears == 1 && !world.spawns,
+        "remote replacement settles an already-earned reward before a new hunt that cannot yet start");
+    world.now = pendingContractStart.nextAttemptMs;
+    UpdatePendingContractStart();
+    Check(pendingContractStart.player == kPlayer && world.settlements == 1 && world.paidCents == 10000 &&
+        world.paidContractClears == 1 && world.clears == 1,
+        "a retained startup retry cannot settle the old reward or clean its contract twice");
+    world.preflightFailure = -1;
+    world.now = pendingContractStart.nextAttemptMs;
+    UpdatePendingContractStart();
+    Check(!pendingContractStart.player && g_state == CONTRACT_UNKNOWN && C.target == kNewTarget && C.cardOpenPending &&
+        world.settlements == 1 && world.paidCents == 10000 && world.oldHuntsCleared == 1 && world.spawns == 1,
+        "eventual startup publishes one new hunt while preserving exactly one credit for the previous reward");
+}
+
+static void RemoteReplacementClosesCardBeforeStarting()
+{
+    for (int oldCard = 0; oldCard < 2; ++oldCard)
+    {
+        Reset();
+        Cd.obj = oldCard == 0 ? 99 : 0;
+        world.ownCardTask = oldCard == 1;
+        C.cardOpenPending = true;
+        world.reenterOnCardClose = true;
+        RequestContractStart(0);
+        UpdatePendingContractStart();
+        Check(pendingContractStart.player == kPlayer && !pendingContractStart.attempting && world.cardCloses == 1 &&
+            !Cd.obj && !world.ownCardTask && !C.cardOpenPending && !world.preflights && !world.clears,
+            "remote replacement retires its old card and guards yielding cleanup against recursive startup");
+        UpdatePendingContractStart();
+        Check(!pendingContractStart.player && C.target == kNewTarget && C.cardOpenPending && world.spawns == 1 && world.cardCloses == 1,
+            "the next playable frame creates one bounty and schedules the new card");
+    }
+
+    Reset();
+    Cd.obj = 99;
+    world.changePlayerOnCardClose = true;
+    RequestContractStart(0);
+    UpdatePendingContractStart();
+    Check(!pendingContractStart.player && C.target == kOldTarget && !world.preflights && !world.clears,
+        "player replacement during yielding card cleanup cancels startup without erasing the current hunt");
+}
+
 int main()
 {
     PreparationFailureAndCacheExhaustion();
     PortraitFailureCleanupAndSuccess();
     InterruptedPreparationAndPublication();
     TransientEngineFailuresRetry();
+    RemoteReplacementAfterCorpseProof();
+    EarnedPaymentSettlesBeforeRetryingNewHunt();
+    RemoteReplacementClosesCardBeforeStarting();
     std::printf("Contract start integration: %u checks passed.\n", checks);
 }

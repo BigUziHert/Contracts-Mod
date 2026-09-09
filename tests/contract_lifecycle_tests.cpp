@@ -6,6 +6,7 @@
 #include "../rdr2 scripting environment/samples/Pools/target_ai_logic.h"
 
 using ULONGLONG = std::uint64_t;
+using DWORD = std::uint32_t;
 using Ped = int;
 using Entity = int;
 using Player = int;
@@ -17,6 +18,7 @@ constexpr Object kCash = 88;
 static Player me = 0;
 static Ped pedMe = kPlayer;
 static Prompt giverPrompt = 90, camPrompt = 91;
+static ULONGLONG giverCooldownUntilMs = 0;
 enum ContractState { CONTRACT_NONE, CONTRACT_UNKNOWN, CONTRACT_FOUND, CONTRACT_DEAD, CONTRACT_PAID };
 static ContractState g_state = CONTRACT_NONE;
 static unsigned checks = 0;
@@ -39,6 +41,8 @@ struct ActiveContract
     bool gotWanted = false;
     bool damagedByPlayer = false;
     bool diedBeforeContact = false;
+    bool paymentCredited = false;
+    int payoutCents = 0;
     TargetAI::Memory ai;
     Blip searchBlip = 0, targetBlip = 0;
     Object cashObj = 0;
@@ -68,6 +72,9 @@ static struct World
     unsigned giverPromptResets = 0, cameraPromptResets = 0;
     unsigned lostMessages = 0;
     unsigned foundMessages = 0, foundBlips = 0;
+    unsigned cashCredits = 0, rewardMessages = 0;
+    int cashCreditedCents = 0;
+    bool reenterSettlementOnCardCleanup = false;
     bool playerAvailable = true, paused = false, faded = false, passedGate = false;
     unsigned giverPromptHides = 0, cameraPromptHides = 0, waits = 0;
 } world;
@@ -165,10 +172,16 @@ static void DELETE_OBJECT(Object* object)
 
 static void StopHandoff() { ++world.handoffStops; }
 static void RemoveBlip(Blip& blip) { if (blip) ++world.blipRemovals; blip = 0; }
+static void SettlePayment();
 static void DestroyCardObject(bool cancel)
 {
     Check(cancel, "contract reset requests cancellation of its own inspection");
     ++world.cardCleanups;
+    if (world.reenterSettlementOnCardCleanup)
+    {
+        world.reenterSettlementOnCardCleanup = false;
+        SettlePayment();
+    }
 }
 static void ReleaseTargetPhoto() { ++world.photoReleases; }
 static void RequestOwnedPedCleanup(Ped ped)
@@ -191,10 +204,30 @@ static void CleanupHook() { ++world.cleanupHooks; }
 static void AddFoundBlip() { ++world.foundBlips; }
 static void DisplaySubtitle(const char* message)
 {
+    if (std::strncmp(message, "REWARD RECEIVED: ", 17) == 0)
+    {
+        ++world.rewardMessages;
+        return;
+    }
     const bool lost = std::strcmp(message, "TARGET LOST") == 0;
     Check(lost || std::strcmp(message, "TARGET FOUND") == 0, "discovery and loss use their matching notification");
     if (lost) ++world.lostMessages;
     else ++world.foundMessages;
+}
+
+static void FormatMoney(char* output, std::size_t size, int cents)
+{
+    std::snprintf(output, size, "$%d.%02d", cents / 100, cents % 100);
+}
+namespace MONEY
+{
+static void _MONEY_INCREMENT_CASH_BALANCE(int cents, int reason)
+{
+    Check(reason == 0 && cents == C.payoutCents && C.paymentCredited,
+        "payment marks its credit before calling the native with the earned reward");
+    ++world.cashCredits;
+    world.cashCreditedCents += cents;
+}
 }
 
 namespace PED
@@ -242,6 +275,7 @@ static void Reset()
     world = World();
     playerPos = Vector3();
     g_state = CONTRACT_NONE;
+    giverCooldownUntilMs = 0;
 }
 
 static void TestCrimeRequiresHostileContact()
@@ -405,6 +439,45 @@ static void TestPayoutBoundsAndTiming()
     Check(ComputePayoutCents() == 5000, "law activity after the photo still applies to its frozen hunt time");
 }
 
+static void TestPaymentSettlementIsIdempotent()
+{
+    for (int state = CONTRACT_NONE; state < CONTRACT_PAID; ++state)
+    {
+        Reset();
+        g_state = static_cast<ContractState>(state);
+        C.payoutCents = 10000;
+        SettlePayment();
+        Check(!world.cashCredits && !world.cardCleanups && C.target == kTarget && g_state == state,
+            "idle, active and unsubmitted corpse-proof contracts cannot settle payment");
+    }
+
+    Reset();
+    g_state = CONTRACT_PAID;
+    C.payoutCents = 10000;
+    C.paymentCredited = true;
+    SettlePayment();
+    Check(!world.cashCredits && !world.cardCleanups && g_state == CONTRACT_PAID,
+        "an already-credited contract cannot grant its reward again during cleanup");
+
+    Reset();
+    g_state = CONTRACT_PAID;
+    C.payoutCents = 10000;
+    C.cashObj = kCash;
+    world.cashExists = true;
+    world.reenterSettlementOnCardCleanup = true;
+    SettlePayment();
+    Check(world.cashCredits == 1 && world.cashCreditedCents == 10000 && world.rewardMessages == 1,
+        "settlement credits the earned reward once even when card cleanup re-enters settlement");
+    Check(g_state == CONTRACT_NONE && !C.target && !C.def && !C.paymentCredited && !C.payoutCents &&
+        world.pedReleases == 1 && !world.pedCleanupRequests && world.cashDeletes == 1,
+        "settlement retires the cash prop and releases the completed target before a new contract");
+    Check(giverCooldownUntilMs == world.nowMs + Tune::kGiverCooldownMs,
+        "settlement preserves the clerk cooldown");
+    SettlePayment();
+    Check(world.cashCredits == 1 && world.rewardMessages == 1 && world.cardCleanups == 1 && world.cashDeletes == 1,
+        "later frames cannot duplicate settled payment or cleanup");
+}
+
 static void TestTrailOwnershipAndTransitions()
 {
     Reset();
@@ -554,6 +627,7 @@ int main()
     TestDiscoveryAndDeathBeforeContact();
     TestLawTrackingSurvivesCorpseDisappearance();
     TestPayoutBoundsAndTiming();
+    TestPaymentSettlementIsIdempotent();
     TestTrailOwnershipAndTransitions();
     TestContractCleanupRouting();
     TestLostTargetStateRouting();

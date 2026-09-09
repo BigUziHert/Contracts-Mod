@@ -47,7 +47,7 @@ int main()
     Vector3 point{12.5f, -4.25f, 9.0f};
     StartupTrace::Record("unit_before_native", 0xAABBCCDDu, 88, &point, 7, "test_location");
     const auto first = Read(path).substr(before.size());
-    Check(first.find("trace-v1 build=native-baseline-card-v1 pid=") != std::string::npos, "writer publishes protocol, build and process identity");
+    Check(first.find("trace-v1 build=native-baseline-wander-v3 pid=") != std::string::npos, "writer publishes protocol, build and process identity");
     Check(first.find("session=777 stage=unit_before_native detail=test_location") != std::string::npos, "first stage is readable before any later call or process exit");
     Check(first.find("model=AABBCCDD ped=88 freePeds=7 hasPoint=1 point=12.500,-4.250,9.000") != std::string::npos, "event metadata and signed coordinates survive formatting");
     Check(first.find("owned=77 slot=3 download=-123 photoStage=none") != std::string::npos, "known ownership/photo state is logged without game natives");

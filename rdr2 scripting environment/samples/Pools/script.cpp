@@ -219,7 +219,7 @@ static void WriteStartupTrace(const StartupTrace::Event& event)
 	if (_wfopen_s(&file, path, L"a") != 0 || !file) return;
 	SYSTEMTIME time;
 	GetSystemTime(&time);
-	fprintf(file, "%04u-%02u-%02uT%02u:%02u:%02uZ trace-v1 build=native-baseline-card-v1 pid=%lu session=%llu stage=%s detail=%s model=%08X ped=%d freePeds=%d hasPoint=%d point=%.3f,%.3f,%.3f owned=%d slot=%d download=%d photoStage=%s\n",
+	fprintf(file, "%04u-%02u-%02uT%02u:%02u:%02uZ trace-v1 build=native-baseline-wander-v3 pid=%lu session=%llu stage=%s detail=%s model=%08X ped=%d freePeds=%d hasPoint=%d point=%.3f,%.3f,%.3f owned=%d slot=%d download=%d photoStage=%s\n",
 		time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond,
 		GetCurrentProcessId(), startupTraceSession, event.stage, event.detail, event.model, event.ped,
 		event.freePeds, event.hasPoint ? 1 : 0, event.point.x, event.point.y, event.point.z,
@@ -1460,7 +1460,6 @@ static void StartWander(Ped ped, const ContractDef& def)
 	TASK::SET_PED_PATH_PREFER_TO_AVOID_WATER(ped, true, def.searchRadius);
 	TASK::SET_PED_PATH_MAY_ENTER_WATER(ped, false);
 	TASK::TASK_WANDER_IN_AREA(ped, def.spawn, def.searchRadius, 0.0f, 0.0f, 1);
-	PED::SET_PED_KEEP_TASK(ped, true);
 }
 
 static void SetupHumanTarget(Ped ped, const ContractDef& def)
@@ -2136,7 +2135,8 @@ static void CancelPendingContractStart()
 
 static void RequestContractStart(Ped giver)
 {
-	if (pendingContractStart.player || !PlayerAvailable() || g_state == CONTRACT_DEAD || g_state == CONTRACT_PAID) return;
+	if (pendingContractStart.player || !PlayerAvailable() ||
+		(giver && (g_state == CONTRACT_DEAD || g_state == CONTRACT_PAID))) return;
 	pendingContractStart.player = pedMe;
 	pendingContractStart.giver = giver;
 	DisplaySubtitle(ContractActive() ? "REPLACING CONTRACT" : "PREPARING CONTRACT");
@@ -2145,16 +2145,35 @@ static void RequestContractStart(Ped giver)
 static void UpdatePendingContractStart()
 {
 	if (!pendingContractStart.player || pendingContractStart.attempting) return;
-	if (!PlayerAvailable() || pendingContractStart.player != pedMe || g_state == CONTRACT_DEAD || g_state == CONTRACT_PAID)
+	if (!PlayerAvailable() || pendingContractStart.player != pedMe ||
+		(pendingContractStart.giver && (g_state == CONTRACT_DEAD || g_state == CONTRACT_PAID)))
 	{
 		CancelPendingContractStart();
 		return;
 	}
-	if (handoff.active || Cd.obj || !CanStartInteraction() || HUD::IS_PAUSE_MENU_ACTIVE() || CAMERA::IS_SCREEN_FADED_OUT() ||
+	if (handoff.active || HUD::IS_PAUSE_MENU_ACTIVE() || CAMERA::IS_SCREEN_FADED_OUT() ||
 		ownedPed.cleanupPending || RuntimeNowMs() < pendingContractStart.nextAttemptMs) return;
+	if (!pendingContractStart.giver)
+	{
+		C.cardOpenPending = false;
+		if (Cd.obj || OwnCardTaskRunning())
+		{
+			// U replaces the contract even during inspection. Close only our card
+			// through its existing outro, then recheck eligibility on the next update.
+			pendingContractStart.attempting = true;
+			DestroyCardObject(true);
+			pendingContractStart.attempting = false;
+			if (!PlayerAvailable() || pendingContractStart.player != pedMe) CancelPendingContractStart();
+			return;
+		}
+	}
+	if (Cd.obj || !CanStartInteraction()) return;
 	pendingContractStart.attempting = true;
 	const Ped requestedPlayer = pendingContractStart.player;
 	const Ped giver = pendingContractStart.giver;
+	// Cash already granted by the clerk still belongs to the player. Use the
+	// existing single credit path before replacing its counter-payment state.
+	if (!giver && g_state == CONTRACT_PAID) SettlePayment();
 	const bool ready = StartContract();
 	pendingContractStart.attempting = false;
 	if (!PlayerAvailable() || requestedPlayer != pedMe)
@@ -2271,48 +2290,13 @@ static void StartRemoteContract()
 	UpdatePendingContractStart();
 }
 
-// Keep one U release across this card's put-away outro. Other blocked interactions discard it.
-static Ped remoteRequestPlayer = 0;
-static ULONGLONG remoteRequestUntilMs = 0;
-static Ped remoteCardPlayer = 0;
-static ULONGLONG remoteCardUntilMs = 0;
-static bool ConsumeRemoteContractRequest(bool pressed)
+// One remote request queue owns U through card outros, handoffs and temporary
+// interaction restrictions. I remains the only shortcut for inspecting a bounty.
+static void HandleContractKeys(bool newBounty, bool inspect)
 {
-	ULONGLONG now = RuntimeNowMs();
-	if (!PlayerAvailable() || HUD::IS_PAUSE_MENU_ACTIVE() || CAMERA::IS_SCREEN_FADED_OUT() ||
-		handoff.active || g_state == CONTRACT_PAID || (remoteRequestPlayer && remoteRequestPlayer != pedMe))
-	{
-		remoteRequestPlayer = 0;
-		remoteCardPlayer = 0;
-		return false;
-	}
-	if (Cd.examining && Cd.inspectingPed == pedMe)
-	{
-		remoteCardPlayer = pedMe;
-		remoteCardUntilMs = now + 3000;
-	}
-	bool puttingAway = Cd.examining && Cd.inspectingPed == pedMe &&
-		(TASK::GET_ITEM_INTERACTION_STATE(pedMe) == Card::kStateOutro || !OwnCardTaskRunning());
-	// Remember our inspector briefly: the first U release can arrive after prop retirement.
-	if (remoteCardPlayer == pedMe && now < remoteCardUntilMs && !Cd.obj &&
-		TASK::GET_ITEM_INTERACTION_STATE(pedMe) == Card::kStateOutro)
-		puttingAway = true;
-	if (!Cd.obj && !puttingAway) remoteCardPlayer = 0;
-	bool ready = !Cd.obj && CanStartInteraction();
-	if (pressed && (ready || puttingAway))
-	{
-		remoteRequestPlayer = pedMe;
-		remoteRequestUntilMs = now + 3000;
-	}
-	if (!remoteRequestPlayer) return false;
-	if (now >= remoteRequestUntilMs || (!ready && !puttingAway))
-	{
-		remoteRequestPlayer = 0;
-		return false;
-	}
-	if (!ready) return false;
-	remoteRequestPlayer = 0;
-	return true;
+	if (newBounty) StartRemoteContract();
+	else if (inspect && ContractActive() && !pendingContractStart.player && !handoff.active && !Cd.obj)
+		C.cardOpenPending = true;
 }
 
 void ScriptMain()
@@ -2329,7 +2313,7 @@ void ScriptMain()
 		UpdatePlayer();
 		SetRuntimePaused(!PlayerAvailable() || HUD::IS_PAUSE_MENU_ACTIVE() || CAMERA::IS_SCREEN_FADED_OUT());
 		MaintainPortraitAndCard();
-		bool bypassPressed = ConsumeRemoteContractRequest(IsKeyJustUp(Tune::kBypassClerkKey));
+		bool bypassPressed = IsKeyJustUp(Tune::kBypassClerkKey);
 		bool inspectPressed = IsKeyJustUp(Tune::kInspectCardKey);
 		if (!PlayerAvailable() || (previousPlayer && previousPlayer != pedMe))
 		{
@@ -2352,15 +2336,7 @@ void ScriptMain()
 
 		CheckTargetLost();
 
-		// U bypasses the clerk for a new contract. An unfinished hunt is ended and replaced, the way
-		// End Contract at a clerk would; a photographed corpse keeps its pending reward, so U reopens
-		// that card instead until the clerk has paid.
-		if (bypassPressed && !handoff.active && !Cd.obj && CanStartInteraction())
-		{
-			if (g_state == CONTRACT_NONE || g_state == CONTRACT_UNKNOWN || g_state == CONTRACT_FOUND) StartRemoteContract();
-			else if (ContractActive()) C.cardOpenPending = true;
-		}
-		if (inspectPressed && ContractActive() && !handoff.active && !Cd.obj) C.cardOpenPending = true;
+		HandleContractKeys(bypassPressed, inspectPressed);
 
 		UpdateHandoff();
 		UpdatePendingContractStart();

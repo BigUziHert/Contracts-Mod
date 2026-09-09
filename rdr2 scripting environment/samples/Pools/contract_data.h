@@ -76,7 +76,7 @@ namespace Tune
 	constexpr float kCounterHeight    = 1.0f;    // cash spawns this far above the clerk's feet (drops onto the counter)
 	constexpr DWORD kCashTimeoutMs    = 120000;  // uncollected cash is credited directly after this interval
 	// --- contract card ---
-	constexpr int   kBypassClerkKey   = 0x55;    // U: issue a contract remotely (or inspect an existing contract)
+	constexpr int   kBypassClerkKey   = 0x55;    // U: always request a new bounty, replacing the current one
 	constexpr int   kInspectCardKey   = 0x49;    // 'I' — look at the card again mid-contract (photograph recipe, as Contracts Remastered)
 	constexpr float kCorpsePhotoDistance = 25.0f;
 	constexpr bool  kCardFaceRenderTarget = true;// retain render-target support for compatible props; custom textures draw the normal card face

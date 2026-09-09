@@ -64,11 +64,7 @@ $bountyPatterns = @(
     '(?ms)^static void RequestContractStart\(Ped giver\)\s*\{.*?^\}',
     '(?ms)^static void UpdatePendingContractStart\(\)\s*\{.*?^\}',
     '(?ms)^static void StartRemoteContract\(\)\s*\{.*?^\}',
-    '(?m)^static Ped remoteRequestPlayer[^\r\n]+;',
-    '(?m)^static ULONGLONG remoteRequestUntilMs[^\r\n]+;',
-    '(?m)^static Ped remoteCardPlayer[^\r\n]+;',
-    '(?m)^static ULONGLONG remoteCardUntilMs[^\r\n]+;',
-    '(?ms)^static bool ConsumeRemoteContractRequest\(bool pressed\)\s*\{.*?^\}'
+    '(?ms)^static void HandleContractKeys\(bool newBounty, bool inspect\)\s*\{.*?^\}'
 )
 foreach ($bountyPattern in $bountyPatterns) {
     $bountyMatches = [regex]::Matches($bountySource, $bountyPattern)
@@ -84,6 +80,10 @@ if ($bountyGiver.Count -ne 1 -or [regex]::Matches($bountyGiver[0].Value, 'Reques
 }
 if ([regex]::Matches($bountySource, 'UpdateHandoff\(\);\s*UpdatePendingContractStart\(\);\s*//[^\r\n]*\s*if \(g_state != CONTRACT_PAID\) UpdateGiverPrompt\(\);').Count -ne 1) {
     throw 'Pending starts must run once before giver handling and the existing post-interaction gate.'
+}
+$bountyMain = [regex]::Matches($bountySource, '(?ms)^void ScriptMain\(\)\s*\{.*?^\}')
+if ($bountyMain.Count -ne 1 -or [regex]::Matches($bountyMain[0].Value, 'HandleContractKeys\(bypassPressed, inspectPressed\);').Count -ne 1) {
+    throw 'The main loop must use the tested contract-key dispatch for U and I.'
 }
 [IO.File]::WriteAllText((Join-Path $bountyOutput 'spawn_under_test.h'), ($bountyHeader -join "`r`n"))
 $bountyCommands = @('@echo off', ('call "{0}" >nul' -f $bountyVcVars), 'if errorlevel 1 exit /b 1')

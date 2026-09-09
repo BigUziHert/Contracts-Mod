@@ -11,7 +11,7 @@ New-Item -ItemType Directory -Path $bountyOutput -Force | Out-Null
 $bountySource = [IO.File]::ReadAllText($bountySourcePath)
 $bountyData = [IO.File]::ReadAllText($bountyDataPath)
 $bountyHeader = @('#pragma once', '// Extracted from production source; do not edit.', 'namespace Tune {')
-foreach ($bountyConstant in @('kPayoutMinCents', 'kPayoutMaxCents', 'kFullPayMinutes', 'kWantedPayoutMult', 'kPayoutStepCents', 'kTrailEnableDist')) {
+foreach ($bountyConstant in @('kPayoutMinCents', 'kPayoutMaxCents', 'kFullPayMinutes', 'kWantedPayoutMult', 'kPayoutStepCents', 'kTrailEnableDist', 'kGiverCooldownMs')) {
     $bountyMatches = [regex]::Matches($bountyData, ('constexpr\s+\w+\s+' + $bountyConstant + '\s*=[^;]+;'))
     if ($bountyMatches.Count -ne 1) { throw "Expected exactly one production constant: $bountyConstant" }
     $bountyHeader += $bountyMatches[0].Value
@@ -21,6 +21,7 @@ $bountyPatterns = @(
     '(?ms)^static int ComputePayoutCents\(\)\s*\{.*?^\}',
     '(?ms)^static void UpdateCrimeTracking\(\)\s*\{.*?^\}',
     '(?ms)^static void ClearContract\(bool deleteTarget\)\s*\{.*?^\}',
+    '(?ms)^static void SettlePayment\(\)\s*\{.*?^\}',
     '(?ms)^static void CheckTargetLost\(\)\s*\{.*?^\}',
     '(?ms)^static void UpdateTrails\(\)\s*\{.*?^\}',
     '(?ms)^static void CheckTargetFound\(\)\s*\{.*?^\}'

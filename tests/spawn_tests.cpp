@@ -73,7 +73,8 @@ static struct World
     bool paused = false;
     bool faded = false;
     bool ownCardTask = false;
-    Hash itemState = 0;
+    unsigned cardCloses = 0, paymentSettlements = 0;
+    bool cardCloseLeavesOutro = false;
     unsigned pauseFrame = std::numeric_limits<unsigned>::max();
     unsigned resumeFrame = std::numeric_limits<unsigned>::max();
     unsigned interactionBlockedFrame = std::numeric_limits<unsigned>::max();
@@ -126,7 +127,6 @@ static Ped PLAYER_PED_ID() { return world.playerId; }
 
 namespace HUD { static bool IS_PAUSE_MENU_ACTIVE() { return world.paused; } }
 namespace CAMERA { static bool IS_SCREEN_FADED_OUT() { return world.faded; } }
-namespace TASK { static Hash GET_ITEM_INTERACTION_STATE(Ped) { return world.itemState; } }
 
 namespace STREAMING
 {
@@ -266,6 +266,8 @@ static void UpdatePlayer();
 static bool CanStartInteraction();
 static bool ContractActive();
 static bool StartContract();
+static void DestroyCardObject(bool cancelInspection = false);
+static void SettlePayment();
 static bool BeginHandoff(Ped giver, bool payout);
 struct GiverSpot {};
 static const GiverSpot* FindGiverSpot(Ped giver)
@@ -280,14 +282,38 @@ static void LogOwnedPedCleanup(const char*) {}
 
 #include "spawn_under_test.h"
 
-static bool ContractActive() { return world.contractActive; }
+static bool ContractActive()
+{
+    return world.contractActive || g_state == CONTRACT_UNKNOWN || g_state == CONTRACT_FOUND || g_state == CONTRACT_DEAD;
+}
+static void DestroyCardObject(bool cancelInspection)
+{
+    Check(cancelInspection && pendingContractStart.player && pendingContractStart.attempting,
+        "remote replacement retires its own inspection while its request is protected from reentry");
+    const unsigned starts = world.contractStarts;
+    UpdatePendingContractStart();
+    Check(world.contractStarts == starts, "card-close yielding cannot reenter pending preparation");
+    ++world.cardCloses;
+    WAIT(0);
+    Cd = {};
+    world.ownCardTask = false;
+    world.interactionAllowed = !world.cardCloseLeavesOutro;
+}
+static void SettlePayment()
+{
+    Check(g_state == CONTRACT_PAID, "remote replacement settles only an already-approved payment");
+    ++world.paymentSettlements;
+    C = {};
+    world.contractActive = false;
+    g_state = CONTRACT_NONE;
+}
 static void UpdatePlayer()
 {
     Check(world.frame > 0, "remote start refreshes its snapshot after the fresh-frame yield");
     ++world.playerRefreshes;
     pedMe = PLAYER::PLAYER_PED_ID();
 }
-static bool CanStartInteraction() { return PlayerAvailable() && world.interactionAllowed; }
+static bool CanStartInteraction() { return PlayerAvailable() && world.interactionAllowed && !world.ownCardTask; }
 static bool StartContract()
 {
     Check(CanStartInteraction() && !world.paused && !world.faded && !Cd.obj && !handoff.active && !ownedPed.cleanupPending,
@@ -341,10 +367,6 @@ static void Reset()
     g_state = CONTRACT_NONE;
     photoSlotsBound = 0;
     pausedDurationMs = pauseStartedMs = 0;
-    remoteRequestPlayer = 0;
-    remoteRequestUntilMs = 0;
-    remoteCardPlayer = 0;
-    remoteCardUntilMs = 0;
     ownedPed = OwnedPedRuntime();
     ownedPedsCreated = ownedPedsDeleted = ownedPedsReleased = 0;
     lastStartFailure = ContractStartFailure::None;
@@ -657,7 +679,7 @@ static void TestPendingStartGuardsAndCancellation()
         Check(world.contractStarts == 2 && C.cardOpenPending && !pendingContractStart.player,
             "the same request resumes after its temporary blocker clears");
     }
-    for (int cancelled = 0; cancelled < 6; ++cancelled)
+    for (int cancelled = 0; cancelled < 4; ++cancelled)
     {
         Reset(); world.locationFailures = 1;
         RequestContractStart(0); UpdatePendingContractStart();
@@ -667,13 +689,11 @@ static void TestPendingStartGuardsAndCancellation()
         case 0: world.playerAlive = false; break;
         case 1: world.playerDying = true; break;
         case 2: world.playerId = pedMe = 99; break;
-        case 3: g_state = CONTRACT_DEAD; break;
-        case 4: g_state = CONTRACT_PAID; break;
-        case 5: CancelPendingContractStart(); break; // Explicit End Contract routing is asserted by the runner.
+        case 3: CancelPendingContractStart(); break; // Explicit End Contract routing is asserted by the runner.
         }
         UpdatePendingContractStart();
         Check(world.contractStarts == 1 && !pendingContractStart.player && !C.cardOpenPending && world.failureReports == 0,
-            "death, player change, proof, payment and explicit cancellation cannot start a queued replacement");
+            "death, player change and explicit cancellation cannot start a queued replacement");
         world.playerAlive = true; world.playerDying = false; world.playerId = pedMe = kPlayer; g_state = CONTRACT_NONE;
         UpdatePendingContractStart();
         Check(world.contractStarts == 1, "cancelled work cannot resume when the old blocker later disappears");
@@ -832,68 +852,115 @@ static void TestContractPreflight()
         "one free slot permits preparation with the optional breadcrumb sink disabled");
 }
 
-static void TestDeferredRemoteInput()
+static void TestContractKeyDispatch()
 {
-    Reset();
-    Check(ConsumeRemoteContractRequest(true), "idle U is consumed immediately");
-    Check(!ConsumeRemoteContractRequest(false), "one release cannot start twice");
-
-    Cd = { 123, true, kPlayer };
-    world.ownCardTask = true;
-    world.itemState = Card::kStateOutro;
-    world.interactionAllowed = false;
-    Check(!ConsumeRemoteContractRequest(true) && remoteRequestPlayer == kPlayer,
-        "U during owned card outro is retained while its prop exists");
-    world.nowMs += 400; // well beyond keyboard.cpp's 100 ms release window
-    Check(!ConsumeRemoteContractRequest(false), "pending request waits for the outro");
-    Cd = {};
-    Check(!ConsumeRemoteContractRequest(false) && remoteRequestPlayer == kPlayer,
-        "prop retirement does not discard U while the native outro still runs");
-    world.itemState = 0;
-    world.interactionAllowed = true;
-    Check(ConsumeRemoteContractRequest(false), "the stored release runs after prop and task retirement");
-    Check(!ConsumeRemoteContractRequest(false), "the stored release runs exactly once");
-
-    Reset();
-    Cd = { 123, true, kPlayer };
-    world.ownCardTask = true;
-    world.interactionAllowed = false;
-    Check(!ConsumeRemoteContractRequest(false), "own inspection is observed before prop retirement");
-    Cd = {};
-    world.itemState = Card::kStateOutro;
-    Check(!ConsumeRemoteContractRequest(true) && remoteRequestPlayer == kPlayer,
-        "a first U release after prop retirement still queues during our remembered outro");
-    world.itemState = 0;
-    world.interactionAllowed = true;
-    Check(ConsumeRemoteContractRequest(false), "post-retirement first release runs when the native outro finishes");
-
-    for (int cancel = 0; cancel < 6; ++cancel)
+    for (int state = CONTRACT_NONE; state <= CONTRACT_PAID; ++state)
     {
         Reset();
-        Cd = { 123, true, kPlayer };
-        world.itemState = Card::kStateOutro;
-        world.ownCardTask = true;
-        world.interactionAllowed = false;
-        Check(!ConsumeRemoteContractRequest(true) && remoteRequestPlayer, "cancellation test queues one outro release");
-        if (cancel == 0) world.paused = true;
-        if (cancel == 1) world.faded = true;
-        if (cancel == 2) { world.playerId = 99; pedMe = 99; }
-        if (cancel == 3) world.nowMs += 3000;
-        if (cancel == 4) handoff.active = true;
-        if (cancel == 5) g_state = CONTRACT_PAID;
-        Check(!ConsumeRemoteContractRequest(false) && !remoteRequestPlayer,
-            "pause, fade, player change, expiry, handoff and payment cancel a queued request");
+        g_state = static_cast<ContractState>(state);
+        HandleContractKeys(true, false);
+        Check(world.contractStarts == 1 && g_state == CONTRACT_UNKNOWN && C.cardOpenPending && !pendingContractStart.player,
+            "U creates a fresh contract in every lifecycle state, including photographed and pending payment");
+        Check(world.paymentSettlements == (state == CONTRACT_PAID ? 1u : 0u),
+            "U settles approved payment once and never awards an unsubmitted corpse photograph");
+        C.cardOpenPending = false;
+        HandleContractKeys(false, false);
+        UpdatePendingContractStart();
+        Check(world.contractStarts == 1 && !C.cardOpenPending,
+            "a consumed U release neither creates another bounty nor reopens its card");
+
+        Reset();
+        g_state = static_cast<ContractState>(state);
+        HandleContractKeys(false, true);
+        Check(!world.contractStarts && !pendingContractStart.player &&
+            C.cardOpenPending == (state == CONTRACT_UNKNOWN || state == CONTRACT_FOUND || state == CONTRACT_DEAD),
+            "I only inspects an existing active contract and never requests another bounty");
     }
-    Reset();
-    world.interactionAllowed = false;
-    Check(!ConsumeRemoteContractRequest(true) && !remoteRequestPlayer, "other blocked interactions do not queue U");
-    Reset();
-    Cd = { 123, true, kPlayer };
-    world.ownCardTask = true;
-    Check(!ConsumeRemoteContractRequest(true) && !remoteRequestPlayer, "ordinary inspection requires put-away before replacing");
+
     Reset();
     g_state = CONTRACT_DEAD;
-    Check(ConsumeRemoteContractRequest(true), "a photographed contract retains the existing U reopen path");
+    world.interactionAllowed = false;
+    HandleContractKeys(true, true);
+    Check(pendingContractStart.player == kPlayer && !C.cardOpenPending && !world.contractStarts,
+        "simultaneous U and I retain only the new-bounty request instead of reopening the old card");
+    const unsigned frame = world.frame;
+    HandleContractKeys(true, true);
+    HandleContractKeys(false, true);
+    Check(world.frame == frame && !C.cardOpenPending && world.messages.size() == 1,
+        "repeated U coalesces with pending preparation and I cannot reopen the previous card");
+    world.nowMs += 30000;
+    UpdatePendingContractStart();
+    Check(!world.contractStarts && !world.cardCloses && pendingContractStart.player == kPlayer,
+        "foreign interaction waits do not clear another task or expire the requested bounty");
+    world.interactionAllowed = true;
+    UpdatePendingContractStart();
+    Check(world.contractStarts == 1 && C.cardOpenPending && !pendingContractStart.player,
+        "the original U request completes once the foreign interaction ends");
+
+    Reset();
+    g_state = CONTRACT_FOUND;
+    Cd = { 123, true, kPlayer };
+    world.ownCardTask = true;
+    world.cardCloseLeavesOutro = true;
+    C.cardOpenPending = true;
+    HandleContractKeys(true, false);
+    Check(world.cardCloses == 1 && !Cd.obj && !C.cardOpenPending && !world.contractStarts &&
+        pendingContractStart.player == kPlayer && !pendingContractStart.attempting,
+        "U actively closes this mod's open card and retains one request through its native outro");
+    world.nowMs += 30000;
+    HandleContractKeys(true, false);
+    UpdatePendingContractStart();
+    Check(world.cardCloses == 1 && !world.contractStarts && pendingContractStart.player == kPlayer,
+        "the retired prop is not closed repeatedly while the native outro still blocks interaction");
+    world.interactionAllowed = true;
+    UpdatePendingContractStart();
+    Check(world.contractStarts == 1 && C.cardOpenPending && !pendingContractStart.player,
+        "one new contract opens after the previous inspection is fully retired");
+
+    Reset();
+    g_state = CONTRACT_FOUND;
+    Cd = { 123, true, kPlayer };
+    world.ownCardTask = true;
+    world.playerChangeFrame = 2; // Fresh-frame remote yield, then owned card cancellation yield.
+    HandleContractKeys(true, false);
+    Check(world.cardCloses == 1 && !world.contractStarts && !pendingContractStart.player && !C.cardOpenPending,
+        "player replacement during the yielding card close cancels the old player's bounty request");
+
+    for (ContractState completed : {CONTRACT_DEAD, CONTRACT_PAID})
+    {
+        Reset();
+        g_state = completed;
+        RequestContractStart(kGiver);
+        Check(!pendingContractStart.player && !world.contractStarts,
+            "clerk requests cannot discard a photographed contract or skip pending payment");
+        g_state = CONTRACT_NONE;
+        world.locationFailures = 1;
+        RequestContractStart(kGiver); UpdatePendingContractStart();
+        g_state = completed;
+        world.nowMs = pendingContractStart.nextAttemptMs;
+        UpdatePendingContractStart();
+        Check(!pendingContractStart.player && world.contractStarts == 1 && !world.paymentSettlements,
+            "an existing clerk request still cancels when proof or payment becomes pending");
+    }
+
+    Reset();
+    g_state = CONTRACT_DEAD;
+    handoff.active = true;
+    Cd = { 123, false, 0 };
+    HandleContractKeys(true, false);
+    Check(pendingContractStart.player == kPlayer && !world.contractStarts && !world.cardCloses,
+        "U during clerk handover queues the next bounty without deleting the handover prop");
+    handoff.active = false;
+    Cd = {};
+    g_state = CONTRACT_PAID; // The same handover completes before the next frame's request pump.
+    world.locationFailures = 1;
+    UpdatePendingContractStart();
+    Check(world.paymentSettlements == 1 && world.contractStarts == 1 && pendingContractStart.player,
+        "completed handover payment settles before preparing the queued bounty");
+    world.nowMs = pendingContractStart.nextAttemptMs;
+    UpdatePendingContractStart();
+    Check(world.paymentSettlements == 1 && world.contractStarts == 2 && !pendingContractStart.player && C.cardOpenPending,
+        "a preparation retry cannot credit the previous contract payment twice");
 }
 
 int main()
@@ -917,6 +984,6 @@ int main()
     TestPendingCleanupAndGiverDelivery();
     TestPauseDuringWait();
     TestContractPreflight();
-    TestDeferredRemoteInput();
+    TestContractKeyDispatch();
     std::printf("All %u spawn checks passed (actual production functions).\n", checks);
 }
