@@ -10,8 +10,7 @@ New-Item -ItemType Directory -Path $bountyOutput -Force | Out-Null
 $bountySource = [IO.File]::ReadAllText($bountySourcePath)
 $bountyHeader = @('#pragma once', '// Extracted production search-area behavior; do not edit.')
 foreach ($bountyPattern in @(
-    '(?ms)^static void AddSearchBlip\(\)\s*\{.*?^\}',
-    '(?ms)^static void UpdateSearchArea\(\)\s*\{.*?^\}'
+    '(?ms)^static void AddSearchBlip\(\)\s*\{.*?^\}'
 )) {
     $bountyMatches = [regex]::Matches($bountySource, $bountyPattern)
     if ($bountyMatches.Count -ne 1) { throw "Expected exactly one production search function matching: $bountyPattern" }
@@ -22,10 +21,10 @@ foreach ($bountyPattern in @(
 $bountyMain = [regex]::Matches($bountySource, '(?ms)^void ScriptMain\(\)\s*\{.*?^\}')
 if ($bountyMain.Count -ne 1) { throw 'Expected exactly one ScriptMain for search-area integration.' }
 $bountyTail = [regex]::Matches($bountyMain[0].Value,
-    '(?s)(?<calls>UpdateSearchArea\(\);\s*TraceCardInspection\(\);\s*UpdateRoutineDebug\(\);\s*UpdateCard\(\);[^\r\n]*\s*WAIT\(0\);)\s*\}\s*\}$')
-if ($bountyTail.Count -ne 1) { throw 'Search-area update must precede inspection trace and the protected debug/card/WAIT tail.' }
-if ([regex]::Matches($bountyMain[0].Value, 'UpdateSearchArea\(\);').Count -ne 1) {
-    throw 'Expected exactly one search-area update in ScriptMain.'
+    '(?s)(?<calls>TraceCardInspection\(\);\s*UpdateCard\(\);[^\r\n]*\s*WAIT\(0\);)\s*\}\s*\}$')
+if ($bountyTail.Count -ne 1) { throw 'The frame must retain the inspection trace, card update, and zero-delay yield.' }
+if ([regex]::Matches($bountyMain[0].Value, 'UpdateSearchArea\(\);').Count -ne 0) {
+    throw 'Static native contract search circles must not follow daily-routine destinations.'
 }
 $bountyHeader += 'static void RunProductionSearchFrameTail() {'
 $bountyHeader += $bountyTail[0].Groups['calls'].Value

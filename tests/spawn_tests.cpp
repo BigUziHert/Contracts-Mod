@@ -12,7 +12,7 @@ using Hash = std::uint32_t;
 using Ped = int;
 struct Vector3 { float x, y, z; };
 #include "../rdr2 scripting environment/samples/Pools/startup_trace.h"
-
+#include "spawn_hash_under_test.h"
 constexpr Hash kModel = 1234;
 constexpr Ped kPlayer = 42;
 constexpr Ped kSpawnedPed = 77;
@@ -62,6 +62,8 @@ static struct World
     bool missionOwned = false;
     unsigned missionClaims = 0;
     unsigned outfits = 0;
+    unsigned randomOutfits = 0, presetOutfits = 0;
+    int lastPreset = -1;
     unsigned placements = 0;
     unsigned deletes = 0;
     bool deleteSucceeds = true;
@@ -126,9 +128,6 @@ namespace HUD { static bool IS_PAUSE_MENU_ACTIVE() { return world.paused; } }
 namespace CAMERA { static bool IS_SCREEN_FADED_OUT() { return world.faded; } }
 namespace TASK { static Hash GET_ITEM_INTERACTION_STATE(Ped) { return world.itemState; } }
 
-// Only the hash constant is needed here; the production compile verifies the full Joaat table.
-constexpr Hash Joaat(const char*) { return 0x13AA268C; }
-
 namespace STREAMING
 {
 static bool IS_MODEL_VALID(Hash model) { return model == kModel && world.modelValid; }
@@ -190,6 +189,8 @@ static void PLACE_ENTITY_ON_GROUND_PROPERLY(Ped ped, int flags)
 {
     Check(ped == kSpawnedPed && world.spawnedAlive && world.missionOwned && world.modelHeld && flags == 1,
         "ground placement only processes the live owned ped");
+    Check(world.outfits == world.placements + 1,
+        "each ped's appearance is initialized before placement and returning it for portrait capture");
     ++world.placements;
 }
 }
@@ -234,6 +235,13 @@ static void _SET_RANDOM_OUTFIT_VARIATION(Ped ped, bool)
     Check(ped == kSpawnedPed && world.spawnedAlive && world.missionOwned && world.modelHeld,
         "outfit initialization only processes the live owned ped");
     ++world.outfits;
+    ++world.randomOutfits;
+}
+[[maybe_unused]] static void _EQUIP_META_PED_OUTFIT_PRESET(Ped ped, int preset, bool p2)
+{
+    Check(ped == kSpawnedPed && world.spawnedAlive && world.missionOwned && world.modelHeld && !p2,
+        "routine appearance is applied once to the owned ped before model release");
+    ++world.outfits; ++world.presetOutfits; world.lastPreset = preset;
 }
 static void DELETE_PED(Ped* ped)
 {
@@ -343,6 +351,15 @@ static void Reset()
 }
 
 static Ped Spawn() { return SpawnPed(kModel, Vector3{ 1.0f, 2.0f, 3.0f }); }
+
+static void TestNativeAppearance()
+{
+    Reset();
+    Check(Spawn() == kSpawnedPed && world.randomOutfits == 1 && world.presetOutfits == 0,
+        "native target spawning selects one random appearance before its portrait");
+    Check(world.outfits == 1 && world.placements == 1 && world.releases == 1,
+        "random appearance retains ordinary ground placement and model cleanup");
+}
 
 static void CheckReleased()
 {
@@ -887,6 +904,7 @@ int main()
         static_cast<int>(ContractStartFailure::PedPoolFull) == 6,
         "pool exhaustion is appended without changing existing diagnostic codes");
     TestWaitPredicate();
+    TestNativeAppearance();
     TestDelayedCreation();
     TestStaleHandleAndBoundedFailure();
     TestPendingHandleAndPoolCapacity();

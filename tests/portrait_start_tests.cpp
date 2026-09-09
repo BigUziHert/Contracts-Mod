@@ -46,11 +46,9 @@ static struct World
     bool collision = true;
     bool visible = true;
     bool acceptedPhoto = false;
-    bool destinationValid = true, placementValid = true, groundPlacement = true;
+    bool groundPlacement = true;
     bool interruptPlacement = false, losePlacementTarget = false;
-    bool interactionAllowed = true, blockDuringPlacement = false;
-    bool delayCleanup = false, cleanupRequested = false, identityMatches = true, loseOwnership = false;
-    unsigned now = 1000, placementReadyAt = 0;
+    bool delayCleanup = false, cleanupRequested = false, identityMatches = true;
     unsigned frame = 0;
     unsigned spawns = 0;
     unsigned releases = 0;
@@ -140,6 +138,8 @@ static bool PLACE_ENTITY_ON_GROUND_PROPERLY(Ped ped, int)
     Check(world.identityMatches, "ground placement never touches an actor whose ownership changed");
     Check(!world.visible && world.collision && !world.frozen, "settling has physics and collision while the target stays hidden");
     ++world.placements;
+    if (world.interruptPlacement) world.playerId = 99;
+    if (world.losePlacementTarget) world.targetExists = false;
     return world.groundPlacement;
 }
 }
@@ -214,34 +214,6 @@ static void RequestOwnedPedCleanup(Ped ped)
 }
 
 static void LogContractStartFailure(Hash model, int attempt);
-namespace RoutineSpawn
-{
-static struct { const char* check = "none"; } diagnostic;
-static bool Reject(const char* check) { diagnostic.check = check; return false; }
-}
-static bool ValidateRoutineDeployment(Ped, const ContractDef&)
-{
-    if (!world.interactionAllowed) return RoutineSpawn::Reject("interaction_interrupted");
-    return world.destinationValid || RoutineSpawn::Reject("collision_or_nav_unloaded");
-}
-static bool ValidateRoutinePlacement(Ped, const ContractDef&) { return world.placementValid && world.now >= world.placementReadyAt; }
-static bool CanStartInteraction() { return world.playerAlive && world.playerId == pedMe && world.interactionAllowed; }
-static ULONGLONG GetTickCount64() { return world.now; }
-template<typename Predicate> static bool WaitUntil(DWORD timeout, Predicate predicate)
-{
-    const unsigned start = world.now;
-    while (world.playerAlive)
-    {
-        if (predicate()) return true;
-        if (world.now - start >= timeout) return false;
-        world.now += 16;
-        if (world.interruptPlacement) world.playerAlive = false;
-        if (world.blockDuringPlacement) world.interactionAllowed = false;
-        if (world.losePlacementTarget) world.targetExists = false;
-        if (world.loseOwnership) world.identityMatches = false;
-    }
-    return false;
-}
 #include "portrait_start_under_test.h"
 
 static void LogContractStartFailure(Hash model, int attempt)
@@ -252,8 +224,6 @@ static void LogContractStartFailure(Hash model, int attempt)
 static void Reset(std::vector<CaptureResult> results)
 {
     world = World();
-    routineStartDiagnostic = {};
-    RoutineSpawn::diagnostic = {};
     world.results = results;
     pedMe = kPlayer;
     lastStartFailure = ContractStartFailure::None;
@@ -295,62 +265,28 @@ int main()
     CheckReady();
 
     Reset({ CaptureResult::Success });
-    world.destinationValid = false;
-    Check(Prepare() == 0 && lastStartFailure == ContractStartFailure::LocationUnavailable,
-        "destination disappearing during portrait refuses deployment");
-    CheckFailed(1);
-    Reset({ CaptureResult::Success });
-    world.interactionAllowed = false;
-    Check(Prepare() == 0 && PlayerAvailable() && lastStartFailure == ContractStartFailure::Interrupted,
-        "pause, fade, mounting or combat before deployment reports interruption with a living player");
-    CheckFailed(1);
-
-    Reset({ CaptureResult::Success });
-    world.placementReadyAt = 1120; world.blockDuringPlacement = true;
-    Check(Prepare() == 0 && PlayerAvailable() && lastStartFailure == ContractStartFailure::Interrupted && world.teleports == 1 && world.reveals == 0,
-        "a blocked interaction during settling reports interruption rather than an unavailable location");
-    Check(world.deletes == 1 && world.releases == 1, "settling interruption cleans up its hidden subject and portrait");
-
-    Reset({ CaptureResult::Success });
-    world.placementValid = false;
-    Check(Prepare() == 0 && world.teleports == 1 && world.reveals == 0 && world.deletes == 1 && world.releases == 1,
-        "failed placement cleans up while hidden without exposing a broken target");
-    Check(world.now < 2516 && world.placements <= 15, "settling timeout and native retries stay bounded");
-
-    Reset({ CaptureResult::Success });
-    world.placementValid = false; world.delayCleanup = true;
-    Check(Prepare() == 0 && world.targetExists && world.cleanupRequested && world.deletes == 0 && world.releases == 1,
-        "deferred placement-failure deletion remains tracked while the portrait is released");
-    Check(world.frozen && !world.collision && !world.visible,
-        "failed placement makes the owned hidden target inert before deferred cleanup");
-
-    Reset({ CaptureResult::Success });
-    world.placementValid = false; world.loseOwnership = true;
-    Check(Prepare() == 0 && world.targetExists && world.cleanupRequested && world.deletes == 0 && world.releases == 1,
-        "changed ownership prevents deletion or physics changes during placement-failure cleanup");
-    Check(world.placements == 1, "changed ownership also stops further placement attempts");
-
-    Reset({ CaptureResult::Success });
     world.groundPlacement = false;
-    Check(Prepare() == kTarget && !routineStartDiagnostic.placementResult,
-        "a false placement return alone cannot reject verified actual geometry");
+    Check(Prepare() == kTarget,
+        "native baseline does not add schedule geometry restrictions to ground placement");
     CheckReady();
 
     Reset({ CaptureResult::Success });
-    world.placementReadyAt = 1120;
-    Check(Prepare() == kTarget && world.now >= 1120 && world.teleports == 1 && world.placements == 3 && world.reveals == 1,
-        "delayed physics settles across bounded native retries without another teleport or early reveal");
-
-    Reset({ CaptureResult::Success });
-    world.placementReadyAt = 1120; world.interruptPlacement = true;
+    world.interruptPlacement = true;
     Check(Prepare() == 0 && lastStartFailure == ContractStartFailure::Interrupted && world.reveals == 0 && world.deletes == 1 && world.releases == 1,
-        "player loss during settling cleans up rather than exposing the provisional target");
+        "player replacement during native placement cleans up before revealing the subject");
+    Check(world.teleports == 1 && world.placements == 1, "placement remains a single native operation");
 
     Reset({ CaptureResult::Success });
-    world.placementReadyAt = 1120; world.losePlacementTarget = true;
-    Check(Prepare() == 0 && world.reveals == 0 && world.deletes == 0 && world.releases == 1,
-        "subject loss during settling never sends another ground task or reveals a vanished ped");
+    world.interruptPlacement = true; world.delayCleanup = true;
+    Check(Prepare() == 0 && world.targetExists && world.cleanupRequested && world.deletes == 0 && world.releases == 1,
+        "deferred cleanup still owns the failed provisional target after native deployment");
+    Check(world.frozen && !world.collision && !world.visible,
+        "interrupted deployment keeps its hidden target inert until cleanup succeeds");
 
+    Reset({ CaptureResult::Success });
+    world.losePlacementTarget = true;
+    Check(Prepare() == 0 && world.reveals == 0 && world.deletes == 0 && world.releases == 1,
+        "subject loss during native placement never reveals a vanished ped");
     Reset({ CaptureResult::Failure, CaptureResult::Success });
     Check(Prepare() == kTarget, "retry success returns the original target");
     Check(world.subjects.size() == 2 && world.subjects[0] == world.subjects[1] && world.spawns == 1,

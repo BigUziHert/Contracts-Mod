@@ -1,5 +1,48 @@
 # Contract inspection framing investigation — 2026-09-07
 
+## Update: weapon put-away reproduction
+
+The owner reproduced the out-of-frame card by pressing **U** while holding a
+knife or gun: inspection began while the player was still putting the weapon
+away. `OpenCard` previously admitted drawn weapons and started the item task
+without waiting for that transition.
+
+`PreparePlayerForCard` now checks both weapon hand slots, requests animated
+holstering once with `_HIDE_PED_WEAPONS(ped, 2, false)`, and waits for empty/unarmed
+hands and no `_IS_WEAPON_HOLSTER_STATE_CHANGING` for 150 ms. Already-running weapon
+transitions finish before a holster request is issued. The wait is bounded at
+four seconds and aborts if the player becomes unavailable, interaction eligibility
+changes, or a carried entity occupies their hands. Carried entities are not dropped.
+An initially empty-handed player opens immediately.
+
+The gate runs before card creation, after potentially yielding model streaming,
+and before the fallback inspection task. It covers both **U** opens and **I**
+reopens through their shared `OpenCard` path. The current contract survives a
+failed open and can be inspected with **I** after clearing the interruption.
+
+The hand reads use `GET_CURRENT_PED_WEAPON(ped, &hash, true, slot, false)` for
+slots 0 and 1, matching the local build-1491.50 `treasure_hunter.c:2025–2060`.
+`beat_booby_trap.c:4228` also waits for the holster-state change to finish before
+acting on an unarmed hand. No camera or pose correction is added.
+
+Restart RDR2 with the updated `dist/TestScript.asi`, then try **U** and **I** with
+a knife, handgun, long gun, dual guns, and empty hands from both camera views.
+The weapon should finish being put away before inspection begins. Check framing,
+flip, and put-away, then repeat during a manual holster. This fix addresses the
+reported overlap; correct rendered framing still requires that in-game check.
+
+The Release/x64 build completed with zero warnings/errors, with `OutDir` set to
+workspace `dist/` and intermediates under `tmp/Release-x64/`. This ASI is 342,016
+bytes, SHA-256 `ABCFCDC4B9749EB4FFCC7B17F28E91E07D58D19971CCE67660E3CE698892AD97`.
+The 25 existing regression suites passed. The new card-start suite also passed
+29,125 checks with `/W4 /WX`, exercising the extracted production readiness
+helpers and `OpenCard`: early unarmed hashes, delayed animations, both hand slots,
+timeouts, interruptions, model-streaming changes, and both inspection paths.
+These simulated natives establish task ordering, not rendered framing. No game
+deployment was performed.
+
+## Earlier investigation
+
 The owner reported that the physical contract card could remain off to the right
 through repeated opens, occasionally correcting itself. After the `e473cde` build,
 the supplied screenshot showed active Zoom / Flip / Put Away prompts with the

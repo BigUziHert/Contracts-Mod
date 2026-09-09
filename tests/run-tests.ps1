@@ -31,6 +31,7 @@ $bountyCommandFile = Join-Path $bountyOutput 'run-tests.cmd'
 if ($LASTEXITCODE -ne 0) { throw 'Regression tests failed.' }
 & (Join-Path $PSScriptRoot 'run-card-texture-tests.ps1') -VisualStudio $VisualStudio
 & (Join-Path $PSScriptRoot 'run-card-inspection-camera-tests.ps1') -VisualStudio $VisualStudio
+& (Join-Path $PSScriptRoot 'run-card-start-tests.ps1') -VisualStudio $VisualStudio
 & (Join-Path $PSScriptRoot 'run-spawn-tests.ps1') -VisualStudio $VisualStudio
 & (Join-Path $PSScriptRoot 'run-portrait-start-tests.ps1') -VisualStudio $VisualStudio
 & (Join-Path $PSScriptRoot 'run-portrait-cache-tests.ps1') -VisualStudio $VisualStudio
@@ -38,16 +39,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Regression tests failed.' }
 & (Join-Path $PSScriptRoot 'run-photo-self-test-tests.ps1') -VisualStudio $VisualStudio
 & (Join-Path $PSScriptRoot 'run-target-ai-bridge-tests.ps1') -VisualStudio $VisualStudio
 & (Join-Path $PSScriptRoot 'run-contract-lifecycle-tests.ps1') -VisualStudio $VisualStudio
-& (Join-Path $PSScriptRoot 'run-routine-spawn-tests.ps1') -VisualStudio $VisualStudio
-& (Join-Path $PSScriptRoot 'run-routine-logic-tests.ps1') -VisualStudio $VisualStudio
-& (Join-Path $PSScriptRoot 'run-routine-plan-tests.ps1') -VisualStudio $VisualStudio
-& (Join-Path $PSScriptRoot 'run-routine-activity-tests.ps1') -VisualStudio $VisualStudio
-& (Join-Path $PSScriptRoot 'run-routine-activity-bridge-tests.ps1') -VisualStudio $VisualStudio
-& (Join-Path $PSScriptRoot 'run-routine-runtime-tests.ps1') -VisualStudio $VisualStudio
-& (Join-Path $PSScriptRoot 'run-routine-card-tests.ps1') -VisualStudio $VisualStudio
-& (Join-Path $PSScriptRoot 'run-routine-debug-view-tests.ps1') -VisualStudio $VisualStudio
-& (Join-Path $PSScriptRoot 'run-routine-debug-blips-tests.ps1') -VisualStudio $VisualStudio
-& (Join-Path $PSScriptRoot 'run-routine-debug-bridge-tests.ps1') -VisualStudio $VisualStudio
+# The retired daily-routine modules are not part of this native ambient build.
 & (Join-Path $PSScriptRoot 'run-startup-trace-writer-tests.ps1') -VisualStudio $VisualStudio
 & (Join-Path $PSScriptRoot 'run-search-area-tests.ps1') -VisualStudio $VisualStudio
 & (Join-Path $PSScriptRoot 'run-contract-start-tests.ps1') -VisualStudio $VisualStudio

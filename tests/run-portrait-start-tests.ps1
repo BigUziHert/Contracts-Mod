@@ -7,7 +7,6 @@ $bountyRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $bountyOutput = Join-Path $bountyRoot 'tmp\tests'
 $bountySourcePath = Join-Path $bountyRoot 'rdr2 scripting environment\samples\Pools\script.cpp'
 $bountyDataPath = Join-Path $bountyRoot 'rdr2 scripting environment\samples\Pools\contract_data.h'
-$bountyRoutinePath = Join-Path $bountyRoot 'rdr2 scripting environment\samples\Pools\routine_runtime.h'
 $bountyVcVars = Join-Path $VisualStudio 'VC\Auxiliary\Build\vcvars64.bat'
 if (-not (Test-Path -LiteralPath $bountyVcVars)) {
     throw 'Visual Studio C++ tools not found; pass -VisualStudio with your installation directory.'
@@ -33,16 +32,6 @@ foreach ($bountyPattern in $bountyPatterns) {
     if ($bountyMatches.Count -ne 1) { throw "Expected exactly one production declaration matching: $bountyPattern" }
     $bountyLine = 1 + ([regex]::Matches($bountySource.Substring(0, $bountyMatches[0].Index), '\n')).Count
     $bountyHeader += '#line {0} "{1}"' -f $bountyLine, $bountySourcePath.Replace('\', '/')
-    $bountyHeader += $bountyMatches[0].Value
-}
-$bountyRoutine = [IO.File]::ReadAllText($bountyRoutinePath)
-foreach ($bountyPattern in @(
-    '(?ms)^struct RoutineStartDiagnostic\s*\{.*?^\};',
-    '(?m)^static RoutineStartDiagnostic routineStartDiagnostic;',
-    '(?ms)^static bool WaitForRoutinePlacement\(Ped ped, const ContractDef& def\)\s*\{.*?^\}'
-)) {
-    $bountyMatches = [regex]::Matches($bountyRoutine, $bountyPattern)
-    if ($bountyMatches.Count -ne 1) { throw "Expected exactly one routine declaration matching: $bountyPattern" }
     $bountyHeader += $bountyMatches[0].Value
 }
 $bountyMatches = [regex]::Matches($bountySource, '(?ms)^static Ped SpawnTargetWithPhoto\(Hash model, const ContractDef& def\)\s*\{.*?^\}')

@@ -303,6 +303,8 @@ namespace Card
 	constexpr Hash kStartState       = kStateIntro;
 	constexpr const char* kFlipBlackboard = "GENERIC_DOCUMENT_FLIP_AVAILABLE";  // player-ped blackboard bool that enables the Flip prompt (R* generic_document_inspection)
 	constexpr DWORD kTaskStartWaitMs = 700;                                   // wait for the inspect task to report running before trying the fallback path
+	constexpr DWORD kHandsReadyWaitMs = 4000;                                // allow the weapon put-away animation to finish before inspecting
+	constexpr DWORD kHandsSettleMs = 150;                                    // require stable empty hands across delayed weapon-state updates
 	constexpr DWORD kTextureSettleMs = 1500;                                 // rebind through delayed item-material setup after each card transition
 	constexpr unsigned kTextureBindCount = 5;
 	constexpr DWORD kTextureBindDelaysMs[kTextureBindCount] = { 0, 100, 300, 750, kTextureSettleMs };

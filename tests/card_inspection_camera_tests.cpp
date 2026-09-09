@@ -169,7 +169,6 @@ static ULONGLONG GetTickCount64() { return w.now; }
 static void MaintainOwnedPedCleanup() { w.events.push_back("cleanup"); }
 static void SetRuntimePaused(bool) {}
 static void MaintainPortraitAndCard() { w.events.push_back("portrait"); }
-static void UpdateRoutineDebug() { w.events.push_back("debug"); }
 static void UpdateCard() { w.events.push_back("card_update"); }
 static void WAIT(int delay)
 {
@@ -314,8 +313,8 @@ static void ProductionWaitAndFrameIntegration()
         "cleanup", "portrait", "wait", "cleanup", "portrait"},
         "real WaitUntil traces before portrait maintenance and retains predicate/yield order");
     Reset(); RunProductionCardFrameTail();
-    Check(w.events == std::vector<std::string>{"card_inspection_sample", "debug", "card_update", "wait"},
-        "actual frame integration preserves final debug, card update and yield order");
+    Check(w.events == std::vector<std::string>{"card_inspection_sample", "card_update", "wait"},
+        "actual frame integration preserves card tracing, update and yield order");
     Reset(); TraceAt(1000); w.paused = w.faded = true;
     TraceAt(16000); TraceAt(17000);
     Check(w.records.size() == 2 && w.records.back().now == 16000,

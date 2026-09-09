@@ -14,6 +14,9 @@ if (-not (Test-Path -LiteralPath $bountyVcVars)) {
 New-Item -ItemType Directory -Path $bountyOutput -Force | Out-Null
 $bountySource = [IO.File]::ReadAllText($bountySourcePath)
 $bountyData = [IO.File]::ReadAllText($bountyDataPath)
+$bountyJoaat = [regex]::Matches($bountyData, '(?ms)^constexpr Hash Joaat\(const char\* s\)\s*\{.*?^\}')
+if ($bountyJoaat.Count -ne 1) { throw 'Expected exactly one production Joaat for card constants.' }
+[IO.File]::WriteAllText((Join-Path $bountyOutput 'spawn_hash_under_test.h'), $bountyJoaat[0].Value)
 $bountyHeader = @('#pragma once', '// Generated from production source; do not edit.', 'namespace Tune {')
 foreach ($bountyConstant in @('kStreamTimeoutMs', 'kPedSpawnRetryMs', 'kPedSpawnRetryDelayMs')) {
     $bountyMatches = [regex]::Matches($bountyData, ('constexpr\s+\w+\s+' + $bountyConstant + '\s*=[^;]+;'))

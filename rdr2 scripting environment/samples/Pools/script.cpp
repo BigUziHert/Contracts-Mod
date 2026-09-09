@@ -219,7 +219,7 @@ static void WriteStartupTrace(const StartupTrace::Event& event)
 	if (_wfopen_s(&file, path, L"a") != 0 || !file) return;
 	SYSTEMTIME time;
 	GetSystemTime(&time);
-	fprintf(file, "%04u-%02u-%02uT%02u:%02u:%02uZ trace-v1 build=pool-preflight-v1 pid=%lu session=%llu stage=%s detail=%s model=%08X ped=%d freePeds=%d hasPoint=%d point=%.3f,%.3f,%.3f owned=%d slot=%d download=%d photoStage=%s\n",
+	fprintf(file, "%04u-%02u-%02uT%02u:%02u:%02uZ trace-v1 build=native-baseline-card-v1 pid=%lu session=%llu stage=%s detail=%s model=%08X ped=%d freePeds=%d hasPoint=%d point=%.3f,%.3f,%.3f owned=%d slot=%d download=%d photoStage=%s\n",
 		time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond,
 		GetCurrentProcessId(), startupTraceSession, event.stage, event.detail, event.model, event.ped,
 		event.freePeds, event.hasPoint ? 1 : 0, event.point.x, event.point.y, event.point.z,
@@ -227,7 +227,6 @@ static void WriteStartupTrace(const StartupTrace::Event& event)
 	fclose(file);
 }
 
-static void WriteRoutineStartDiagnostic(FILE* file);
 static void LogContractStartFailure(Hash model, int attempt)
 {
 	StartupTrace::Record("handled_failure", model, C.target);
@@ -253,7 +252,6 @@ static void LogContractStartFailure(Hash model, int attempt)
 		C.photoCommitReady ? 1 : 0, C.photoCommitBefore ? 1 : 0, C.photoBusyBefore ? 1 : 0,
 		C.photoBusyAfterCleanup ? 1 : 0, C.photoBusyAtRequest ? 1 : 0, C.photoRequestAttempts);
 	if (lastStartFailure == ContractStartFailure::PortraitFailed) WritePhotoTiming(file, lastPhotoStage);
-	if (lastStartFailure == ContractStartFailure::LocationUnavailable) WriteRoutineStartDiagnostic(file);
 	fclose(file);
 }
 
@@ -416,8 +414,6 @@ template<typename Pred> static bool WaitUntil(DWORD timeoutMs, Pred pred)
 	}
 }
 
-#include "routine_runtime.h"
-
 static bool LoadModel(Hash model)
 {
 	STREAMING::REQUEST_MODEL(model, true);
@@ -496,24 +492,8 @@ static void StyleTargetBlip(Blip blip, const char* colorModifier, bool large, bo
 }
 static void AddSearchBlip()
 {
-	Vector3 centre = C.def->spawn;
-	float radius = C.def->searchRadius;
-	if (IsRoutine(*C.def))
-	{
-		centre = R.fallbackCentre;
-		radius = R.wanderRadius;
-	}
-	C.searchBlip = MAP::BLIP_ADD_FOR_RADIUS(BLIP_STYLE_MP_MISSION_GIVER, centre, radius);
+	C.searchBlip = MAP::BLIP_ADD_FOR_RADIUS(BLIP_STYLE_MP_MISSION_GIVER, C.def->spawn, C.def->searchRadius);
 	StyleTargetBlip(C.searchBlip, "BLIP_MODIFIER_MP_COLOR_32", true, false);
-}
-static void UpdateSearchArea()
-{
-	if (g_state != CONTRACT_UNKNOWN || !C.def || !IsRoutine(*C.def) ||
-		R.fallbackDestination < 0 || !C.searchBlip || !MAP::DOES_BLIP_EXIST(C.searchBlip)) return;
-	// The cache advances on arrival, when the target enters the wander radius.
-	// Selecting a future stop or taking individual steps never moves this circle.
-	if (DistSq(MAP::GET_BLIP_COORDS(C.searchBlip), R.fallbackCentre) > .01f)
-		MAP::SET_BLIP_COORDS(C.searchBlip, R.fallbackCentre);
 }
 static void AddFoundBlip()
 {
@@ -940,26 +920,17 @@ static Ped SpawnTargetWithPhoto(Hash model, const ContractDef& def)
 	}
 
 	StartupTrace::Record("portrait_ready", model, ped);
-	StartupTrace::Record("destination_revalidate_begin", model, ped, &def.spawn);
-	if (!ValidateRoutineDeployment(ped, def))
-	{
-		lastStartFailure = !PlayerAvailable() || strcmp(RoutineSpawn::diagnostic.check, "interaction_interrupted") == 0
-			? ContractStartFailure::Interrupted : ContractStartFailure::LocationUnavailable;
-		RequestOwnedPedCleanup(ped);
-		ReleaseTargetPhoto();
-		return 0;
-	}
-	// Move once while hidden, then allow collision/physics to settle before revealing.
-	// Do not clear ambient entities from the destination. Active routine travel never teleports.
+	// Deploy the photographed subject once, using the original fixed contract area.
+	// The native wander task owns behavior after setup; there is no scheduled relocation.
 	StartupTrace::Record("deployment_begin", model, ped, &def.spawn);
 	ENTITY::SET_ENTITY_COORDS(ped, def.spawn.x, def.spawn.y, def.spawn.z, false, false, false, false);
 	ENTITY::SET_ENTITY_COLLISION(ped, true, false);
 	ENTITY::FREEZE_ENTITY_POSITION(ped, false);
 	StartupTrace::Record("settling_begin", model, ped, &def.spawn);
-	if (!WaitForRoutinePlacement(ped, def))
+	ENTITY::PLACE_ENTITY_ON_GROUND_PROPERLY(ped, 1);
+	if (!PlayerAvailable() || !LivingPed(ped))
 	{
-		lastStartFailure = !PlayerAvailable() || strcmp(RoutineSpawn::diagnostic.check, "interaction_interrupted") == 0
-			? ContractStartFailure::Interrupted : ContractStartFailure::LocationUnavailable;
+		lastStartFailure = !PlayerAvailable() ? ContractStartFailure::Interrupted : ContractStartFailure::PedCreationFailed;
 		// Deletion can be deferred. Keep our hidden subject inert while cleanup retries.
 		if (ped == ownedPed.ped && ENTITY::DOES_ENTITY_EXIST(ped) && OwnedPedIdentityMatches())
 		{
@@ -1119,6 +1090,50 @@ static void DestroyCardObject(bool cancelInspection = false)
 	Cd = CardRuntime();
 }
 
+static bool CardWeaponInHand()
+{
+	// Include the offhand: a knife, lantern or second gun must retire before the paper intro.
+	for (int hand = 0; hand < 2; ++hand)
+	{
+		Hash weapon = 0;
+		WEAPON::GET_CURRENT_PED_WEAPON(pedMe, &weapon, true, hand, false);
+		if (weapon && weapon != joaat("WEAPON_UNARMED")) return true;
+	}
+	return false;
+}
+
+static bool PreparePlayerForCard()
+{
+	if (!CanStartInteraction() || PED::IS_PED_CARRYING_SOMETHING(pedMe)) return false;
+	if (!CardWeaponInHand() && !WEAPON::_IS_WEAPON_HOLSTER_STATE_CHANGING(pedMe)) return true;
+
+	bool interrupted = false, holsterRequested = false;
+	ULONGLONG readySinceMs = 0;
+	bool ready = WaitUntil(Card::kHandsReadyWaitMs, [&] {
+		if (!CanStartInteraction() || PED::IS_PED_CARRYING_SOMETHING(pedMe))
+		{
+			interrupted = true;
+			return true;
+		}
+		bool changing = WEAPON::_IS_WEAPON_HOLSTER_STATE_CHANGING(pedMe) != 0;
+		bool armed = CardWeaponInHand();
+		if (armed && !changing && !holsterRequested)
+		{
+			// Issue once, then yield. Starting inspection here overlaps the put-away animation
+			// and can leave the card outside the native inspection camera's frame.
+			WEAPON::_HIDE_PED_WEAPONS(pedMe, 2, false);
+			holsterRequested = true;
+			readySinceMs = 0;
+			return false;
+		}
+		if (armed || changing) { readySinceMs = 0; return false; }
+		ULONGLONG now = GetTickCount64();
+		if (!readySinceMs) readySinceMs = now;
+		return now - readySinceMs >= Card::kHandsSettleMs;
+	});
+	return ready && !interrupted;
+}
+
 // Player takes the card out and examines it (Zoom / Flip / Put Away are the game's own prompts).
 // Uses generic_photograph, prop p_cs_photonudie05x_4x6, slot primaryItem and paper-inspect states;
 // Flip comes from the GENERIC_DOCUMENT_FLIP_AVAILABLE blackboard flag.
@@ -1132,7 +1147,7 @@ static bool OpenCard(bool reuseHandoffCard = false)
 		DisplaySubtitle("CONTRACT PHOTO UNAVAILABLE. PRESS I TO RETRY.");
 		return false;
 	}
-	if (!CanStartInteraction()) return false;
+	if (!PreparePlayerForCard()) return false;
 	if (Cd.obj && ENTITY::IS_ENTITY_ATTACHED(Cd.obj)) ENTITY::DETACH_ENTITY(Cd.obj, true, false);
 	Cd.inHand = false;
 	Cd.inspectingPed = pedMe;
@@ -1142,7 +1157,8 @@ static bool OpenCard(bool reuseHandoffCard = false)
 
 	if (CreateCardObject())
 	{
-		if (!CanStartInteraction()) { DestroyCardObject(); return false; }
+		// Model streaming can yield long enough for the player to draw another weapon.
+		if (!PreparePlayerForCard()) { DestroyCardObject(); return false; }
 		// The task's first parameter is the title label (natives.h: propNameGxt) — proven in dev-7. Use our
 		// LML label when installed, else the item hash (no title). No retry: re-issuing the task while the
 		// first call was still starting restarted it without the label.
@@ -1160,7 +1176,7 @@ static bool OpenCard(bool reuseHandoffCard = false)
 		DestroyCardObject(true);
 	}
 
-	if (!CanStartInteraction() || !TargetPhotoReady()) return false;
+	if (!TargetPhotoReady() || !PreparePlayerForCard()) return false;
 	Cd.inspectingPed = pedMe;
 	auto abandonFallback = [&] {
 		if (PlayerAvailable())
@@ -1275,8 +1291,6 @@ static void RefreshCardTextureAfterTransition()
 	ApplyCardCustomTexture();
 }
 
-#include "routine_card.h"
-
 // The "back" of the card: a screen-space panel with the portrait, usual haunts, and the pay.
 static void DrawCardBackPanel()
 {
@@ -1297,12 +1311,8 @@ static void DrawCardBackPanel()
 	FormatMoney(lo, sizeof lo, Tune::kPayoutMinCents);
 	FormatMoney(hi, sizeof hi, Tune::kPayoutMaxCents);
 	sprintf_s(reward, "%s - %s", lo, hi);
-	if (IsRoutine(*C.def)) RoutineCard::Draw(R.cardLines);
-	else
-	{
-		DrawTextToScreen(C.def->targetDesc, 0.49f, 0.37f, 0.36f, 255, 255, 255, 255);
-		DrawTextToScreen(C.def->hint,       0.49f, 0.43f, 0.36f, 255, 255, 255, 255);
-	}
+	DrawTextToScreen(C.def->targetDesc, 0.49f, 0.37f, 0.36f, 255, 255, 255, 255);
+	DrawTextToScreen(C.def->hint,       0.49f, 0.43f, 0.36f, 255, 255, 255, 255);
 	DrawTextToScreen(reward,            0.52f, 0.57f, 0.72f, 255, 255, 255, 255);
 }
 
@@ -1444,7 +1454,9 @@ static void StartWander(Ped ped, const ContractDef& def)
 {
 	PED::SET_PED_CONFIG_FLAG(ped, 233, false);
 	PED::SET_PED_COMBAT_ATTRIBUTES(ped, 5, false);
-	if (StartRoutineWander(ped, def)) return;
+	// Restore 61f3ad8's native ambient handoff, only at setup or the end of search.
+	// Calm updates leave the game's chosen scenarios and tasks alone.
+	TASK::CLEAR_PED_TASKS(ped, true, true);
 	TASK::SET_PED_PATH_PREFER_TO_AVOID_WATER(ped, true, def.searchRadius);
 	TASK::SET_PED_PATH_MAY_ENTER_WATER(ped, false);
 	TASK::TASK_WANDER_IN_AREA(ped, def.spawn, def.searchRadius, 0.0f, 0.0f, 1);
@@ -1610,12 +1622,6 @@ static void UpdateHumanTarget(Ped ped, const ContractDef& def)
 		C.combatExitPending = false;
 		EnterCombat(ped, false, recovery);
 	}
-	// The policy can finish its search while the player's old native combat flag lingers.
-	// Honour that lifecycle, while still yielding to an actual combat task or another fight.
-	UpdateRoutine(ped, def, observation.canAct && taskStatus != 0 && taskStatus != 1 &&
-		C.ai.state == TargetAI::State::Wander && !C.ai.pendingEngagement &&
-		!(PED::IS_PED_IN_COMBAT(ped, 0) && !observation.nativeInCombat) &&
-		!PED::IS_PED_IN_ANY_VEHICLE(ped, false));
 }
 
 const TargetBehavior kHumanTarget = { SetupHumanTarget, UpdateHumanTarget };
@@ -1725,16 +1731,6 @@ static bool StartContract()
 	lastStartFailure = ContractStartFailure::None;
 	lastPhotoStage = "none";
 	if (!CanPrepareContract()) return false;
-	RoutineRuntime prepared;
-	StartupTrace::Record("destination_prepare_begin");
-	if (!PrepareRoutineContract(prepared))
-	{
-		lastStartFailure = !PlayerAvailable() || strcmp(RoutineSpawn::diagnostic.check, "interaction_interrupted") == 0
-			? ContractStartFailure::Interrupted : ContractStartFailure::LocationUnavailable;
-		LogContractStartFailure(0, 0);
-		return false;
-	}
-	StartupTrace::Record("destination_prepared", 0, 0, &prepared.definition.spawn);
 	if (!CanStartInteraction())
 	{
 		lastStartFailure = ContractStartFailure::Interrupted;
@@ -1743,7 +1739,6 @@ static bool StartContract()
 	}
 	StartupTrace::Record("replace_previous_begin");
 	ClearContract(true);
-	R = prepared;
 	for (int attempt = 0; attempt < Tune::kSpawnAttempts; ++attempt)
 	{
 		if (!PlayerAvailable())
@@ -1752,7 +1747,7 @@ static bool StartContract()
 			LogContractStartFailure(0, attempt + 1);
 			break;
 		}
-		const ContractDef& def = R.definition;
+		const ContractDef& def = kContracts[rand() % kContractCount];
 		Hash model = def.models.list[rand() % def.models.count];
 		Ped ped = SpawnTargetWithPhoto(model, def);
 		if (!ped)
@@ -1789,7 +1784,6 @@ static bool StartContract()
 		StartupTrace::Record("contract_ready", model, ped, &def.spawn);
 		return true;
 	}
-	ResetRoutine();
 	return false;
 }
 
@@ -2321,8 +2315,6 @@ static bool ConsumeRemoteContractRequest(bool pressed)
 	return true;
 }
 
-#include "routine_debug.h"
-
 void ScriptMain()
 {
 	startupTraceSession = GetTickCount64();
@@ -2339,7 +2331,6 @@ void ScriptMain()
 		MaintainPortraitAndCard();
 		bool bypassPressed = ConsumeRemoteContractRequest(IsKeyJustUp(Tune::kBypassClerkKey));
 		bool inspectPressed = IsKeyJustUp(Tune::kInspectCardKey);
-		if (IsKeyJustUp(VK_F8)) ToggleRoutineDebug();
 		if (!PlayerAvailable() || (previousPlayer && previousPlayer != pedMe))
 		{
 			CancelPendingContractStart();
@@ -2419,9 +2410,7 @@ void ScriptMain()
 		// re-triggering aggression through walls for the rest of the contract.
 		if (C.damagedByPlayer && TargetExists()) ENTITY::CLEAR_ENTITY_LAST_DAMAGE_ENTITY(C.target);
 		C.damagedByPlayer = false;
-		UpdateSearchArea();
 		TraceCardInspection();
-		UpdateRoutineDebug();
 		UpdateCard(); // render-target drawing must remain last
 		WAIT(0);
 	}

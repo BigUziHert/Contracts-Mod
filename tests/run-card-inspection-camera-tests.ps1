@@ -41,7 +41,7 @@ if ([regex]::Matches($bountyWait[0].Value, 'TraceCardInspection\(\);\s*MaintainP
 $bountyMain = [regex]::Matches($bountySource, '(?ms)^void ScriptMain\(\)\s*\{.*?^\}')
 if ($bountyMain.Count -ne 1) { throw 'Expected exactly one ScriptMain for card trace integration.' }
 $bountyTail = [regex]::Matches($bountyMain[0].Value,
-    '(?s)(?<calls>TraceCardInspection\(\);\s*UpdateRoutineDebug\(\);\s*UpdateCard\(\);[^\r\n]*\s*WAIT\(0\);)\s*\}\s*\}$')
+    '(?s)(?<calls>TraceCardInspection\(\);\s*UpdateCard\(\);[^\r\n]*\s*WAIT\(0\);)\s*\}\s*\}$')
 if ($bountyTail.Count -ne 1) { throw 'Card trace must preserve the final protected debug/card/WAIT tail.' }
 $bountyHeader += 'static void RunProductionCardFrameTail() {'
 $bountyHeader += $bountyTail[0].Groups['calls'].Value

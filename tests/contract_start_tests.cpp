@@ -29,13 +29,6 @@ struct ContractDef
     const TargetBehavior* behavior = nullptr;
     void (*onSpawned)(const ContractDef&) = nullptr;
 };
-struct RoutineRuntime
-{
-    bool enabled = false;
-    int planIdentity = 0;
-    std::array<std::string, 6> cardLines;
-    ContractDef definition;
-};
 struct ActiveContract
 {
     const ContractDef* def = nullptr;
@@ -47,7 +40,12 @@ struct ActiveContract
 };
 struct GiverSpot {};
 static Ped pedMe = kPlayer;
-static RoutineRuntime R;
+static void SetupTarget(Ped ped, const ContractDef& def);
+static void OnSpawned(const ContractDef& def);
+static const TargetBehavior behavior{SetupTarget};
+static constexpr Hash models[] = {kModel};
+static const ContractDef kContracts[] = {{{10, 20, 30}, {models, 1}, &behavior, OnSpawned}};
+static constexpr int kContractCount = 1;
 static ActiveContract C;
 static struct { int obj = 0; } Cd;
 static struct { bool active = false; } handoff;
@@ -59,14 +57,13 @@ static struct World
     bool playerAlive = true, canInteract = true, paused = false, faded = false;
     bool interruptPreparation = false, changePlayerAfterSpawn = false;
     bool giverAlive = true, giverAtSpot = true, handoffSucceeds = true;
-    int prepareFailures = 0, spawnFailures = 0;
+    int spawnFailures = 0;
     int preflightFailure = -1, spawnFailure = -1;
-    unsigned preflights = 0, preparations = 0, clears = 0, oldHuntsCleared = 0;
+    unsigned preflights = 0, clears = 0, oldHuntsCleared = 0;
     unsigned spawns = 0, setups = 0, spawnedHooks = 0, blips = 0;
     unsigned cleanupRequests = 0, photoReleases = 0, handoffs = 0, reports = 0, readyMessages = 0;
 } world;
 namespace StartupTrace { static void Record(const char*, unsigned = 0, int = 0, const Vector3* = nullptr) {} }
-namespace RoutineSpawn { static struct { const char* check = "none"; } diagnostic; }
 namespace HUD { static bool IS_PAUSE_MENU_ACTIVE() { return world.paused; } }
 namespace CAMERA { static bool IS_SCREEN_FADED_OUT() { return world.faded; } }
 static bool PlayerAvailable() { return world.playerAlive && world.player == pedMe; }
@@ -86,9 +83,7 @@ static void DisplaySubtitle(const char* text)
 }
 static bool ContractActive();
 static bool CanPrepareContract();
-static bool PrepareRoutineContract(RoutineRuntime& prepared);
 static void ClearContract(bool deleteTarget);
-static void ResetRoutine();
 static Ped SpawnTargetWithPhoto(Hash model, const ContractDef& def);
 static void RequestOwnedPedCleanup(Ped ped);
 static void ReleaseTargetPhoto();
@@ -101,42 +96,23 @@ static void ReportContractStartFailure() { ++world.reports; }
 
 static void SetupTarget(Ped ped, const ContractDef& def)
 {
-    Check(ped == kNewTarget && C.target == ped && C.def == &R.definition && &def == C.def && C.photoIdentity == 200,
-        "setup follows target publication using stable runtime definition and its completed portrait");
+    Check(ped == kNewTarget && C.target == ped && C.def == &kContracts[0] && &def == C.def && C.photoIdentity == 200,
+        "setup follows target publication using stable static contract definition and its completed portrait");
     ++world.setups;
 }
 static void OnSpawned(const ContractDef& def)
 {
-    Check(&def == &R.definition && world.setups == 1, "spawn callback receives the published definition after setup");
+    Check(&def == &kContracts[0] && world.setups == 1, "spawn callback receives the published definition after setup");
     ++world.spawnedHooks;
 }
-static const TargetBehavior behavior{SetupTarget};
 static bool ContractActive() { return g_state == CONTRACT_UNKNOWN || g_state == CONTRACT_FOUND || g_state == CONTRACT_DEAD; }
-static void ResetRoutine() { R = {}; }
 static bool CanPrepareContract()
 {
     ++world.preflights;
+    if (world.interruptPreparation) world.canInteract = false;
     if (world.preflightFailure < 0) return true;
     lastStartFailure = static_cast<ContractStartFailure>(world.preflightFailure);
     return false;
-}
-static bool PrepareRoutineContract(RoutineRuntime& prepared)
-{
-    ++world.preparations;
-    world.now += 100;
-    if (world.prepareFailures)
-    {
-        --world.prepareFailures;
-        RoutineSpawn::diagnostic.check = "candidate_budget_exhausted";
-        return false;
-    }
-    static constexpr Hash models[] = {kModel};
-    prepared.enabled = true;
-    prepared.planIdentity = 200;
-    prepared.cardLines[0] = "Prepared target habit";
-    prepared.definition = {{10, 20, 30}, {models, 1}, &behavior, OnSpawned};
-    if (world.interruptPreparation) world.canInteract = false;
-    return true;
 }
 static void ReleaseTargetPhoto()
 {
@@ -156,19 +132,19 @@ static void ClearContract(bool deleteTarget)
     if (C.target == kOldTarget) ++world.oldHuntsCleared;
     if (C.photoIdentity) ReleaseTargetPhoto();
     C = {};
-    ResetRoutine();
+
     g_state = CONTRACT_NONE;
 }
 static Ped SpawnTargetWithPhoto(Hash model, const ContractDef& def)
 {
-    Check(model == kModel && &def == &R.definition && R.enabled && R.planIdentity == 200 && !C.target,
-        "target preparation starts only after committing the new runtime and clearing the previous hunt");
+    Check(model == kModel && &def == &kContracts[0] && !C.target,
+        "target preparation starts only after committing the new contract and clearing the previous hunt");
     ++world.spawns;
     if (world.spawnFailures)
     {
         --world.spawnFailures;
         lastStartFailure = static_cast<ContractStartFailure>(world.spawnFailure);
-        if (lastStartFailure == ContractStartFailure::LocationUnavailable || lastStartFailure == ContractStartFailure::PortraitFailed)
+        if (lastStartFailure == ContractStartFailure::PortraitFailed)
         {
             // This boundary represents the separately tested capture/deployment cleanup.
             C.photoIdentity = 200;
@@ -183,7 +159,7 @@ static Ped SpawnTargetWithPhoto(Hash model, const ContractDef& def)
 }
 static void AddSearchBlip()
 {
-    Check(C.def == &R.definition && world.setups == 1 && world.spawnedHooks == 1,
+    Check(C.def == &kContracts[0] && world.setups == 1 && world.spawnedHooks == 1,
         "search blip follows completed setup and the spawn callback");
     ++world.blips;
 }
@@ -197,44 +173,43 @@ static bool BeginHandoff(Ped giver, bool payout)
 static void Reset(bool oldHunt = true)
 {
     world = {};
-    R = {}; C = {}; Cd = {}; handoff = {}; ownedPed = {};
+    C = {}; Cd = {}; handoff = {}; ownedPed = {};
     pedMe = kPlayer;
     CancelPendingContractStart();
     lastStartFailure = ContractStartFailure::None;
     g_state = oldHunt ? CONTRACT_FOUND : CONTRACT_NONE;
     if (oldHunt)
     {
-        R.enabled = true; R.planIdentity = 100; R.cardLines[0] = "Existing target habit";
-        C.def = &R.definition; C.target = kOldTarget; C.photoIdentity = 100;
+        C.def = &kContracts[0]; C.target = kOldTarget; C.photoIdentity = 100;
     }
 }
 static void CheckOldHunt()
 {
-    Check(g_state == CONTRACT_FOUND && C.target == kOldTarget && C.def == &R.definition && C.photoIdentity == 100 &&
-        R.enabled && R.planIdentity == 100 && R.cardLines[0] == "Existing target habit" && world.clears == 0 && world.spawns == 0,
-        "pre-commit failure preserves the original target, portrait, runtime and card clues");
+    Check(g_state == CONTRACT_FOUND && C.target == kOldTarget && C.def == &kContracts[0] && C.photoIdentity == 100 &&
+        world.clears == 0 && world.spawns == 0,
+        "pre-commit failure preserves the original target, portrait, contract information");
 }
 static void PreparationFailureAndCacheExhaustion()
 {
-    Reset(); world.prepareFailures = 1;
+    Reset(); world.preflightFailure = static_cast<int>(ContractStartFailure::PedPoolFull);
     RequestContractStart(0); UpdatePendingContractStart();
     CheckOldHunt();
     Check(pendingContractStart.player == kPlayer && world.reports == 0 && !C.cardOpenPending,
-        "location preparation failure retains one quiet request without claiming delivery");
+        "pool exhaustion preserves the current hunt and a quiet pending request");
     world.preflightFailure = static_cast<int>(ContractStartFailure::PhotoCacheExhausted);
     world.now = pendingContractStart.nextAttemptMs;
     UpdatePendingContractStart();
     CheckOldHunt();
-    Check(!pendingContractStart.player && world.preparations == 1 && world.reports == 1,
-        "exhausted portrait capacity stops before another preparation or replacement");
+    Check(!pendingContractStart.player && world.preflights == 2 && world.reports == 1,
+        "exhausted portrait capacity stops before replacement");
 }
-static void DeploymentFailureCleanupAndSuccess()
+static void PortraitFailureCleanupAndSuccess()
 {
-    Reset(); world.spawnFailures = 1; world.spawnFailure = static_cast<int>(ContractStartFailure::LocationUnavailable);
+    Reset(); world.spawnFailures = 1; world.spawnFailure = static_cast<int>(ContractStartFailure::PortraitFailed);
     RequestContractStart(kGiver); UpdatePendingContractStart();
     Check(world.clears == 1 && world.oldHuntsCleared == 1 && world.spawns == 1 && world.cleanupRequests == 1 &&
-        world.photoReleases == 2 && !R.enabled && !C.target && !C.def && g_state == CONTRACT_NONE,
-        "post-capture location failure clears the old hunt once, retires the provisional portrait and resets unpublished runtime");
+        world.photoReleases == 2 && !C.target && !C.def && g_state == CONTRACT_NONE,
+        "portrait failure clears the old hunt once, retires provisional resources and withholds unpublished contract data");
     Check(pendingContractStart.player == kPlayer && ownedPed.cleanupPending && world.setups == 0 && world.blips == 0 && !C.cardOpenPending,
         "failed deployment retains the request while withholding setup, search blips and delivery");
     world.now = pendingContractStart.nextAttemptMs + 100;
@@ -242,7 +217,7 @@ static void DeploymentFailureCleanupAndSuccess()
     Check(world.preflights == 1 && world.clears == 1, "pending cleanup prevents another real startup preflight");
     ownedPed.cleanupPending = false;
     UpdatePendingContractStart();
-    Check(C.def == &R.definition && C.target == kNewTarget && C.targetPos.x == 10 && R.cardLines[0] == "Prepared target habit" &&
+    Check(C.def == &kContracts[0] && C.target == kNewTarget && C.targetPos.x == 10 &&
         C.startMs == world.now && world.oldHuntsCleared == 1 && g_state == CONTRACT_UNKNOWN,
         "eventual success publishes a stable new definition without replacing the old hunt twice");
     Check(!pendingContractStart.player && world.setups == 1 && world.blips == 1 && world.handoffs == 1 &&
@@ -257,11 +232,11 @@ static void InterruptedPreparationAndPublication()
     RequestContractStart(0); UpdatePendingContractStart();
     CheckOldHunt();
     Check(lastStartFailure == ContractStartFailure::Interrupted && pendingContractStart.player == kPlayer,
-        "interruption after successful destination preparation stops before replacement and retains the living player's request");
+        "interruption after successful preflight stops before replacement and retains the living player's request");
 
     Reset(); world.changePlayerAfterSpawn = true;
     RequestContractStart(0); UpdatePendingContractStart();
-    Check(lastStartFailure == ContractStartFailure::Interrupted && !pendingContractStart.player && !R.enabled &&
+    Check(lastStartFailure == ContractStartFailure::Interrupted && !pendingContractStart.player &&
         !C.target && !C.def && world.cleanupRequests == 1 && world.photoReleases == 2 && world.setups == 0 && world.blips == 0,
         "a player change after the yielding spawn boundary cleans the provisional target without publishing it");
 }
@@ -280,7 +255,7 @@ static void TransientEngineFailuresRetry()
         world.preflightFailure = -1; world.spawnFailures = 0; ownedPed.cleanupPending = false;
         world.now = pendingContractStart.nextAttemptMs;
         UpdatePendingContractStart();
-        Check(!pendingContractStart.player && C.target == kNewTarget && C.def == &R.definition && C.cardOpenPending &&
+        Check(!pendingContractStart.player && C.target == kNewTarget && C.def == &kContracts[0] && C.cardOpenPending &&
             world.setups == 1 && world.blips == 1 && world.readyMessages == 1,
             "the retained engine-failure request eventually publishes one target and schedules its remote card");
     }
@@ -288,7 +263,7 @@ static void TransientEngineFailuresRetry()
 int main()
 {
     PreparationFailureAndCacheExhaustion();
-    DeploymentFailureCleanupAndSuccess();
+    PortraitFailureCleanupAndSuccess();
     InterruptedPreparationAndPublication();
     TransientEngineFailuresRetry();
     std::printf("Contract start integration: %u checks passed.\n", checks);
